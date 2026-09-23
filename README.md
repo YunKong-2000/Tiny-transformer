@@ -1,0 +1,179 @@
+# Tiny Transformer Lab
+
+面向 **A100 80GB PCIe + `nvcr.io/nvidia/pytorch:25.08-py3`** 的单卡训练与推理学习项目。
+完整 PyTorch 参考框架已经提供；CUDA / CuTe C++ / CUTLASS 学生算子刻意留空。
+
+![模型与残差路径](docs/assets/architecture.png)
+
+## 从这里开始
+
+1. 阅读 [Transformer 算法手册](docs/transformer.md)：从 next-token prediction 到反向传播与 KV Cache。
+2. 阅读 [开发与优化手册](docs/development.md)：算子契约、CuTe 任务、测试和测量边界。
+3. 跑通下面的 smoke 流程，再逐个启用 `student` 算子。
+4. 查看 [当前验证记录](docs/validation.md)，区分本地已验证与 A100 待验证内容。
+
+**服务器不能联网时，使用 [离线部署指南](docs/offline.md)。** 本机已准备真实 TinyStories 子集、
+8K BPE、编码后的 train/val 和 Linux tokenizer wheel；离线包同时包含项目代码与校验文件。
+
+## 环境
+
+在 GPU 主机的项目根目录执行。宿主机需要 NVIDIA 驱动、Docker 和 NVIDIA Container Toolkit；
+驱动兼容性以 NVIDIA 对该镜像的 release notes 为准。容器不提供宿主机驱动。
+
+```bash
+docker run --rm -it --gpus all --ipc=host \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v "$PWD":/workspace/tiny-transformer \
+  -w /workspace/tiny-transformer \
+  nvcr.io/nvidia/pytorch:25.08-py3 bash
+
+# 以下命令在容器内执行；保留镜像原有的 torch/CUDA。
+python -m pip install -e '.[data]'
+python -c 'import torch; print(torch.__version__, torch.version.cuda); print(torch.cuda.get_device_name())'
+export TORCH_CUDA_ARCH_LIST=8.0
+```
+
+也可用仓库 Dockerfile 构建已安装数据依赖的派生镜像：
+
+```bash
+docker build -t tiny-transformer:25.08 .
+docker run --rm -it --gpus all --ipc=host \
+  -v "$PWD":/workspace/tiny-transformer tiny-transformer:25.08
+```
+
+项目不在 pip dependencies 中声明 torch，以防覆盖 NGC 中预装的 CUDA wheel。
+运行前必须已经安装 PyTorch。Python 3.9+；CPU 验证环境为 PyTorch 2.8.0。
+
+## 第一次跑通：不需要下载数据
+
+```bash
+# 自动创建独立输出目录；使用 CPU 小模型，包含测试、训练、生成、benchmark、profile。
+bash scripts/smoke.sh
+
+# GPU 容器内的验收：FP32 / BF16 / FP16、SDPA、compile、profile。
+bash scripts/a100_validate.sh
+```
+
+当前工作区已有 `data/smoke`：500 条训练、50 条验证合成故事，byte tokenizer。
+它只验证流水线，不用于证明模型质量或报告 60M 模型吞吐。
+`data/` 与 `runs/` 不纳入版本控制，换机器后通过脚本重建。
+
+## 真实数据：TinyStories + 8K BPE
+
+```bash
+python -m tiny_transformer.prepare \
+  --source tinystories --output data/tinystories-8k \
+  --train-docs 100000 --val-docs 2000 \
+  --tokenizer-docs 20000 --vocab-size 8192
+```
+
+脚本解析并记录数据集实际 revision，只在 train split 上训练 tokenizer，分开生成 train/val
+token 文件，记录文本、token 文件和 tokenizer 的 SHA256。目标目录已存在时拒绝覆盖。
+首次下载需要能访问 Hugging Face。本机已通过系统代理完成下载与打包：
+过滤空文本后为 99,983 篇训练故事（21,729,332 tokens）和 2,000 篇验证故事（385,234 tokens）。
+已存在的数据目录无需再次运行 prepare；输出目录存在时脚本会拒绝覆盖。
+使用前阅读数据集卡片和使用条款。
+
+没有外网的 GPU 主机可以在联网机器执行上述步骤，再复制整个 `data/tinystories-8k` 目录。
+也支持自备 JSONL（每行 `{"text":"..."}`）：
+
+```bash
+python -m tiny_transformer.prepare --source local \
+  --train-jsonl /path/to/train.jsonl --val-jsonl /path/to/val.jsonl \
+  --output data/local-8k --vocab-size 8192
+```
+
+## 60M 训练
+
+```bash
+# 算法参考基线，默认 eager attention。约 62.93M 参数。
+python -m tiny_transformer.train --config configs/model_60m.json \
+  --data data/tinystories-8k --output runs/60m-eager --device cuda
+
+# 成熟库性能基线：相同配置，单独启用 SDPA。
+python -m tiny_transformer.train --config configs/model_60m.json \
+  --data data/tinystories-8k --output runs/60m-sdpa --device cuda \
+  --op attention=sdpa
+
+# FP32 对照：保持同一数据、seed、batch、seq_len；默认关闭 TF32。
+python -m tiny_transformer.train --config configs/model_60m.json \
+  --data data/tinystories-8k --output runs/60m-fp32 --device cuda --precision fp32
+
+# 保持训练总 schedule 为 1000 steps，只执行前 20 steps。
+python -m tiny_transformer.train --config configs/model_60m.json \
+  --data data/tinystories-8k --output runs/resume-demo --device cuda --stop-after 20
+python -m tiny_transformer.train --config configs/model_60m.json \
+  --data data/tinystories-8k --output runs/resume-demo --device cuda \
+  --resume runs/resume-demo/last.pt
+```
+
+默认每步处理 `8 × 512 × 4 = 16384` 个 input tokens；1000 steps 约 16.38M tokens。
+采样是可复现的随机 token 窗口、有放回抽样；step 不等于 epoch。
+100M tokens 可设置 `--steps 6104`。正式长训前先跑 100–200 步实测速度和显存。
+
+日志：`metadata.json`、逐步 `metrics.jsonl`、原子写入的 `last.pt`。
+训练含验证、梯度裁剪、AdamW、warmup/cosine、FP16 GradScaler 与 RNG/sampler 恢复。
+只加载自己信任的 checkpoint；当前 checkpoint 含 optimizer 和 RNG 的 Python 对象。
+
+## 推理、benchmark 与热点
+
+```bash
+python -m tiny_transformer.generate --checkpoint runs/60m-sdpa/last.pt \
+  --device cuda --precision bf16 --prompt "Once upon a time" --max-new-tokens 128
+
+python -m tiny_transformer.benchmark --checkpoint runs/60m-sdpa/last.pt \
+  --device cuda --precision bf16 --batch-size 1 --prompt-length 512 \
+  --new-tokens 128 --repeats 10 --output runs/bench-b1.json
+
+TORCH_LOGS="graph_breaks,recompiles" python -m tiny_transformer.benchmark \
+  --checkpoint runs/60m-sdpa/last.pt --device cuda --precision bf16 --compile \
+  --prompt-length 512 --new-tokens 128 --output runs/bench-compile.json \
+  2> runs/compile.log
+
+python -m tiny_transformer.profile --checkpoint runs/60m-sdpa/last.pt \
+  --device cuda --precision bf16 --phase decode --seq-len 512 --output runs/profile-decode
+```
+
+`--phase train/prefill/decode` 分别分析三类负载。生成 Chrome/Perfetto trace、算子时间表和前三个热点。
+benchmark 报告冷请求、稳态 TTFT/TPOT、输出 token 吞吐、allocated/reserved 峰值显存、环境和原始 trial。
+它是固定 batch 的模型基准，不是 HTTP 服务或动态调度器。
+
+## 实现你的第一个算子
+
+修改 `tiny_transformer/operators/student.py` 对应函数，在 `csrc/` 添加实际代码。
+例如只替换 RMSNorm：
+
+```bash
+python -m tiny_transformer.check_ops --operator rms_norm --backend student \
+  --device cuda --precision bf16 --backward --output runs/rmsnorm-check.json
+
+python -m tiny_transformer.benchmark --checkpoint runs/60m-sdpa/last.pt \
+  --device cuda --precision bf16 --op rms_norm=student --output runs/rmsnorm-e2e.json
+```
+
+在完成前，命令会明确抛出 `NotImplementedError`。没有自动退回 PyTorch 的隐藏路径。
+训练接入必须支持正确反向；仅完成前向时先用于 inference。
+
+## 目录
+
+```text
+configs/                    小模型与 60M 模型 JSON 配置
+tiny_transformer/
+  operators/reference.py    可执行算法规范
+  operators/student.py      你需要实现的算子入口
+  operators/dispatch.py     逐算子选择后端
+  model.py                  decoder、参数管理、连续 KV cache
+  tokenizer.py / prepare.py tokenizer、下载与 token 文件生成
+  data.py                   packed window、文档边界与标签
+  train.py / generate.py    训练、续训、文本生成
+  benchmark.py / profile.py 性能测量与热点分析
+  check_ops.py              算子数值/梯度检查与微基准
+csrc/                       你的 CUDA / CuTe / CUTLASS 实现
+tests/                      算法、数据、缓存、梯度、续训测试
+scripts/                    CPU/GPU 验收、图表重建
+docs/transformer.md          算法手册
+docs/development.md          工程与优化手册
+```
+
+当前未实现：学生 GPU kernel、paged attention、CUDA Graph bucket、量化、分布式训练、HTTP serving。
+这些是后续实验，不会被标记为已完成优化。

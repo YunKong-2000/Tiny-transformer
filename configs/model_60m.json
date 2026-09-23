@@ -1,0 +1,15 @@
+{
+  "model": {
+    "vocab_size": 8192, "dim": 768, "n_layers": 8, "n_heads": 12,
+    "hidden_dim": 2048, "max_seq_len": 4096, "norm_eps": 1e-6,
+    "rope_theta": 10000.0, "tie_embeddings": true, "operators": {}
+  },
+  "training": {
+    "seq_len": 512, "batch_size": 8, "grad_accum": 4,
+    "steps": 1000, "lr": 0.0003, "min_lr_ratio": 0.1,
+    "warmup_steps": 50, "weight_decay": 0.1, "grad_clip": 1.0,
+    "precision": "bf16", "seed": 42, "eval_every": 100,
+    "eval_batches": 8, "save_every": 250, "packing": "continuous",
+    "tf32": false
+  }
+}
