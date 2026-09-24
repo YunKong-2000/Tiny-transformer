@@ -18,6 +18,9 @@
 `operators/student.py` 的 8 个入口全部保留为 `NotImplementedError`，没有隐藏 fallback。
 你可以只实现其中一个，通过 `--op rms_norm=student` 启用，其余继续使用参考路径。
 
+开始实现前，阅读 [Student 算子总契约与八份逐算子文档](operators/README.md)。
+其中逐项列出了实际训练/推理输入、dtype、stride、反向返回项，以及完整兼容与首版支持范围的区别。
+
 当前范围是单 GPU、固定 batch、普通 MHA。没有请求调度器、HTTP 服务、多卡训练、paged attention、
 CUDA Graph bucket 或权重量化。它们是后续里程碑，不应出现在当前的“已完成”列表中。
 
@@ -108,20 +111,24 @@ TMA/WGMMA 不属于本项目 A100 的实现路线。
 
 ## 4. 算子契约：先兼容，再优化
 
+符号沿用[算法手册](transformer.md#0-阅读路线和符号)：$B$ 为 batch size，$L$ 为序列长度，
+$d_{\mathrm{model}}$ 为模型维度，$H$ 为头数，$d_h$ 为单头维度，$d_{\mathrm{ffn}}$ 为 FFN 中间维度。
+$L_q$、$L_k$ 分别为 query 和 key 的序列长度。
+
 统一规则：输出留在输入 device；不得偷偷搬到 CPU；不得在 kernel 内或 wrapper 中加入全设备同步；
 默认不修改输入；遵守 reference 的 dtype、广播、数学约定和反向语义。
 如果只支持某些 shape/stride，应明确检查并报错，性能实验应声明支持范围。
 
 | 入口 | 输入和输出 | 特别注意 |
 |---|---|---|
-| `embedding(ids, weight)` | ids 的形状为 $[B,T]$、dtype 为 int64；weight 的形状为 $[V,H]$；输出为 $[B,T,H]$ | 重复 token 的梯度累加 |
+| `embedding(ids, weight)` | ids 的形状为 $[B,L]$、dtype 为 int64；weight 的形状为 $[V,d_{\mathrm{model}}]$；输出为 $[B,L,d_{\mathrm{model}}]$ | 重复 token 的梯度累加 |
 | `linear(x, weight)` | x 的形状为 $[\ldots,K]$，weight 为 $[N,K]$，输出为 $[\ldots,N]$ | 权重按 `[out,in]`，无 bias；autocast |
-| `rms_norm(x,w,eps)` | x 的形状为 $[\ldots,H]$，w 为 $[H]$；输出与 x 的 shape/dtype 相同 | FP32 累加、$\epsilon$、跨行 $d\gamma$ |
-| `rope(x,cos,sin)` | x 的形状为 $[B,N_h,T,D_h]$；cos/sin 为 $[B,1,T,D_h/2]$ 或 $[1,1,T,D_h/2]$ | adjacent pairs、非连续 Q/K |
-| `attention(q,k,v,past_len,segments)` | q 的形状为 $[B,N_h,T_q,D_h]$，k/v 为 $[B,N_h,T_k,D_h]$；输出与 q 的 shape 相同 | 非方形 causal mask；缓存视图 stride |
-| `swiglu(gate,up)` | 两个 $[\ldots,I]$ 张量，输出形状相同 | gate/up 来自合并输出的切片 |
+| `rms_norm(x,w,eps)` | x 的形状为 $[\ldots,d_{\mathrm{model}}]$，w 为 $[d_{\mathrm{model}}]$；输出与 x 的 shape/dtype 相同 | FP32 累加、$\epsilon$、跨行 $d\gamma$ |
+| `rope(x,cos,sin)` | x 的形状为 $[B,H,L,d_h]$；cos/sin 为 $[B,1,L,d_h/2]$ 或 $[1,1,L,d_h/2]$ | adjacent pairs、非连续 Q/K |
+| `attention(q,k,v,past_len,segments)` | q 的形状为 $[B,H,L_q,d_h]$，k/v 为 $[B,H,L_k,d_h]$；输出与 q 的 shape 相同 | 非方形 causal mask；缓存视图 stride |
+| `swiglu(gate,up)` | 两个 $[\ldots,d_{\mathrm{ffn}}]$ 张量，输出形状相同 | gate/up 来自合并输出的切片 |
 | `residual(x,update)` | 同 shape → 和 | dtype promotion；避免破坏 residual |
-| `cross_entropy(logits,targets)` | logits 的形状为 $[B,T,V]$，targets 为 $[B,T]$，输出为标量 | FP32 loss、`-100`、有效 token 平均 |
+| `cross_entropy(logits,targets)` | logits 的形状为 $[B,L,V]$，targets 为 $[B,L]$，输出为标量 | FP32 loss、`-100`、有效 token 平均 |
 
 初期保留 embedding、residual、cross_entropy 为参考实现即可。它们提供扩展点，
 不意味着必须把每个入口都重写才算完成项目。
@@ -142,7 +149,7 @@ TMA/WGMMA 不属于本项目 A100 的实现路线。
 
 - Q/K/V 的 transpose 视图，通常非连续。
 - gate/up 的 chunk，行 stride 可能大于自身宽度。
-- KV 前缀视图 `cache[:, :, :length, :]` 的形状为 $[B,N_h,\ell,D_h]$，其中 $\ell=\mathrm{length}$；head stride 仍然按 capacity 而非 length 计算。
+- KV 前缀视图 `cache[:, :, :length, :]` 的形状为 $[B,H,\ell,d_h]$，其中 $\ell=\mathrm{length}$；head stride 仍然按 capacity 而非 length 计算。
 - weight 的转置逻辑与实际 $[N,K]$ 存储。
 
 最初可以显式做 `.contiguous()` 保证正确，但必须把复制时间和分配成本纳入端到端测量。
@@ -176,14 +183,14 @@ Python wrapper 没报错，不意味着编译器能看见 kernel 的数学内容
 
 ### 5.1 RMSNorm / residual + RMSNorm
 
-工作量大致为每行 $O(H)$，通常是带宽/归约/launch 问题。
+工作量大致为每行 $O(d_{\mathrm{model}})$，通常是带宽/归约/launch 问题。
 探索每行一个 warp 或多个 warp、向量 load、FP32 accumulation、减少同步与寄存器压力。
 
 融合目标：将 $h=x+\mathrm{update}$ 与后续 $\operatorname{RMSNorm}(h)$ 合并，减少中间张量的写回与重读。
 注意 block 的 residual stream 还需要 $h$，因此融合入口通常需要同时返回 $h$ 和归一化后的 $h$。
 现有独立 `residual` / `rms_norm` 接口没有假装实现这种跨算子融合；到该阶段再显式增加 fused API 和 reference。
 
-验证：$H\in\{64,65,128,768,1024\}$，$M\in\{1,2,128,4096\}$，零输入、大幅值、不同 dtype、非连续输入。
+验证：$d_{\mathrm{model}}\in\{64,65,128,768,1024\}$，$M\in\{1,2,128,4096\}$，零输入、大幅值、不同 dtype、非连续输入。
 反向还要验证 $d\gamma$ 的跨行 reduction。仅减少 kernel 数而额外保存多个大张量，可能抵消带宽收益。
 
 ### 5.2 RoPE
@@ -204,7 +211,7 @@ gate 和 up 存储在合并输出的两段；跨段配对是否容易被 epilogu
 
 ### 5.4 CUTLASS GEMM
 
-默认训练 $B=8,\ T=512$ 时的主要前向 GEMM：
+默认训练 $B=8,\ L=512$ 时的主要前向 GEMM：
 
 | 层 | $M$ | $N$ | $K$ |
 |---|---:|---:|---:|
@@ -326,9 +333,9 @@ python -m tiny_transformer.check_ops --operator rope --backend student \
 
 还应补充：
 
-- $B\in\{1,2,8\}$，$T\in\{1,17,128,512,2048\}$，$H\in\{64,65,768\}$ 等实际与尾部形状。
+- $B\in\{1,2,8\}$，$L\in\{1,17,128,512,2048\}$，$d_{\mathrm{model}}\in\{64,65,768\}$ 等实际与尾部形状。
 - 输入包含零、较大值、负值，RoPE 包含较大 position。
-- attention 的 $T_q=1,\ T_k>1$ 和 $T_q>1,\ T_k>T_q$。
+- attention 的 $L_q=1,\ L_k>1$ 和 $L_q>1,\ L_k>L_q$。
 - 连续/非连续输入，不同 CUDA stream，重复调用与 cache reset。
 - FP32/BF16/FP16，autocast 与 FP32 master 参数组合。
 - `compute-sanitizer` 下的越界、race、未初始化数据读取。

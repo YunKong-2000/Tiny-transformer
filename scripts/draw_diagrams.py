@@ -39,18 +39,18 @@ def save(fig, name):
 
 fig, ax = canvas(12, 10)
 ax.text(0.2, 9.6, "Decoder-only Transformer: shapes and residual paths", fontsize=17, weight="bold", color=DARK)
-items = [(8.4, "Token IDs  [B,T]", GRAY), (7.25, "Embedding  [V,H]\noutput [B,T,H]", BLUE),
-         (5.85, "Decoder Block x 8\noutput [B,T,H]", GREEN), (4.45, "Final RMSNorm\n[B,T,H]", BLUE),
-         (3.05, "LM Head (tied embedding weight)\n[B,T,H] -> [B,T,V]", BLUE), (1.65, "Cross Entropy\nlogits + shifted targets -> scalar loss", ORANGE)]
+items = [(8.4, "Token IDs  $[B,L]$", GRAY), (7.25, "Embedding  $[V,d_{\\mathrm{model}}]$\noutput $[B,L,d_{\\mathrm{model}}]$", BLUE),
+         (5.85, "Decoder Block $\\times N_{\\mathrm{layers}}$ (= 8)\noutput $[B,L,d_{\\mathrm{model}}]$", GREEN), (4.45, "Final RMSNorm\n$[B,L,d_{\\mathrm{model}}]$", BLUE),
+         (3.05, "LM Head (tied embedding weight)\n$[B,L,d_{\\mathrm{model}}] \\to [B,L,V]$", BLUE), (1.65, "Cross Entropy\nlogits + shifted targets -> scalar loss", ORANGE)]
 for index, (y, text, color) in enumerate(items):
     box(ax, 0.3, y, 5, 0.85, text, color)
     if index:
         arrow(ax, 2.8, items[index - 1][0], 2.8, y + 0.85)
-ax.text(0.4, 0.8, "Training: all T positions predict in parallel.\nGeneration: use the last position to choose a new token.", fontsize=10, color=DARK)
+ax.text(0.4, 0.8, "Training: all $L$ positions predict in parallel.\nGeneration: use the last position to choose a new token.", fontsize=10, color=DARK)
 ax.plot([5.7, 5.7], [0.8, 9.1], color="#cbd5e1", linestyle="--")
 ax.text(7.0, 8.9, "Inside one pre-norm block", fontsize=13, weight="bold", color=DARK)
 ys = [7.75, 6.65, 5.55, 4.45, 3.35, 2.25, 1.15]
-texts = ["x  [B,T,H]", "RMSNorm", "QKV -> RoPE -> Attention -> O", "Add residual: x + attention(x)", "RMSNorm", "Gate / Up -> SiLU * Up -> Down", "Add residual: h + FFN(h)"]
+texts = ["$x$  $[B,L,d_{\\mathrm{model}}]$", "RMSNorm", "QKV -> RoPE -> Attention -> O", "Add residual: x + attention(x)", "RMSNorm", "Gate / Up -> SiLU * Up -> Down", "Add residual: h + FFN(h)"]
 for index, (y, text) in enumerate(zip(ys, texts)):
     box(ax, 6.5, y, 5, 0.65, text, GREEN if index in (3, 6) else BLUE, 10)
     if index:
@@ -61,7 +61,7 @@ save(fig, "architecture")
 
 fig, ax = canvas(12, 5.5)
 ax.text(0.2, 5.1, "Causal attention: rows are queries, columns are keys", fontsize=17, weight="bold", color=DARK)
-for origin, past, qlen, klen, title in [(0.9, 0, 4, 4, "Prefill: Tq = Tk = 4"), (6.1, 4, 2, 6, "Cached chunk: past = 4, Tq = 2, Tk = 6")]:
+for origin, past, qlen, klen, title in [(0.9, 0, 4, 4, "Prefill: $L_q = L_k = 4$"), (6.1, 4, 2, 6, "Cached chunk: past = 4, $L_q = 2$, $L_k = 6$")]:
     ax.text(origin, 4.4, title, fontsize=11, weight="bold", color=DARK)
     for row in range(qlen):
         ax.text(origin - 0.25, 3.65 - row * 0.65, str(past + row), ha="right", va="center")
@@ -83,7 +83,7 @@ for y, title, live in [(4.05, "After prefill", 4), (2.8, "After one decode", 5),
     for col in range(8):
         color = BLUE if col < 4 else (GREEN if col < live else GRAY)
         box(ax, 3.0 + col * 1.02, y, 0.88, 0.65, f"K{col},V{col}" if col < live else "free", color, 10)
-ax.text(0.3, 0.5, "Per-layer storage: [B, heads, capacity, head_dim]. Only K and V are cached.\nRotated K is stored once. Cache length advances after all layers complete.", fontsize=11, color=DARK)
+ax.text(0.3, 0.5, "Per-layer storage: $[B,H,C,d_h]$. Only K and V are cached.\nRotated K is stored once. Cache length advances after all layers complete.", fontsize=11, color=DARK)
 save(fig, "kv-cache")
 
 fig, ax = canvas(12, 7)

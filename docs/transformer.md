@@ -13,16 +13,19 @@
 | 符号 | 意义 | 本项目默认值 |
 |---|---|---:|
 | $B$ | microbatch 中的序列数 | 8 |
-| $T$ | 本次输入的序列长度 | 训练 512 |
-| $H$ | hidden dimension / residual stream 宽度 | 768 |
-| $L$ | block 层数 | 8 |
-| $N_h$ | attention head 数 | 12 |
-| $D_h$ | 每个 head 的宽度，$D_h=H/N_h$ | 64 |
-| $I$ | SwiGLU 中间宽度 | 2048 |
+| $L$ | 本次输入的序列长度 | 训练 512 |
+| $d_{\mathrm{model}}$ | hidden dimension / residual stream 宽度 | 768 |
+| $N_{\mathrm{layers}}$ | block 层数 | 8 |
+| $H$ | attention head 数 | 12 |
+| $d_h$ | 每个 head 的宽度，$d_h=d_{\mathrm{model}}/H$ | 64 |
+| $d_{\mathrm{ffn}}$ | SwiGLU 中间宽度 | 2048 |
 | $V$ | 词表大小 | 8192 |
 | $C$ | 已分配 KV cache 的位置容量 | 随请求指定 |
 
-shape 是逻辑维度，不保证张量连续。张量从 $[B,T,N_h,D_h]$ transpose 成 $[B,N_h,T,D_h]$
+其中 $L_q$、$L_k$ 分别表示 query 和 key 的序列长度；训练和普通 prefill 时二者都等于 $L$。
+模型维度满足 $d_{\mathrm{model}}=H d_h$；层数单独记为 $N_{\mathrm{layers}}$，损失记为 $\mathcal{L}$。
+
+shape 是逻辑维度，不保证张量连续。张量从 $[B,L,H,d_h]$ transpose 成 $[B,H,L,d_h]$
 通常只是改变 stride；理解这一点会直接影响 CuTe/CUDA kernel 的正确性。
 
 ## 1. 模型到底学习什么
@@ -57,7 +60,7 @@ BPE 则将常见字节片段逐步合并成更长的 token。训练 tokenizer �
 前向主线是：
 
 $$
-\text{IDs}\to\text{Embedding}\to\text{Block}^{\times L}
+\text{IDs}\to\text{Embedding}\to\text{Block}^{\times N_{\mathrm{layers}}}
 \to\text{RMSNorm}\to\text{LM Head}\to\text{logits}
 $$
 
@@ -82,15 +85,15 @@ RoPE 在 attention 内引入位置信息。
 参数量可直接推导：
 
 $$
-P=VH+L(4H^2+3HI+2H)+H=62{,}927{,}616
+P=Vd_{\mathrm{model}}+N_{\mathrm{layers}}(4d_{\mathrm{model}}^2+3d_{\mathrm{model}}d_{\mathrm{ffn}}+2d_{\mathrm{model}})+d_{\mathrm{model}}=62{,}927{,}616
 $$
 
-其中 $4H^2$ 是 Q/K/V/O，$3HI$ 是 gate/up/down，$2H$ 是每层两个 RMSNorm 的缩放参数。
-输入 embedding 和输出 LM head 共享权重，所以 $VH$ 只计算一次。
+其中 $4d_{\mathrm{model}}^2$ 是 Q/K/V/O，$3d_{\mathrm{model}}d_{\mathrm{ffn}}$ 是 gate/up/down，$2d_{\mathrm{model}}$ 是每层两个 RMSNorm 的缩放参数。
+输入 embedding 和输出 LM head 共享权重，所以 $Vd_{\mathrm{model}}$ 只计算一次。
 
 ## 3. Embedding 与 Linear：先连接到熟悉的 GEMM
 
-Embedding 权重 $E\in\mathbb{R}^{V\times H}$ 是可训练表格：
+Embedding 权重 $E\in\mathbb{R}^{V\times d_{\mathrm{model}}}$ 是可训练表格：
 
 $$
 X_{b,t,:}=E_{\mathrm{ids}_{b,t},:}
@@ -105,16 +108,16 @@ $$
 Y=XW^\top
 $$
 
-将 $X\in\mathbb{R}^{B\times T\times K}$ 的前两维合并，则 GEMM 的矩阵形状为
-$(M\times K)\cdot(K\times N)\longrightarrow(M\times N)$，其中 $M=B\times T$。
+将 $X\in\mathbb{R}^{B\times L\times K}$ 的前两维合并，则 GEMM 的矩阵形状为
+$(M\times K)\cdot(K\times N)\longrightarrow(M\times N)$，其中 $M=B\times L$。
 
 | 投影 | 存储的权重 | 输出 |
 |---|---|---|
-| 合并 QKV | $[3H,H]$ | $[B,T,3H]$ |
-| Attention O | $[H,H]$ | $[B,T,H]$ |
-| 合并 gate/up | $[2I,H]$ | $[B,T,2I]$ |
-| FFN down | $[H,I]$ | $[B,T,H]$ |
-| LM head | $[V,H]$ | $[B,T,V]$ |
+| 合并 QKV | $[3d_{\mathrm{model}},d_{\mathrm{model}}]$ | $[B,L,3d_{\mathrm{model}}]$ |
+| Attention O | $[d_{\mathrm{model}},d_{\mathrm{model}}]$ | $[B,L,d_{\mathrm{model}}]$ |
+| 合并 gate/up | $[2d_{\mathrm{ffn}},d_{\mathrm{model}}]$ | $[B,L,2d_{\mathrm{ffn}}]$ |
+| FFN down | $[d_{\mathrm{model}},d_{\mathrm{ffn}}]$ | $[B,L,d_{\mathrm{model}}]$ |
+| LM head | $[V,d_{\mathrm{model}}]$ | $[B,L,V]$ |
 
 合并 QKV 或 gate/up 是把具有共同输入的独立 Linear 合并为更大的 GEMM，计算语义不变。
 QKV 和 gate/up 的切片可能是非连续视图，后续算子必须处理这一点。
@@ -130,15 +133,15 @@ $$
 
 ## 4. RMSNorm：按 token 对通道归一化
 
-对一个 token 的 $H$ 维向量：
+对一个 token 的 $d_{\mathrm{model}}$ 维向量：
 
 $$
-r=\left(\frac{1}{H}\sum_{j=1}^{H}x_j^2+\epsilon\right)^{-1/2},
+r=\left(\frac{1}{d_{\mathrm{model}}}\sum_{j=1}^{d_{\mathrm{model}}}x_j^2+\epsilon\right)^{-1/2},
 \quad y_i=x_i r\gamma_i
 $$
 
-$\gamma\in\mathbb{R}^{H}$ 是可训练缩放参数；本项目没有 $\beta$。RMSNorm 不减均值，因此不同于 LayerNorm。
-归约轴只有最后一维 $H$，不跨 batch、sequence 或 head。
+$\gamma\in\mathbb{R}^{d_{\mathrm{model}}}$ 是可训练缩放参数；本项目没有 $\beta$。RMSNorm 不减均值，因此不同于 LayerNorm。
+归约轴只有最后一维 $d_{\mathrm{model}}$，不跨 batch、sequence 或 head。
 
 FP16/BF16 输入的平方和使用 FP32 累加。参考实现先转为 FP32，计算后再转回输入 dtype。
 $\epsilon$ 防止分母为零，不能省略或移动到平方根之外。
@@ -148,7 +151,7 @@ $g_i=\frac{\partial\mathcal{L}}{\partial y_i}$，$u_i=g_i\gamma_i$：
 
 $$
 \frac{\partial\mathcal{L}}{\partial x_i}
-=r u_i-\frac{r^3 x_i}{H}\sum_j u_jx_j
+=r u_i-\frac{r^3 x_i}{d_{\mathrm{model}}}\sum_j u_jx_j
 $$
 
 $$
@@ -160,10 +163,10 @@ $$
 
 ## 5. RoPE：通过旋转使 Q/K 带有位置关系
 
-先将 Q/K 划分为 heads：$[B,N_h,T,D_h]$。本项目每两个相邻通道组成一对：
+先将 Q/K 划分为 heads：$[B,H,L,d_h]$。本项目每两个相邻通道组成一对：
 
 $$
-\theta_j=\mathrm{base}^{-2j/D_h},\quad \phi_{p,j}=p\theta_j
+\theta_j=\mathrm{base}^{-2j/d_h},\quad \phi_{p,j}=p\theta_j
 $$
 
 $$
@@ -189,14 +192,14 @@ $$
 对一个 batch 中的一个 head：
 
 $$
-S=\frac{QK^\top}{\sqrt{D_h}},\quad P=\operatorname{softmax}(S+M),\quad O=PV
+S=\frac{QK^\top}{\sqrt{d_h}},\quad P=\operatorname{softmax}(S+M),\quad O=PV
 $$
 
 Q、K、V 的概念分别是：当前位置用什么特征查询；每个位置提供什么匹配特征；最终取回什么信息。
 它们都是输入经过学习到的线性变换所得，不是预先标注的“问题、答案”。
 
-$S\in\mathbb{R}^{T_q\times T_k}$ 的一行对应一个 query，列对应 keys。
-除以 $\sqrt{D_h}$ 是为控制内积的尺度，避免维度增大时 softmax 过早饱和。
+$S\in\mathbb{R}^{L_q\times L_k}$ 的一行对应一个 query，列对应 keys。
+除以 $\sqrt{d_h}$ 是为控制内积的尺度，避免维度增大时 softmax 过早饱和。
 
 ![prefill 与缓存查询的正确 mask](assets/causal-mask.png)
 
@@ -212,7 +215,7 @@ $$
 \mathrm{key\_index}\le p+\mathrm{query\_index}
 $$
 
-例如 $p=4,\ T_q=2,\ T_k=6$，两个 query 分别能看见 5 个和 6 个 key。
+例如 $p=4,\ L_q=2,\ L_k=6$，两个 query 分别能看见 5 个和 6 个 key。
 不能直接对 $2\times6$ 矩阵应用从左上角开始的普通三角 mask。
 本项目 SDPA 路径在这种情况下传入显式 mask；单 token decode 直接允许访问全部已缓存 key。
 PyTorch SDPA 的 bool mask 中 `True` 表示允许参与 attention，要留意其他 API 可能采用相反含义。
@@ -242,8 +245,8 @@ O&=PV
 &&\Longrightarrow\quad dV=P^\top dO,\quad dP=dO\,V^\top,\\
 P&=\operatorname{softmax}(S+M)
 &&\Longrightarrow\quad dS=\operatorname{SoftmaxBackward}(P,dP),\\
-S&=\frac{QK^\top}{\sqrt{D_h}}
-&&\Longrightarrow\quad dQ=\frac{dS\,K}{\sqrt{D_h}},\quad dK=\frac{dS^\top Q}{\sqrt{D_h}}.
+S&=\frac{QK^\top}{\sqrt{d_h}}
+&&\Longrightarrow\quad dQ=\frac{dS\,K}{\sqrt{d_h}},\quad dK=\frac{dS^\top Q}{\sqrt{d_h}}.
 \end{aligned}
 $$
 
@@ -251,12 +254,12 @@ $$
 
 ### 6.3 多头与输出投影
 
-每个 head 独立计算 attention，再把 $[B,N_h,T,D_h]$ 合并回 $[B,T,H]$，经过 O Linear。
+每个 head 独立计算 attention，再把 $[B,H,L,d_h]$ 合并回 $[B,L,d_{\mathrm{model}}]$，经过 O Linear。
 多头允许学习不同的相互作用，但不能保证每个 head 都能被人为赋予明确的语义标签。
 
 ### 6.4 SDPA / FlashAttention 改变了什么
 
-朴素 attention 保存 $S$ 和 $P$，每个都包含 $B\times N_h\times T^2$ 个元素。
+朴素 attention 保存 $S$ 和 $P$，每个都包含 $B\times H\times L^2$ 个元素。
 分块的 FlashAttention 路径在片上处理 tiles，并使用 online softmax 合并归一化统计量，避免将完整概率矩阵写回 HBM。
 它通常仍执行平方级的 dense attention 算术；主要改进是中间数据流和实际执行效率。
 
@@ -273,8 +276,8 @@ $$
 z=\operatorname{SiLU}(g)\odot u,\quad Y=zW_d^\top
 $$
 
-其中 $g,u,z$ 都是 $[B,T,I]$，$\operatorname{SiLU}(x)=x\sigma(x)$，$\sigma$ 表示 sigmoid 函数。
-gate 调制 up 分支的特征，最后由 down 投影回 $H$ 维，才能与 residual 相加。
+其中 $g,u,z$ 都是 $[B,L,d_{\mathrm{ffn}}]$，$\operatorname{SiLU}(x)=x\sigma(x)$，$\sigma$ 表示 sigmoid 函数。
+gate 调制 up 分支的特征，最后由 down 投影回 $d_{\mathrm{model}}$ 维，才能与 residual 相加。
 
 同一位置的通道会相互混合；不同位置共享权重，但 FFN 本身不会跨位置读数据。
 Attention 负责跨位置交互，FFN 负责逐位置非线性变换。
@@ -293,7 +296,7 @@ $$
 
 ## 8. LM head、Cross Entropy 与“学会”的含义
 
-最终隐藏状态经过词表投影，logits 的形状为 $[B,T,V]$。logit 是未归一化分数。
+最终隐藏状态经过词表投影，logits 的形状为 $[B,L,V]$。logit 是未归一化分数。
 训练目标是正确 token 的负对数概率：
 
 $$
@@ -315,7 +318,7 @@ perplexity 为 $\exp(\mathcal{L})$，其中 $\mathcal{L}$ 是平均 loss；只�
 ### 9.1 两种 packed batch 语义
 
 数据准备把每篇文档编码为 BOS、正文 token 与 EOS 的顺序拼接，再拼成 token 流。
-dataset 随机取长度 $T+1$ 的窗口，前 $T$ 个是 input，后 $T$ 个是 target。
+dataset 随机取长度 $L+1$ 的窗口，前 $L$ 个是 input，后 $L$ 个是 target。
 **标签偏移只发生一次**，模型和 loss 不再重复 shift。
 
 ```text
@@ -390,14 +393,14 @@ autocast 不意味着每个张量都变为 BF16。FP32 residual 与 norm 路径�
 缓存正确的原因：在 causal decoder 中，已有位置的隐藏状态不依赖未来 token，
 所以其每层 K/V 不会因追加 token 而改变。条件是模型权重、位置定义、输入序列等保持一致。
 
-本项目 cache 的每层布局为 $[B,N_h,C,D_h]$，预分配容量，前缀是视图；每步原位写入，
+本项目 cache 的每层布局为 $[B,H,C,d_h]$，预分配容量，前缀是视图；每步原位写入，
 避免 `torch.cat` 反复复制全部历史数据。缓存长度在所有层完成后才统一增加。
 预填充后第一个输出 token 尚未写入 cache；下一次 decode 才把它作为输入写入。
 
 总缓存字节数：
 
 $$
-\mathrm{KV\ bytes}=2\times L\times B\times C\times H\times\operatorname{bytes}(\mathrm{dtype})
+\mathrm{KV\ bytes}=2\times N_{\mathrm{layers}}\times B\times C\times d_{\mathrm{model}}\times\operatorname{bytes}(\mathrm{dtype})
 $$
 
 BF16 默认模型每个 batch、每个 token 需要 24 KiB KV；$B=1$、$C=2048$ 时约 48 MiB。
@@ -410,13 +413,13 @@ reset 只改变有效长度，不必清零整块显存，因为 attention 只读
 
 | 阶段 | Linear 的主要规模 | Attention 主要规模 | 常见限制 |
 |---|---|---|---|
-| 训练 / prefill | $M=B\times T$，较大 GEMM | $QK^\top$ 与 $PV$ 的计算量随 $T^2$ 增长 | Tensor Core 利用率、激活/中间显存 |
+| 训练 / prefill | $M=B\times L$，较大 GEMM | $QK^\top$ 与 $PV$ 的计算量随 $L^2$ 增长 | Tensor Core 利用率、激活/中间显存 |
 | 小 batch decode | $M=B$，瘦 GEMM/GEMV | 单 Q 读取历史 K/V | 权重与 cache 带宽、launch、CPU 调度 |
 
-忽略 logits 等部分，dense attention 的两个矩阵乘约需 $4BT^2H$ FLOPs/层（一次乘加记 2）。
+忽略 logits 等部分，dense attention 的两个矩阵乘约需 $4BL^2d_{\mathrm{model}}$ FLOPs/层（一次乘加记 2）。
 单步 decode 大致随历史长度线性增长，并非总生成过程都为线性复杂度。
 
-例如 $B=8$、$N_h=12$、$T=4096$，单个 BF16 $B\times N_h\times T\times T$ 张量就约 3 GiB。
+例如 $B=8$、$H=12$、$L=4096$，单个 BF16 $B\times H\times L\times L$ 张量就约 3 GiB。
 这解释了为什么长序列下不能仅凭“模型参数只有约 120MB BF16”估算训练显存。
 
 $6\times\text{参数量}\times\text{训练 token 数}$ 是常见训练 FLOPs 粗估，忽略或简化 attention 等开销；
@@ -424,9 +427,9 @@ $6\times\text{参数量}\times\text{训练 token 数}$ 是常见训练 FLOPs 粗
 
 ## 12. 动手检查：能解释这些，才算掌握主线
 
-1. 对 $B=2$、$T=5$，写出每个算子的形状，特别是 $QK^\top$ 和 gate/up。
+1. 对 $B=2$、$L=5$，写出每个算子的形状，特别是 $QK^\top$ 和 gate/up。
 2. 改变输入最后两个 token，验证更早位置 logits 不变。
-3. 用 $T=4$ 的小矩阵手算 causal softmax 的一行，确认非法权重为零、合法权重和为 1。
+3. 用 $L=4$ 的小矩阵手算 causal softmax 的一行，确认非法权重为零、合法权重和为 1。
 4. 比较整段前向和 prefill+逐 token decode 的 logits，解释误差来源。
 5. 将 RoPE decode position 错误地固定为 0，观察第 4 项测试如何失败，然后恢复。
 6. 将 label 再错移一位，解释为什么 loss 仍可能下降但任务已变。

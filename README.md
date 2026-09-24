@@ -9,8 +9,9 @@
 
 1. 阅读 [Transformer 算法手册](docs/transformer.md)：从 next-token prediction 到反向传播与 KV Cache。
 2. 阅读 [开发与优化手册](docs/development.md)：算子契约、CuTe 任务、测试和测量边界。
-3. 跑通下面的 smoke 流程，再逐个启用 `student` 算子。
-4. 查看 [当前验证记录](docs/validation.md)，区分本地已验证与 A100 待验证内容。
+3. 阅读 [八种 Student 算子开发契约](docs/operators/README.md)：逐项查看真实输入输出、精度、布局和功能边界。
+4. 跑通下面的 smoke 流程，再逐个启用 `student` 算子。
+5. 查看 [当前验证记录](docs/validation.md)，区分本地已验证与 A100 待验证内容。
 
 **服务器不能联网时，使用 [离线部署指南](docs/offline.md)。** 本机已准备真实 TinyStories 子集、
 8K BPE、编码后的 train/val 和 Linux tokenizer wheel；离线包同时包含项目代码与校验文件。

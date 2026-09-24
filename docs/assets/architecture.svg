@@ -6,7 +6,7 @@
   <rdf:RDF xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
    <cc:Work>
     <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage"/>
-    <dc:date>2026-09-23T20:06:46.727847</dc:date>
+    <dc:date>2026-09-24T09:31:19.152908</dc:date>
     <dc:format>image/svg+xml</dc:format>
     <dc:creator>
      <cc:Agent>
@@ -40,7 +40,7 @@ Q 25.866 50.7168 25.866 55.152
 L 25.866 96.732 
 Q 25.866 101.1672 30.33 101.1672 
 z
-" clip-path="url(#p6f65808695)" style="fill: #e2e8f0; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
+" clip-path="url(#p5043a48f8c)" style="fill: #e2e8f0; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
    </g>
    <g id="patch_3">
     <path d="M 30.33 164.9232 
@@ -53,7 +53,7 @@ Q 25.866 114.4728 25.866 118.908
 L 25.866 160.488 
 Q 25.866 164.9232 30.33 164.9232 
 z
-" clip-path="url(#p6f65808695)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
+" clip-path="url(#p5043a48f8c)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
    </g>
    <g id="patch_4">
     <path d="M 30.33 242.5392 
@@ -66,7 +66,7 @@ Q 25.866 192.0888 25.866 196.524
 L 25.866 238.104 
 Q 25.866 242.5392 30.33 242.5392 
 z
-" clip-path="url(#p6f65808695)" style="fill: #dcfce7; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
+" clip-path="url(#p5043a48f8c)" style="fill: #dcfce7; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
    </g>
    <g id="patch_5">
     <path d="M 30.33 320.1552 
@@ -79,7 +79,7 @@ Q 25.866 269.7048 25.866 274.14
 L 25.866 315.72 
 Q 25.866 320.1552 30.33 320.1552 
 z
-" clip-path="url(#p6f65808695)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
+" clip-path="url(#p5043a48f8c)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
    </g>
    <g id="patch_6">
     <path d="M 30.33 397.7712 
@@ -92,7 +92,7 @@ Q 25.866 347.3208 25.866 351.756
 L 25.866 393.336 
 Q 25.866 397.7712 30.33 397.7712 
 z
-" clip-path="url(#p6f65808695)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
+" clip-path="url(#p5043a48f8c)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
    </g>
    <g id="patch_7">
     <path d="M 30.33 475.3872 
@@ -105,7 +105,7 @@ Q 25.866 424.9368 25.866 429.372
 L 25.866 470.952 
 Q 25.866 475.3872 30.33 475.3872 
 z
-" clip-path="url(#p6f65808695)" style="fill: #ffedd5; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
+" clip-path="url(#p5043a48f8c)" style="fill: #ffedd5; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
    </g>
    <g id="patch_8">
     <path d="M 376.29 137.2032 
@@ -118,7 +118,7 @@ Q 371.826 97.8408 371.826 102.276
 L 371.826 132.768 
 Q 371.826 137.2032 376.29 137.2032 
 z
-" clip-path="url(#p6f65808695)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
+" clip-path="url(#p5043a48f8c)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
    </g>
    <g id="patch_9">
     <path d="M 376.29 198.1872 
@@ -131,7 +131,7 @@ Q 371.826 158.8248 371.826 163.26
 L 371.826 193.752 
 Q 371.826 198.1872 376.29 198.1872 
 z
-" clip-path="url(#p6f65808695)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
+" clip-path="url(#p5043a48f8c)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
    </g>
    <g id="patch_10">
     <path d="M 376.29 259.1712 
@@ -144,7 +144,7 @@ Q 371.826 219.8088 371.826 224.244
 L 371.826 254.736 
 Q 371.826 259.1712 376.29 259.1712 
 z
-" clip-path="url(#p6f65808695)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
+" clip-path="url(#p5043a48f8c)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
    </g>
    <g id="patch_11">
     <path d="M 376.29 320.1552 
@@ -157,7 +157,7 @@ Q 371.826 280.7928 371.826 285.228
 L 371.826 315.72 
 Q 371.826 320.1552 376.29 320.1552 
 z
-" clip-path="url(#p6f65808695)" style="fill: #dcfce7; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
+" clip-path="url(#p5043a48f8c)" style="fill: #dcfce7; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
    </g>
    <g id="patch_12">
     <path d="M 376.29 381.1392 
@@ -170,7 +170,7 @@ Q 371.826 341.7768 371.826 346.212
 L 371.826 376.704 
 Q 371.826 381.1392 376.29 381.1392 
 z
-" clip-path="url(#p6f65808695)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
+" clip-path="url(#p5043a48f8c)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
    </g>
    <g id="patch_13">
     <path d="M 376.29 442.1232 
@@ -183,7 +183,7 @@ Q 371.826 402.7608 371.826 407.196
 L 371.826 437.688 
 Q 371.826 442.1232 376.29 442.1232 
 z
-" clip-path="url(#p6f65808695)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
+" clip-path="url(#p5043a48f8c)" style="fill: #dbeafe; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
    </g>
    <g id="patch_14">
     <path d="M 376.29 503.1072 
@@ -196,36 +196,56 @@ Q 371.826 463.7448 371.826 468.18
 L 371.826 498.672 
 Q 371.826 503.1072 376.29 503.1072 
 z
-" clip-path="url(#p6f65808695)" style="fill: #dcfce7; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
+" clip-path="url(#p5043a48f8c)" style="fill: #dcfce7; stroke: #64748b; stroke-width: 1.1; stroke-linejoin: miter"/>
    </g>
    <g id="line2d_1">
     <path d="M 328.86 520.848 
 L 328.86 60.696 
-" clip-path="url(#p6f65808695)" style="fill: none; stroke-dasharray: 5.55,2.4; stroke-dashoffset: 0; stroke: #cbd5e1; stroke-width: 1.5"/>
+" clip-path="url(#p5043a48f8c)" style="fill: none; stroke-dasharray: 5.55,2.4; stroke-dashoffset: 0; stroke: #cbd5e1; stroke-width: 1.5"/>
    </g>
    <g id="line2d_2">
     <path d="M 373.5 117.7992 
 L 348.39 117.7992 
 L 348.39 300.7512 
 L 373.5 300.7512 
-" clip-path="url(#p6f65808695)" style="fill: none; stroke: #ea580c; stroke-width: 1.5; stroke-linecap: square"/>
+" clip-path="url(#p5043a48f8c)" style="fill: none; stroke: #ea580c; stroke-width: 1.5; stroke-linecap: square"/>
    </g>
    <g id="line2d_3">
     <path d="M 652.5 300.7512 
 L 674.82 300.7512 
 L 674.82 483.7032 
 L 652.5 483.7032 
-" clip-path="url(#p6f65808695)" style="fill: none; stroke: #ea580c; stroke-width: 1.5; stroke-linecap: square"/>
+" clip-path="url(#p5043a48f8c)" style="fill: none; stroke: #ea580c; stroke-width: 1.5; stroke-linecap: square"/>
    </g>
    <g id="text_1">
     <text style="fill: #172554; font: 700 17px 'DejaVu Sans'; text-anchor: start" x="21.96" y="32.976" transform="rotate(-0 21.96 32.976)">Decoder-only Transformer: shapes and residual paths</text>
    </g>
    <g id="text_2">
-    <text style="fill: #172554; font: 11px 'DejaVu Sans'; text-anchor: middle" x="167.04" y="78.977312" transform="rotate(-0 167.04 78.977312)">Token IDs  [B,T]</text>
+    <!-- Token IDs  $[B,L]$ -->
+    <g style="fill: #172554" transform="translate(122.325 78.977312)">
+     <text>
+      <tspan style="font: 11px 'DejaVu Sans'" x="0 6.719238 13.449219 19.819336 26.586914 33.558594 37.055176 40.299316 48.769531 54.500488 57.99707 61.493652 73.331543 85.099609" y="-0.640625">Token IDs  [,]</tspan>
+      <tspan style="font: oblique 11px 'DejaVu Sans'" x="65.785156 78.971191" y="-0.640625">BL</tspan>
+     </text>
+    </g>
    </g>
    <g id="text_3">
-    <text style="fill: #172554; font: 11px 'DejaVu Sans'" transform="translate(118.408828 136.574516)">Embedding  [V,H]</text>
-    <text style="fill: #172554; font: 11px 'DejaVu Sans'" transform="translate(128.094844 148.892109)">output [B,T,H]</text>
+    <!-- Embedding  $[V,d_{\mathrm{model}}]$ -->
+    <g style="fill: #172554" transform="translate(105.825 136.552)">
+     <text>
+      <tspan style="font: 11px 'DejaVu Sans'" x="0 6.950195 17.665527 24.647949 31.415527 38.397949 45.380371 48.436523 55.408203 62.390625 65.887207 69.383789 81.200195 118.099072" y="-0.640625">Embedding  [,]</tspan>
+      <tspan style="font: oblique 11px 'DejaVu Sans'" x="73.675293 86.839844" y="-0.640625">Vd</tspan>
+      <tspan style="font: 7.7px 'DejaVu Sans'" x="93.822266 101.322998 106.033984 110.92168 115.658984" y="1.1640625">model</tspan>
+     </text>
+    </g>
+    <!-- output $[B,L,d_{\mathrm{model}}]$ -->
+    <g style="fill: #172554" transform="translate(114.735 148.894)">
+     <text>
+      <tspan style="font: 11px 'DejaVu Sans'" x="0 6.72998 13.70166 18.014648 24.99707 31.96875 36.281738 39.77832 51.616211 63.384277 100.283154" y="-0.640625">output [,,]</tspan>
+      <tspan style="font: oblique 11px 'DejaVu Sans'" x="44.069824 57.255859 69.023926" y="-0.640625">BLd</tspan>
+      <tspan style="font: 7.7px 'DejaVu Sans'" x="76.006348 83.50708 88.218066 93.105762 97.843066" y="1.1640625">model</tspan>
+     </text>
+    </g>
    </g>
    <g id="patch_15">
     <path d="M 167.04 101.50585 
@@ -237,8 +257,22 @@ L 164.84 108.062305
 " style="fill: none; stroke: #475569; stroke-width: 1.5; stroke-linecap: round"/>
    </g>
    <g id="text_4">
-    <text style="fill: #172554; font: 11px 'DejaVu Sans'" transform="translate(117.020078 214.190516)">Decoder Block x 8</text>
-    <text style="fill: #172554; font: 11px 'DejaVu Sans'" transform="translate(128.094844 226.508109)">output [B,T,H]</text>
+    <!-- Decoder Block $\times N_{\mathrm{layers}}$ (= 8) -->
+    <g style="fill: #172554" transform="translate(89.05 213.618)">
+     <text>
+      <tspan style="font: 11px 'DejaVu Sans'" x="0 8.470215 15.237793 21.285645 28.015625 34.998047 41.765625 46.288086 49.784668 57.331055 60.387207 67.117188 73.165039 79.535156 83.031738 124.107178 127.60376 131.895264 141.112061 144.608643 151.607178" y="-0.640625">Decoder Block × (= 8)</tspan>
+      <tspan style="font: oblique 11px 'DejaVu Sans'" x="92.248535" y="-0.640625">N</tspan>
+      <tspan style="font: 7.7px 'DejaVu Sans'" x="100.477051 102.616357 107.334863 111.891699 116.629004 119.794727" y="1.1640625">layers</tspan>
+     </text>
+    </g>
+    <!-- output $[B,L,d_{\mathrm{model}}]$ -->
+    <g style="fill: #172554" transform="translate(114.735 227.06)">
+     <text>
+      <tspan style="font: 11px 'DejaVu Sans'" x="0 6.72998 13.70166 18.014648 24.99707 31.96875 36.281738 39.77832 51.616211 63.384277 100.283154" y="-0.640625">output [,,]</tspan>
+      <tspan style="font: oblique 11px 'DejaVu Sans'" x="44.069824 57.255859 69.023926" y="-0.640625">BLd</tspan>
+      <tspan style="font: 7.7px 'DejaVu Sans'" x="76.006348 83.50708 88.218066 93.105762 97.843066" y="1.1640625">model</tspan>
+     </text>
+    </g>
    </g>
    <g id="patch_16">
     <path d="M 167.04 165.258804 
@@ -251,7 +285,14 @@ L 164.84 185.674999
    </g>
    <g id="text_5">
     <text style="fill: #172554; font: 11px 'DejaVu Sans'" transform="translate(125.554531 291.806516)">Final RMSNorm</text>
-    <text style="fill: #172554; font: 11px 'DejaVu Sans'" transform="translate(147.983359 304.124109)">[B,T,H]</text>
+    <!-- $[B,L,d_{\mathrm{model}}]$ -->
+    <g style="fill: #172554" transform="translate(134.59 304.124109)">
+     <text>
+      <tspan style="font: 11px 'DejaVu Sans'" x="0 11.837891 23.605957 60.504834" y="-0.640625">[,,]</tspan>
+      <tspan style="font: oblique 11px 'DejaVu Sans'" x="4.291504 17.477539 29.245605" y="-0.640625">BLd</tspan>
+      <tspan style="font: 7.7px 'DejaVu Sans'" x="36.228027 43.72876 48.439746 53.327441 58.064746" y="1.1640625">model</tspan>
+     </text>
+    </g>
    </g>
    <g id="patch_17">
     <path d="M 167.04 242.874804 
@@ -264,7 +305,14 @@ L 164.84 263.290999
    </g>
    <g id="text_6">
     <text style="fill: #172554; font: 11px 'DejaVu Sans'" transform="translate(73.354375 369.422516)">LM Head (tied embedding weight)</text>
-    <text style="fill: #172554; font: 11px 'DejaVu Sans'" transform="translate(119.211484 381.740109)">[B,T,H] -&gt; [B,T,V]</text>
+    <!-- $[B,L,d_{\mathrm{model}}] \to [B,L,V]$ -->
+    <g style="fill: #172554" transform="translate(107.31 381.740109)">
+     <text>
+      <tspan style="font: 11px 'DejaVu Sans'" x="0 11.837891 23.605957 60.504834 66.939404 78.299268 90.137158 101.905225 115.069775" y="-0.640625">[,,]→[,,]</tspan>
+      <tspan style="font: oblique 11px 'DejaVu Sans'" x="4.291504 17.477539 29.245605 82.590771 95.776807 107.544873" y="-0.640625">BLdBLV</tspan>
+      <tspan style="font: 7.7px 'DejaVu Sans'" x="36.228027 43.72876 48.439746 53.327441 58.064746" y="1.1640625">model</tspan>
+     </text>
+    </g>
    </g>
    <g id="patch_18">
     <path d="M 167.04 320.490804 
@@ -289,14 +337,27 @@ L 164.84 418.522999
 " style="fill: none; stroke: #475569; stroke-width: 1.5; stroke-linecap: round"/>
    </g>
    <g id="text_8">
-    <text style="fill: #172554; font: 10px 'DejaVu Sans'" transform="translate(33.12 509.650188)">Training: all T positions predict in parallel.</text>
+    <!-- Training: all $L$ positions predict in parallel. -->
+    <g style="fill: #172554" transform="translate(33.12 509.629875)">
+     <text>
+      <tspan style="font: 10px 'DejaVu Sans'" x="0 6.108398 10.219727 16.347656 19.125977 25.463867 28.242188 34.580078 40.927734 44.296875 47.475586 53.603516 56.381836 59.160156 67.910156 71.088867 77.436523 83.554688 88.764648 91.542969 95.463867 98.242188 104.360352 110.698242 115.908203 119.086914 125.43457 129.545898 135.698242 142.045898 144.824219 150.322266 154.243164 157.421875 160.200195 166.538086 169.716797 176.064453 182.192383 186.303711 192.431641 195.209961 197.988281 204.140625 206.918945" y="-0.40625">Training: all  positions predict in parallel.</tspan>
+      <tspan style="font: oblique 10px 'DejaVu Sans'" x="62.338867" y="-0.40625">L</tspan>
+     </text>
+    </g>
     <text style="fill: #172554; font: 10px 'DejaVu Sans'" transform="translate(33.12 520.848)">Generation: use the last position to choose a new token.</text>
    </g>
    <g id="text_9">
     <text style="fill: #172554; font: 700 13px 'DejaVu Sans'; text-anchor: start" x="401.4" y="71.784" transform="rotate(-0 401.4 71.784)">Inside one pre-norm block</text>
    </g>
    <g id="text_10">
-    <text style="fill: #172554; font: 10px 'DejaVu Sans'; text-anchor: middle" x="513" y="120.281375" transform="rotate(-0 513 120.281375)">x  [B,T,H]</text>
+    <!-- $x$  $[B,L,d_{\mathrm{model}}]$ -->
+    <g style="fill: #172554" transform="translate(477.4 120.281375)">
+     <text>
+      <tspan style="font: oblique 10px 'DejaVu Sans'" x="0 16.176758 28.164062 38.862305" y="-0.40625">xBLd</tspan>
+      <tspan style="font: 10px 'DejaVu Sans'" x="5.917969 9.09668 12.275391 23.037109 33.735352 67.279785" y="-0.40625">  [,,]</tspan>
+      <tspan style="font: 7px 'DejaVu Sans'" x="45.209961 52.028809 56.311523 60.754883 65.061523" y="1.234375">model</tspan>
+     </text>
+    </g>
    </g>
    <g id="text_11">
     <text style="fill: #172554; font: 10px 'DejaVu Sans'; text-anchor: middle" x="513" y="181.265375" transform="rotate(-0 513 181.265375)">RMSNorm</text>
@@ -373,7 +434,7 @@ L 510.8 457.333716
   </g>
  </g>
  <defs>
-  <clipPath id="p6f65808695">
+  <clipPath id="p5043a48f8c">
    <rect x="10.8" y="10.8" width="669.6" height="554.4"/>
   </clipPath>
  </defs>
