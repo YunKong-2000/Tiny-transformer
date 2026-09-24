@@ -72,14 +72,24 @@ $$
 
 ## 6. 建议的实现阶段与验收
 
+当前 student 已接入 **CUDA FP32 连续输入的前向**，保留一 warp 一 ID 的标量和 float4 两条路径。
+weight/output 指针均为 16 字节对齐且 H 能被 4 整除时使用 float4，否则使用标量 kernel。
+支持空 IDs，拒绝 V/H 为零、非连续输入和低精度 weight。
+扩展在首次调用时延迟编译，构建依赖和完整命令见 [csrc 说明](../../csrc/README.md)。
+当前尚无 backward：梯度开启且 weight 需要梯度时明确报错，不能用于训练。
+非法 ID 通过异步设备断言报错；不会静默跳过或通过 CPU 读回检查。
+
 1. FP32/BF16 inference：按 ID gather 一整行，保证向量 load/store 对齐与行尾处理。
 2. 加入重复 ID 的 backward 累加，验证不同 batch/sequence 的重复情况。
 3. 验证 FP32 master 参数的 AMP 训练，再考虑查表缓存与带宽优化。
 
 ```bash
 python -m tiny_transformer.check_ops --operator embedding --backend student \
-  --device cuda --precision fp32 --backward --output runs/embedding-fp32.json
+  --device cuda --precision fp32 --output runs/embedding-fp32.json
+python -m unittest discover -s tests -p 'test_student_embedding.py' -v
 ```
+
+完成 backward 后再为 `check_ops` 加 `--backward`；该选项当前应明确失败。
 
 补充用例：所有 ID 相同、ID 0 与最大合法 ID、重复 BOS/EOS、非连续 IDs、真实词表，
 以及共享 embedding/LM head 权重的整模型梯度。BF16 推理和 BF16 AMP 训练要分别检查。
