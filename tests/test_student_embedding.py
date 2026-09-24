@@ -1,4 +1,5 @@
 """Student embedding integration tests; CUDA cases JIT-build the real extension."""
+from contextlib import contextmanager
 from pathlib import Path
 import subprocess
 import sys
@@ -13,6 +14,18 @@ from tiny_transformer.operators._extension import load_embedding_extension
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@contextmanager
+def full_precision_matmul():
+    # Full-sequence and cached GEMMs have different shapes. Under TF32 their
+    # numerical differences can exceed this FP32 correctness test's tolerance.
+    previous = torch.get_float32_matmul_precision()
+    try:
+        torch.set_float32_matmul_precision("highest")
+        yield
+    finally:
+        torch.set_float32_matmul_precision(previous)
 
 
 class StudentEmbeddingHostTests(unittest.TestCase):
@@ -161,17 +174,44 @@ class StudentEmbeddingCudaTests(unittest.TestCase):
 
     @torch.inference_mode()
     def test_model_prefill_and_cached_decode(self):
-        model = Transformer(ModelConfig(vocab_size=31, dim=32, n_layers=1,
-                                        n_heads=4, hidden_dim=48, max_seq_len=32)).cuda().eval()
-        ids = torch.randint(31, (2, 11), device="cuda")
-        expected = model(ids)
-        model.ops = Operators({"embedding": "student"})
-        torch.testing.assert_close(model(ids), expected, atol=0, rtol=0)
-        cache = model.new_cache(2, 16)
-        parts = [model(ids[:, :4].contiguous(), cache=cache)]
-        parts.extend(model(ids[:, index:index + 1].contiguous(), cache=cache)
-                     for index in range(4, ids.size(1)))
-        torch.testing.assert_close(torch.cat(parts, dim=1), expected, atol=2e-5, rtol=1e-4)
+        with full_precision_matmul():
+            model = Transformer(ModelConfig(vocab_size=31, dim=32, n_layers=1,
+                                            n_heads=4, hidden_dim=48, max_seq_len=32)).cuda().eval()
+            ids = torch.randint(31, (2, 11), device="cuda")
+            chunks = [ids[:, :4].contiguous()]
+            chunks.extend(ids[:, index:index + 1].contiguous()
+                          for index in range(4, ids.size(1)))
+
+            expected = model(ids)
+            reference_cache = model.new_cache(2, 16)
+            reference_parts = [model(chunk, cache=reference_cache) for chunk in chunks]
+
+            # Check the reference's cache path independently of the student op.
+            # Retain the original tolerance; do not hide errors by widening it.
+            with self.subTest(stage="reference cached vs full"):
+                torch.testing.assert_close(torch.cat(reference_parts, dim=1), expected,
+                                           atol=2e-5, rtol=1e-4)
+
+            model.ops = Operators({"embedding": "student"})
+            # Pure gather must remain exact on full, prefill and decode inputs.
+            for index, chunk in enumerate([ids] + chunks):
+                with self.subTest(stage="embedding", input_index=index):
+                    torch.testing.assert_close(student.embedding(chunk, model.embedding),
+                                               reference.embedding(chunk, model.embedding),
+                                               atol=0, rtol=0)
+
+            with self.subTest(stage="student full vs reference full"):
+                torch.testing.assert_close(model(ids), expected, atol=0, rtol=0)
+
+            cache = model.new_cache(2, 16)
+            parts = []
+            for index, (chunk, reference_part) in enumerate(zip(chunks, reference_parts)):
+                actual = model(chunk, cache=cache)
+                parts.append(actual)
+                with self.subTest(stage="student cached vs reference cached", chunk=index):
+                    torch.testing.assert_close(actual, reference_part, atol=2e-5, rtol=1e-4)
+            with self.subTest(stage="student cached vs reference full"):
+                torch.testing.assert_close(torch.cat(parts, dim=1), expected, atol=2e-5, rtol=1e-4)
 
     def test_invalid_ids_fail_in_isolated_processes(self):
         # A device-side assertion poisons its CUDA context; never trigger it in

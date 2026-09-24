@@ -24,6 +24,10 @@ python -m tiny_transformer.benchmark --config configs/smoke.json \
 ```
 
 测试会在有 CUDA 时真实编译扩展；没有 CUDA 时跳过 GPU 用例。
+模型缓存对照测试临时将 FP32 matmul precision 设为 `highest`，结束后恢复原设置，
+避免 TF32 下不同 GEMM 尺寸的数值差异干扰 FP32 验收。
+该测试分别检查纯 reference 缓存路径、各输入的 embedding 精确相等、
+student/reference 相同缓存步骤及缓存结果与完整前向；不会放宽原有误差阈值。
 支持连续二维 int64 IDs、连续二维 FP32 weight，以及非零 storage offset；
 支持空 IDs，但 weight 的 V/H 必须为正。非连续输入显式报错。
 weight 需要梯度且梯度模式开启时显式拒绝；验证/推理请用 `no_grad` 或 `inference_mode`。
