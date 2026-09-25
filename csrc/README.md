@@ -4,7 +4,13 @@
 256 线程的 block 同时处理 8 个 ID；按地址与行宽对齐选择 float4 或标量 kernel。
 反向每个 warp 对最多 32 个位置按 ID 分组，合并组内梯度后原子累加到全零梯度表。
 另提供一 warp 一 token 的 baseline 反向，共用输入检查、清零和 stream 管理。
+另包含 RMSNorm 的 FP32 CUDA 前向，每个 warp 对一行归约；Python 入口显式复制非连续输入，
+支持 `[..., H]` 与 `[H]`。尚未实现 RMSNorm 反向或低精度路径。
 其他算子尚未实现；CUDA 编译、数值及性能需在目标 GPU 上验收。
+
+RMSNorm 使用独立的 `rms_norm/bindings.cpp` 和 `load_rms_norm_extension()`，
+只编译本算子的绑定与 CUDA 源码，避免与 embedding 互相产生未定义符号。
+逐步接入说明、代码检查结果与测试命令见 [RMSNorm 文档](../docs/operators/rms_norm.md#7-本次代码检查与-pytorch-接入步骤)。
 
 调用链：`student.embedding` → `operators/_extension.py` 的延迟 JIT 加载 →
 `bindings.cpp::embedding_forward` → `embedding_forward_cuda` → CUDA kernel。

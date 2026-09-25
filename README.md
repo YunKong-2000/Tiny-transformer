@@ -1,7 +1,7 @@
 # Tiny Transformer Lab
 
 面向 **A100 80GB PCIe + `nvcr.io/nvidia/pytorch:25.08-py3`** 的单卡训练与推理学习项目。
-完整 PyTorch 参考框架已经提供；student embedding 已接入 CUDA FP32 前向与一阶反向，其余学生算子待实现。
+完整 PyTorch 参考框架已经提供；student embedding 已接入 CUDA FP32 前向与一阶反向，RMSNorm 已接入 FP32 前向，其余学生算子待实现。
 
 ![模型与残差路径](docs/assets/architecture.png)
 
@@ -147,17 +147,19 @@ benchmark 报告冷请求、稳态 TTFT/TPOT、输出 token 吞吐、allocated/r
 它尚不支持二阶梯度、低精度 weight 或 torch.compile。
 
 修改 `tiny_transformer/operators/student.py` 对应函数，在 `csrc/` 添加实际代码。
+RMSNorm 当前支持 CUDA FP32 前向，非连续输入由 Python 入口显式复制，暂不支持反向。
+[代码检查与 PyTorch 接入步骤](docs/operators/rms_norm.md#7-本次代码检查与-pytorch-接入步骤) 包含各层职责和测试说明。
 例如只替换 RMSNorm：
 
 ```bash
 python -m tiny_transformer.check_ops --operator rms_norm --backend student \
-  --device cuda --precision bf16 --backward --output runs/rmsnorm-check.json
+  --device cuda --precision fp32 --output runs/rmsnorm-check.json
 
 python -m tiny_transformer.benchmark --checkpoint runs/60m-sdpa/last.pt \
-  --device cuda --precision bf16 --op rms_norm=student --output runs/rmsnorm-e2e.json
+  --device cuda --precision fp32 --op rms_norm=student --output runs/rmsnorm-e2e.json
 ```
 
-在完成前，命令会明确抛出 `NotImplementedError`。没有自动退回 PyTorch 的隐藏路径。
+未实现的算子会明确抛出 `NotImplementedError`；已接入算子的范围外调用会报错。没有自动退回 PyTorch 的隐藏路径。
 训练接入必须支持正确反向；仅完成前向时先用于 inference。
 
 ## 目录
@@ -181,5 +183,5 @@ docs/transformer.md          算法手册
 docs/development.md          工程与优化手册
 ```
 
-当前未实现：embedding 二阶梯度、其余学生 GPU kernel、paged attention、CUDA Graph bucket、量化、分布式训练、HTTP serving。
+当前未实现：embedding 二阶梯度、RMSNorm 反向与低精度路径、其余学生 GPU kernel、paged attention、CUDA Graph bucket、量化、分布式训练、HTTP serving。
 这些是后续实验，不会被标记为已完成优化。

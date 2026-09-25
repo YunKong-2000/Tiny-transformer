@@ -1,6 +1,6 @@
 """Your CUDA / CuTe / CUTLASS implementation entry points.
 
-Embedding supports contiguous CUDA FP32 forward/backward; other entries are unfinished.
+Embedding supports contiguous CUDA FP32 forward/backward; RMSNorm supports FP32 forward.
 There is no silent reference fallback.
 Match reference.py semantics, device, shape, dtype, strides and gradients.
 Use --op NAME=student to enable only a completed operator.
@@ -10,7 +10,7 @@ See docs/development.md before registering a compiled/custom operator.
 import torch
 from torch.autograd.function import once_differentiable
 
-from ._extension import load_embedding_extension
+from ._extension import load_embedding_extension, load_rms_norm_extension
 
 
 def _todo(name):
@@ -59,7 +59,23 @@ def linear(x, weight):
 
 
 def rms_norm(x, weight, eps):
-    return _todo("rms_norm")
+    """CUDA FP32 [..., H] RMSNorm forward; strided inputs are explicitly copied.
+
+    No backward yet: use no_grad/inference_mode for parameters requiring grad.
+    The native entry point repeats validation and accepts only contiguous inputs.
+    """
+    if not x.is_cuda or not weight.is_cuda:
+        raise RuntimeError("student rms_norm requires x and weight to be CUDA tensors")
+    if torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad):
+        raise RuntimeError(
+            "student rms_norm backward is not implemented; "
+            "use torch.no_grad()/torch.inference_mode() for forward-only inference"
+        )
+    # Covers last-only prefill (batch stride > H), transposes and x[..., ::2].
+    # Copies are part of end-to-end operator timing; there is no reference fallback.
+    return load_rms_norm_extension().rms_norm_forward(
+        x.contiguous(), weight.contiguous(), eps
+    )
 
 
 def rope(x, cos, sin):

@@ -64,8 +64,10 @@ class OperatorTests(unittest.TestCase):
 
     def test_student_does_not_silently_fallback(self):
         ops = Operators({"rms_norm": "student"})
-        with self.assertRaisesRegex(NotImplementedError, "rms_norm"):
+        with self.assertRaisesRegex(RuntimeError, "CUDA"):
             ops.rms_norm(torch.ones(1, 4), torch.ones(4), 1e-6)
+        with self.assertRaisesRegex(NotImplementedError, "linear"):
+            Operators({"linear": "student"}).linear(torch.ones(1, 4), torch.ones(4, 4))
         self.assertIs(ops.linear, reference.linear)
 
     def test_invalid_dispatch_is_rejected(self):

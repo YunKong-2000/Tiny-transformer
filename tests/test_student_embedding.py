@@ -274,6 +274,26 @@ class StudentEmbeddingCudaTests(unittest.TestCase):
                     student.embedding(ids, weight, backward_impl=implementation), weight, upstream)[0]
                 torch.testing.assert_close(actual, expected, atol=3e-5, rtol=3e-4)
 
+    def test_baseline_backward_vector_channels_and_alignment(self):
+        # A nonzero ID storage offset must not prevent valid float4 gradient loads.
+        ids = torch.tensor([99, 0, 6, 2, 2, 1, 0], device="cuda")[1:].view(2, 3)
+        for dim in (4, 8, 32, 65, 128, 132, 768):
+            for offset in (0, 1, 4):
+                with self.subTest(dim=dim, gradient_offset=offset):
+                    storage = torch.empty(6 * dim + offset, device="cuda")
+                    upstream = storage[offset:].view(2, 3, dim)
+                    # Nonzero exact integers expose every missing/misrouted channel.
+                    upstream.copy_(torch.arange(1, 6 * dim + 1, device="cuda").view(2, 3, dim))
+                    self.assertTrue(upstream.is_contiguous())
+                    self.assertEqual(upstream.data_ptr() % 16, 4 if offset == 1 else 0)
+                    weight = torch.randn(7, dim, device="cuda", requires_grad=True)
+                    expected = torch.autograd.grad(reference.embedding(ids, weight), weight, upstream)[0]
+                    native = self.extension.embedding_backward(ids, upstream, 7, "baseline")
+                    actual = torch.autograd.grad(
+                        student.embedding(ids, weight, backward_impl="baseline"), weight, upstream)[0]
+                    torch.testing.assert_close(native, expected, atol=0, rtol=0)
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
     def test_backward_native_rejects_unsupported_inputs(self):
         ids = torch.zeros(2, 3, device="cuda", dtype=torch.long)
         gradient = torch.randn(2, 3, 65, device="cuda")
