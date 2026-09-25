@@ -89,3 +89,16 @@ python -m tiny_transformer.check_ops --operator residual --backend student \
 
 residual+RMSNorm 的融合不在当前接口内：norm 需要 weight/eps，且后续仍需要未归一化的 residual。
 到融合阶段应明确设计参数和两个结果，而不是把当前输出悄悄改成 normalized x。
+
+## 统一性能测试入口
+
+本算子与其余七个算子共用 [benchmarks 测量框架](../../tiny_transformer/benchmarks/README.md)：
+先校验数值与可用梯度，再用 CUDA events、交替后端顺序、多轮中位数分别测前向/反向。
+
+```bash
+python -m tiny_transformer.benchmarks --operator residual \
+  --output runs/residual-performance.json
+```
+
+未实现的 student 算子/阶段会记录为 `skipped`，没有隐式 reference fallback；
+可用 `--backend reference` 验证完整测量流程。`check_ops --backward` 的结果不能替代反向性能数据。

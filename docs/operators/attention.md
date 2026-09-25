@@ -138,3 +138,16 @@ python -m tiny_transformer.check_ops --operator attention --backend student \
 改变未来 token 不影响过去输出；改变前一文档不影响后一文档；prefill+decode 与完整前向一致；
 cache capacity 大于有效长度；batch 大于 1；前后向各自的误差与性能。
 SDPA 是独立的可用后端。`attention=student` 中的优化不能仅凭调用名宣称已使用 FlashAttention。
+
+## 统一性能测试入口
+
+本算子与其余七个算子共用 [benchmarks 测量框架](../../tiny_transformer/benchmarks/README.md)：
+先校验数值与可用梯度，再用 CUDA events、交替后端顺序、多轮中位数分别测前向/反向。
+
+```bash
+python -m tiny_transformer.benchmarks --operator attention \
+  --output runs/attention-performance.json
+```
+
+未实现的 student 算子/阶段会记录为 `skipped`，没有隐式 reference fallback；
+可用 `--backend reference` 验证完整测量流程。`check_ops --backward` 的结果不能替代反向性能数据。

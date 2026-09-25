@@ -213,14 +213,14 @@ CPU 环境只验证 autograd wrapper 的接线（使用测试替身），CUDA �
 
 ## 7. 前向与反向性能：四种 token 分布
 
-使用 [benchmark_embedding.py](../../tiny_transformer/benchmark_embedding.py) 在 CUDA 机器上比较
+使用 [benchmarks/embedding.py](../../tiny_transformer/benchmarks/embedding.py) 在 CUDA 机器上比较
 student 和 PyTorch reference。默认测量 FP32、`B=8,T=512,V=8192,H=768`，每组先验证
 前向/反向数值，再分别测量两个阶段。首次扩展编译和预热不计入结果。
 
 ```bash
 # A100；其他 GPU 请按实际架构设置。
 export TORCH_CUDA_ARCH_LIST=8.0
-python -m tiny_transformer.benchmark_embedding \
+python -m tiny_transformer.benchmarks.embedding \
   --device cuda --backward-impl all --patterns random same unique hot \
   --warmup 20 --repeats 100 --trials 5 \
   --output runs/embedding-performance.json
@@ -234,9 +234,9 @@ python -m tiny_transformer.benchmark_embedding \
 | `hot` | 在前 `min(hot_tokens,V)` 个 ID 中随机采样 | 热门 token 的重复与竞争；默认 16 个 |
 
 当 `B*T > V` 时，`unique` 明确记录为 `skipped`，不会通过取模制造重复 ID。
-控制台和 JSON 分别报告各分布的 `forward` / `backward`：`reference_us`、`student_us`、
-`speedup`，JSON 另存每轮原始计时、实际不同 ID 数量、误差、参数和硬件环境。
-`speedup = reference_us / student_us`，大于 1 表示 student 更快。
+控制台和 JSON 分别报告各分布的 `forward` / `backward`：`reference_us`、`candidate_us`、
+`speedup`，JSON 另存每轮原始计时、`inputs.distinct_ids`、误差、参数和硬件环境。
+`speedup = reference_us / candidate_us`，大于 1 表示 student 更快。
 
 `--backward-impl grouped|baseline|all` 选择反向实现，默认 grouped。
 `all` 在每种分布下使用相同的 ids、weight 和上游梯度，分别测量两个实现；控制台增加实现名，
@@ -245,7 +245,7 @@ JSON 的每条测量记录增加 `backward_impl`。两种实现都先与 PyTorch
 只测试 baseline 可运行：
 
 ```bash
-python -m tiny_transformer.benchmark_embedding \
+python -m tiny_transformer.benchmarks.embedding \
   --backward-impl baseline --patterns random same unique hot \
   --output runs/embedding-baseline.json
 ```
@@ -263,11 +263,24 @@ Nsight Systems/Compute；不要把清零移出算子反向计时来计算加速�
 可改变形状或单独比较热门 token 数量：
 
 ```bash
-python -m tiny_transformer.benchmark_embedding \
+python -m tiny_transformer.benchmarks.embedding \
   --batch-size 1 --seq-length 512 --vocab-size 8192 --dim 768 \
   --output runs/embedding-b1-t512.json
-python -m tiny_transformer.benchmark_embedding \
+python -m tiny_transformer.benchmarks.embedding \
   --patterns hot --hot-tokens 4 --output runs/embedding-hot4.json
 ```
 
 该脚本不提供 CPU 性能替代结果；当前 student 只支持 FP32 weight，不能据此推断低精度性能。
+
+## 统一性能测试入口
+
+本算子与其余七个算子共用 [benchmarks 测量框架](../../tiny_transformer/benchmarks/README.md)：
+先校验数值与可用梯度，再用 CUDA events、交替后端顺序、多轮中位数分别测前向/反向。
+
+```bash
+python -m tiny_transformer.benchmarks --operator embedding --backward-impl all \
+  --output runs/embedding-performance.json
+```
+
+未实现的 student 算子/阶段会记录为 `skipped`，没有隐式 reference fallback；
+可用 `--backend reference` 验证完整测量流程。`check_ops --backward` 的结果不能替代反向性能数据。

@@ -31,16 +31,18 @@ export MAX_JOBS=2
 python -m tiny_transformer.check_ops --operator embedding --backend student \
   --device cuda --precision fp32 --backward --output runs/embedding-fp32.json
 python -m unittest discover -s tests -p 'test_student_embedding.py' -v
-python -m tiny_transformer.benchmark_embedding \
+python -m tiny_transformer.benchmarks.embedding \
   --device cuda --backward-impl all --patterns random same unique hot \
   --output runs/embedding-performance.json
-python -m tiny_transformer.benchmark --config configs/smoke.json \
+python -m tiny_transformer.benchmarks.model --config configs/smoke.json \
   --device cuda --precision fp32 --op embedding=student \
   --prompt-length 16 --new-tokens 8 --output runs/embedding-inference.json
 ```
 
 测试会在有 CUDA 时真实编译扩展；没有 CUDA 时跳过 GPU 用例。
-`benchmark_embedding` 独立测量四种 token 分布的前向与反向，并与 PyTorch 比较。
+`benchmarks.embedding` 通过统一框架测量四种 token 分布的前向与反向，并与 PyTorch 比较。
+全部八个算子共用 [benchmarks/](../tiny_transformer/benchmarks/README.md) 的测量方法；
+RMSNorm 性能入口为 `python -m tiny_transformer.benchmarks --operator rms_norm --phases forward`。
 `--backward-impl all` 同时测试 grouped/baseline；也可仅指定其中一个，默认 grouped。
 反向计时包含梯度表清零，不含前向；参数和结果含义见
 [embedding 性能测试说明](../docs/operators/embedding.md#7-前向与反向性能四种-token-分布)。

@@ -107,3 +107,16 @@ python -m tiny_transformer.check_ops --operator linear --backend student \
 该命令只检查小尺寸、同 dtype 输入。必须补充上表五种真实 shape、FP32/BF16 混合输入的 autocast、
 较小 $M$、不整除 tile 的尾部、LM head 的共享权重梯度，以及训练与缓存生成。
 接口目前不包含 fused epilogue 的额外输出；跨 Linear/SwiGLU/Residual 融合应另行定义明确的新契约。
+
+## 统一性能测试入口
+
+本算子与其余七个算子共用 [benchmarks 测量框架](../../tiny_transformer/benchmarks/README.md)：
+先校验数值与可用梯度，再用 CUDA events、交替后端顺序、多轮中位数分别测前向/反向。
+
+```bash
+python -m tiny_transformer.benchmarks --operator linear \
+  --output runs/linear-performance.json
+```
+
+未实现的 student 算子/阶段会记录为 `skipped`，没有隐式 reference fallback；
+可用 `--backend reference` 验证完整测量流程。`check_ops --backward` 的结果不能替代反向性能数据。

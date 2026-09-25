@@ -122,11 +122,11 @@ python -m tiny_transformer.train --config configs/model_60m.json \
 python -m tiny_transformer.generate --checkpoint runs/60m-sdpa/last.pt \
   --device cuda --precision bf16 --prompt "Once upon a time" --max-new-tokens 128
 
-python -m tiny_transformer.benchmark --checkpoint runs/60m-sdpa/last.pt \
+python -m tiny_transformer.benchmarks.model --checkpoint runs/60m-sdpa/last.pt \
   --device cuda --precision bf16 --batch-size 1 --prompt-length 512 \
   --new-tokens 128 --repeats 10 --output runs/bench-b1.json
 
-TORCH_LOGS="graph_breaks,recompiles" python -m tiny_transformer.benchmark \
+TORCH_LOGS="graph_breaks,recompiles" python -m tiny_transformer.benchmarks.model \
   --checkpoint runs/60m-sdpa/last.pt --device cuda --precision bf16 --compile \
   --prompt-length 512 --new-tokens 128 --output runs/bench-compile.json \
   2> runs/compile.log
@@ -155,12 +155,30 @@ RMSNorm 当前支持 CUDA FP32 前向，非连续输入由 Python 入口显式�
 python -m tiny_transformer.check_ops --operator rms_norm --backend student \
   --device cuda --precision fp32 --output runs/rmsnorm-check.json
 
-python -m tiny_transformer.benchmark --checkpoint runs/60m-sdpa/last.pt \
+python -m tiny_transformer.benchmarks.model --checkpoint runs/60m-sdpa/last.pt \
   --device cuda --precision fp32 --op rms_norm=student --output runs/rmsnorm-e2e.json
 ```
 
 未实现的算子会明确抛出 `NotImplementedError`；已接入算子的范围外调用会报错。没有自动退回 PyTorch 的隐藏路径。
 训练接入必须支持正确反向；仅完成前向时先用于 inference。
+
+## 统一算子性能测试
+
+八个算子的性能代码集中在 [tiny_transformer/benchmarks](tiny_transformer/benchmarks/README.md)，
+统一采用校验后预热、CUDA events、交替后端顺序、多轮中位数；forward/backward 分开计时。
+保留 embedding 的四种 ID 分布与 grouped/baseline，对所有算子记录形状、stride、原始样本和跳过原因。
+
+```bash
+python -m tiny_transformer.benchmarks --operator rms_norm \
+  --layouts contiguous strided last-only --phases forward --output runs/rmsnorm-performance.json
+python -m tiny_transformer.benchmarks --operator embedding \
+  --backward-impl all --output runs/embedding-performance.json
+python -m tiny_transformer.benchmarks --operator all --output runs/all-operators-performance.json
+```
+
+当前 student RMSNorm 只测 FP32 前向；未实现的算子、反向或低精度阶段在报告中明确跳过。
+`--backend reference` 可验证八个算子的测量流程，`--operator attention --backend sdpa` 可比较 SDPA。
+模型端到端入口为 `python -m tiny_transformer.benchmarks.model`；旧命令保留转发兼容。
 
 ## 目录
 
@@ -175,7 +193,8 @@ tiny_transformer/
   data.py                   packed window、文档边界与标签
   train.py / generate.py    训练、续训、文本生成
   benchmark.py / profile.py 性能测量与热点分析
-  check_ops.py              算子数值/梯度检查与微基准
+  check_ops.py              小形状算子数值/梯度检查
+  benchmarks/               集中的算子性能与整模型性能测试
 csrc/                       你的 CUDA / CuTe / CUTLASS 实现
 tests/                      算法、数据、缓存、梯度、续训测试
 scripts/                    CPU/GPU 验收、图表重建

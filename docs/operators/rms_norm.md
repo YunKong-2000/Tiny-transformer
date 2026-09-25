@@ -188,7 +188,7 @@ export MAX_JOBS=2
 python -m unittest discover -s tests -p 'test_student_rms_norm.py' -v
 python -m tiny_transformer.check_ops --operator rms_norm --backend student \
   --device cuda --precision fp32 --output runs/rmsnorm-fp32.json
-python -m tiny_transformer.benchmark --config configs/smoke.json \
+python -m tiny_transformer.benchmarks.model --config configs/smoke.json \
   --device cuda --precision fp32 --op rms_norm=student \
   --prompt-length 16 --new-tokens 8 --output runs/rmsnorm-inference.json
 ```
@@ -211,3 +211,16 @@ eps=0 可用于非零行；零行加零 eps 时与 reference 一样产生 NaN，
 单算子使用 `atol=1e-5, rtol=1e-4`；模型使用 `atol=2e-5, rtol=1e-4`，测试期间关闭 TF32 后恢复。
 有 CUDA 时测试会真实编译扩展，缺少 nvcc 会构建失败；无 CUDA 时跳过 GPU 用例。
 本次本地环境为 macOS / PyTorch 2.8.0，无 CUDA 和 nvcc，GPU 编译、数值及性能仍须按上述命令验收。
+
+## 统一性能测试入口
+
+本算子与其余七个算子共用 [benchmarks 测量框架](../../tiny_transformer/benchmarks/README.md)：
+先校验数值与可用梯度，再用 CUDA events、交替后端顺序、多轮中位数分别测前向/反向。
+
+```bash
+python -m tiny_transformer.benchmarks --operator rms_norm --layouts contiguous strided last-only --phases forward \
+  --output runs/rms_norm-performance.json
+```
+
+未实现的 student 算子/阶段会记录为 `skipped`，没有隐式 reference fallback；
+可用 `--backend reference` 验证完整测量流程。`check_ops --backward` 的结果不能替代反向性能数据。

@@ -115,3 +115,16 @@ python -m tiny_transformer.check_ops --operator cross_entropy --backend student 
 忽略位置梯度为零；不同有效数的 microbatches；非单位上游梯度；FP16 GradScaler；真实 $V=8192$。
 对全部 ignored 的边界单独检查并记录策略。
 融合 LM head 与 CE 需要隐藏状态及输出权重，当前接口只接收 logits，无法无接口变化地完成该融合。
+
+## 统一性能测试入口
+
+本算子与其余七个算子共用 [benchmarks 测量框架](../../tiny_transformer/benchmarks/README.md)：
+先校验数值与可用梯度，再用 CUDA events、交替后端顺序、多轮中位数分别测前向/反向。
+
+```bash
+python -m tiny_transformer.benchmarks --operator cross_entropy \
+  --output runs/cross_entropy-performance.json
+```
+
+未实现的 student 算子/阶段会记录为 `skipped`，没有隐式 reference fallback；
+可用 `--backend reference` 验证完整测量流程。`check_ops --backward` 的结果不能替代反向性能数据。

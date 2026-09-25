@@ -386,7 +386,7 @@ TPOT 的 p95 是不同请求 trial 的平均 TPOT 的 p95，**不是单个 token
 ### 8.3 编译成本与 graph break
 
 ```bash
-TORCH_LOGS="graph_breaks,recompiles" python -m tiny_transformer.benchmark \
+TORCH_LOGS="graph_breaks,recompiles" python -m tiny_transformer.benchmarks.model \
   --config configs/model_60m.json --device cuda --precision bf16 \
   --op attention=sdpa --compile --prompt-length 512 --new-tokens 128 \
   --output runs/compile.json 2> runs/compile.log
@@ -402,7 +402,11 @@ JSON 另存编译器报告的分项耗时和 Dynamo counters，日志保存图�
 
 ### 8.4 微基准与模型基准
 
-`check_ops.py` 的时延包含 Python 调用和算子 dispatch，是简单的开发微基准。
+性能实现统一放在 [benchmarks/](../tiny_transformer/benchmarks/README.md)。
+`python -m tiny_transformer.benchmarks --operator NAME` 对八个算子采用同一套 CUDA event、
+交替顺序、多轮中位数方法，先验证再分别测前向和保留图反向。
+`check_ops.py` 是小形状开发检查，CUDA 前向计时也复用该函数；其 `--backward` 只校验梯度。
+CPU 的 check_ops 时延仅为主机开发诊断。
 对亚微秒 kernel，需要 CUDA events、足够重复次数或受控 CUDA Graph 测量，并明确边界。
 不要将纯 kernel event 时间与含 Python 调度的另一条路径直接相除。
 
@@ -443,7 +447,7 @@ decode profile 预填充一次，然后每次复用同一长度前缀，测量�
 
 ```bash
 nsys profile -t cuda,nvtx,osrt -o runs/timeline \
-  python -m tiny_transformer.benchmark --config configs/model_60m.json \
+  python -m tiny_transformer.benchmarks.model --config configs/model_60m.json \
   --device cuda --precision bf16 --op attention=sdpa --prompt-length 512 --new-tokens 32
 
 ncu --set full --launch-count 10 --target-processes all \

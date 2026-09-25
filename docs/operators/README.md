@@ -180,3 +180,10 @@ FP64 gradcheck 是参考推导的工具；第一版 CUDA kernel 可以明确不�
 实现要求来源：[reference.py](../../tiny_transformer/operators/reference.py)、
 [model.py](../../tiny_transformer/model.py)、[train.py](../../tiny_transformer/train.py)、
 [data.py](../../tiny_transformer/data.py)、[check_ops.py](../../tiny_transformer/check_ops.py)。
+
+## 统一性能验收
+
+八个算子的性能测试集中在 [tiny_transformer/benchmarks](../../tiny_transformer/benchmarks/README.md)。
+用 `python -m tiny_transformer.benchmarks --operator all` 统一运行，或指定单个算子；
+全部使用校验后预热、CUDA events、交替顺序、多轮中位数和一致的 JSON 字段。
+前向/反向分开计时；未实现阶段显式跳过，编译/数值错误直接失败。

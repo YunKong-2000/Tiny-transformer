@@ -1,12 +1,12 @@
 """Compare a selected student operator with its executable reference contract."""
 import argparse
 import json
-import time
 
 import torch
 
 from .operators import reference, student
-from .runtime import DTYPES, device_for, environment, seed_all, synchronize, validate_precision, write_json
+from .benchmarks.common import MEASUREMENT, measure_pair, measure_cpu_smoke_pair
+from .runtime import DTYPES, device_for, environment, seed_all, validate_precision, write_json
 
 
 def cases(name, device, dtype, decode=False):
@@ -41,18 +41,6 @@ def differentiable_args(args):
     return tuple(x.detach().clone().requires_grad_(True) if torch.is_tensor(x) and x.is_floating_point() else x for x in args)
 
 
-def timed(function, args, device, repeats):
-    with torch.no_grad():
-        for _ in range(5):
-            function(*args)
-        synchronize(device)
-        begin = time.perf_counter()
-        for _ in range(repeats):
-            function(*args)
-        synchronize(device)
-    return (time.perf_counter() - begin) * 1e6 / repeats
-
-
 def main():
     from .operators.dispatch import NAMES
     parser = argparse.ArgumentParser(description=__doc__)
@@ -61,11 +49,13 @@ def main():
     parser.add_argument("--device", default="auto")
     parser.add_argument("--precision", choices=DTYPES, default="fp32")
     parser.add_argument("--backward", action="store_true")
+    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--trials", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--output", default="runs/operator_check.json")
     args = parser.parse_args()
-    if args.repeats <= 0 or (args.backend == "sdpa" and args.operator != "attention"):
-        parser.error("positive repeats required; sdpa is only an attention backend")
+    if min(args.warmup, args.trials, args.repeats) <= 0 or (args.backend == "sdpa" and args.operator != "attention"):
+        parser.error("positive warmup/trials/repeats required; sdpa is only an attention backend")
     device = device_for(args.device)
     validate_precision(device, args.precision)
     seed_all(42)
@@ -78,8 +68,8 @@ def main():
         with torch.no_grad():
             expected, actual = expected_function(*inputs), function(*inputs)
         torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
-        row = {"case": "decode" if decode else "prefill", "max_abs_error": float((actual - expected).abs().max()),
-               "reference_us": timed(expected_function, inputs, device, args.repeats), "candidate_us": timed(function, inputs, device, args.repeats)}
+        row = {"case": "decode" if decode else "prefill",
+               "max_abs_error": float((actual - expected).abs().max())}
         if args.backward:
             left, right = differentiable_args(inputs), differentiable_args(inputs)
             if args.operator == "rope":
@@ -95,9 +85,18 @@ def main():
             for expected_gradient, actual_gradient in zip(gradients, candidate_gradients):
                 torch.testing.assert_close(actual_gradient, expected_gradient, atol=atol * 3, rtol=rtol * 3)
             row["backward"] = "passed"
+        with torch.no_grad():
+            functions = (lambda: expected_function(*inputs), lambda: function(*inputs))
+            if device.type == "cuda":
+                with torch.cuda.device(device):
+                    timing = measure_pair(functions, args.warmup, args.repeats, args.trials)
+            else:
+                timing = measure_cpu_smoke_pair(functions, args.warmup, args.repeats, args.trials)
+        row.update(timing)
         results.append(row)
     write_json(args.output, {"environment": environment(device), "arguments": vars(args), "atol": atol, "rtol": rtol,
-                             "notice": "development smoke cases; extend to real model shapes before performance claims", "cases": results})
+                             "measurement": {**MEASUREMENT, "backward": "correctness only; not timed"} if device.type == "cuda" else {"timer": "CPU wall clock; smoke diagnostics only"},
+                             "notice": "forward timing only; --backward checks correctness, not latency; development smoke cases; extend to real model shapes before performance claims", "cases": results})
     print(json.dumps(results, indent=2))
 
 

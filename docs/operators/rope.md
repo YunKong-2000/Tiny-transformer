@@ -100,3 +100,16 @@ python -m tiny_transformer.check_ops --operator rope --backend student \
 该工具的 transpose 输入与真实 QKV view 的 stride 并不完全相同，必须增加上表布局的用例。
 检查位置 0、较大位置、isolated position reset、Q/K 不同 offset、batch 大于 1，以及反向。
 额外检查每对分量的平方和近似保持不变，并对比整段前向与缓存解码的 logits。
+
+## 统一性能测试入口
+
+本算子与其余七个算子共用 [benchmarks 测量框架](../../tiny_transformer/benchmarks/README.md)：
+先校验数值与可用梯度，再用 CUDA events、交替后端顺序、多轮中位数分别测前向/反向。
+
+```bash
+python -m tiny_transformer.benchmarks --operator rope \
+  --output runs/rope-performance.json
+```
+
+未实现的 student 算子/阶段会记录为 `skipped`，没有隐式 reference fallback；
+可用 `--backend reference` 验证完整测量流程。`check_ops --backward` 的结果不能替代反向性能数据。

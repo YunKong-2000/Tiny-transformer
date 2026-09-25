@@ -5,7 +5,7 @@ from unittest.mock import Mock
 
 import torch
 
-from tiny_transformer.benchmark_embedding import PATTERNS, make_ids, measure_pair, prepare_calls
+from tiny_transformer.benchmarks.embedding import PATTERNS, make_ids, measure_pair, prepare_calls
 from tiny_transformer.operators import reference, student
 
 
@@ -73,9 +73,9 @@ class EmbeddingBenchmarkCudaTests(unittest.TestCase):
                     with self.subTest(pattern=pattern, implementation=implementation, phase=phase):
                         result = measure_pair(functions, warmup=2, repeats=2, trials=3)
                         self.assertEqual(len(result["reference_trials_us"]), 3)
-                        self.assertEqual(len(result["student_trials_us"]), 3)
+                        self.assertEqual(len(result["candidate_trials_us"]), 3)
                         self.assertGreater(result["reference_us"], 0)
-                        self.assertGreater(result["student_us"], 0)
+                        self.assertGreater(result["candidate_us"], 0)
                         self.assertGreater(result["speedup"], 0)
             self.assertIsNone(weight.grad)
 

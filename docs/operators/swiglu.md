@@ -94,3 +94,16 @@ python -m tiny_transformer.check_ops --operator swiglu --backend student \
 补充真实 `.chunk(2, -1)` 输入、正负大幅值、零 gate/零 up、$I=65$ 尾部和 $I=2048$ 主配置。
 分别检查 dgate/dup，并通过完整 FFN 梯度验证 chunk 的反向链路。
 与 Gate/Up GEMM epilogue 融合时，上游输出的组织方式会变化，应明确增加融合入口，而不是改变此函数的参数含义。
+
+## 统一性能测试入口
+
+本算子与其余七个算子共用 [benchmarks 测量框架](../../tiny_transformer/benchmarks/README.md)：
+先校验数值与可用梯度，再用 CUDA events、交替后端顺序、多轮中位数分别测前向/反向。
+
+```bash
+python -m tiny_transformer.benchmarks --operator swiglu \
+  --output runs/swiglu-performance.json
+```
+
+未实现的 student 算子/阶段会记录为 `skipped`，没有隐式 reference fallback；
+可用 `--backend reference` 验证完整测量流程。`check_ops --backward` 的结果不能替代反向性能数据。
