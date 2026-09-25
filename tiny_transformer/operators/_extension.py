@@ -19,7 +19,7 @@ def load_embedding_extension():
 
     source_root = Path(__file__).resolve().parents[2] / "csrc"
     sources = [
-        source_root / "bindings.cpp",
+        source_root / "embedding" / "bindings.cpp",
         source_root / "embedding" / "embedding.cu",
         source_root / "embedding" / "embedding_backward.cu",
     ]
