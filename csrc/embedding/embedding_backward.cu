@@ -12,6 +12,7 @@ namespace {
 constexpr int kWarpSize = 32;
 constexpr int kThreads = 256;
 constexpr unsigned kFullWarp = 0xffffffffu;
+constexpr int kVector = 4;
 
 __global__ void embedding_backward_kernel_scalar(
     int64_t rows, int64_t vocab_size, int64_t dim,
@@ -31,22 +32,12 @@ __global__ void embedding_backward_kernel_scalar(
     CUDA_KERNEL_ASSERT(row >= rows || (index >= 0 && index < vocab_size));
     const bool valid = row < rows && index >= 0 && index < vocab_size;
 
-#if __CUDA_ARCH__ >= 700
-    const unsigned my_group = __match_any_sync(kFullWarp, index);
-    unsigned leaders = __ballot_sync(
-        kFullWarp, valid && lane == __ffs(my_group) - 1);
-#else
     // Older targets lack match.any; discover each group with ballot instead.
     unsigned leaders = __ballot_sync(kFullWarp, valid);
-#endif
     while (leaders) {
       const int leader_lane = __ffs(leaders) - 1;
       const int64_t token = __shfl_sync(kFullWarp, index, leader_lane);
-#if __CUDA_ARCH__ >= 700
-      const unsigned group = __shfl_sync(kFullWarp, my_group, leader_lane);
-#else
       const unsigned group = __ballot_sync(kFullWarp, valid && index == token);
-#endif
       for (int64_t channel = lane; channel < dim; channel += kWarpSize) {
         float sum = 0.0f;
         unsigned members = group;
@@ -63,7 +54,7 @@ __global__ void embedding_backward_kernel_scalar(
   }
 }
 
-__global__ void embedding_backward_baseline_kernel(
+__global__ void embedding_backward_baseline_kernel_scalar(
     int64_t rows, int64_t vocab_size, int64_t dim,
     const int64_t* ids, const float* gradient, float* output) {
   const int64_t warp_id =
@@ -78,6 +69,30 @@ __global__ void embedding_backward_baseline_kernel(
     if (index < 0 || index >= vocab_size) continue;
     for (int64_t channel = lane; channel < dim; channel += kWarpSize) {
       atomicAdd(output + index * dim + channel, gradient[row * dim + channel]);
+    }
+  }
+}
+
+__global__ void embedding_backward_baseline_kernel_vector(
+    int64_t rows, int64_t vocab_size, int64_t dim,
+    const int64_t* ids, const float* gradient, float* output) {
+  const int64_t warp_id =
+      static_cast<int64_t>(blockIdx.x) * (blockDim.x / kWarpSize) +
+      threadIdx.x / kWarpSize;
+  const int64_t warp_count =
+      static_cast<int64_t>(gridDim.x) * (blockDim.x / kWarpSize);
+  const int lane = threadIdx.x % kWarpSize;
+  const int warp_stride = kWarpSize * kVector;
+  for (int64_t row = warp_id; row < rows; row += warp_count) {
+    const int64_t index = ids[row];
+    CUDA_KERNEL_ASSERT(index >= 0 && index < vocab_size);
+    if (index < 0 || index >= vocab_size) continue;
+    for (int64_t channel = static_cast<int64_t>lane * kVector; channel * kVector < dim; channel += warp_stride) {
+      const float4 grad = *reinterpret_cast<const float4*>(&gradient[row * dim + channel]);
+      atomicAdd(output + index * dim + channel + 0, grad.x);
+      atomicAdd(output + index * dim + channel + 1, grad.y);
+      atomicAdd(output + index * dim + channel + 2, grad.z);
+      atomicAdd(output + index * dim + channel + 3, grad.w);
     }
   }
 }
@@ -122,9 +137,19 @@ torch::Tensor embedding_backward_cuda(
       (rows - 1) / rows_per_block + 1, 65535));
   const auto stream = c10::cuda::getCurrentCUDAStream(gradient.get_device());
   if (baseline) {
-    embedding_backward_baseline_kernel<<<blocks, kThreads, 0, stream>>>(
+    const auto grad_addr = reinterpret_cast<std::uintptr_t>(gradient.data_ptr<float>());
+    bool vectorized = (dim % kVector == 0) && (grad_addr % alignof(float4) == 0);
+    if (vectorized) {
+      embedding_backward_baseline_kernel_vector<<<blocks, kThreads, 0, stream>>>(
         rows, vocab_size, dim, ids.data_ptr<int64_t>(),
         gradient.data_ptr<float>(), output.data_ptr<float>());
+    }
+    else {
+      embedding_backward_baseline_kernel_scalar<<<blocks, kThreads, 0, stream>>>(
+        rows, vocab_size, dim, ids.data_ptr<int64_t>(),
+        gradient.data_ptr<float>(), output.data_ptr<float>());
+    }
+    
   } else {
     embedding_backward_kernel_scalar<<<blocks, kThreads, 0, stream>>>(
         rows, vocab_size, dim, ids.data_ptr<int64_t>(),
