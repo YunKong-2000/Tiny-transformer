@@ -16,7 +16,7 @@
 
 `operators/reference.py` 是可执行规范，不是要求你提交的优化实现。
 `operators/student.py` 已接入 embedding 的 CUDA FP32 连续输入前向与一阶反向，以及 RMSNorm 的
-CUDA FP32 前向（非连续输入显式复制，暂不支持 backward，见 [接入步骤](operators/rms_norm.md#7-本次代码检查与-pytorch-接入步骤)）。其余入口保留为
+CUDA FP32 前向与一阶反向（非连续输入显式复制，反向 H <= 1024，见 [接入步骤](operators/rms_norm.md#7-前向缓存与-pytorch-调用链)）。其余入口保留为
 `NotImplementedError`，没有隐藏 reference fallback。embedding 使用 eager autograd 连接反向，
 GPU 编译、数值和性能仍需在目标环境验收；尚未接入二阶梯度和 torch.compile。
 你可以只实现其中一个，通过 `--op rms_norm=student` 启用，其余继续使用参考路径。

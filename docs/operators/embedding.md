@@ -204,7 +204,10 @@ python -m unittest discover -s tests -p 'test_student_embedding.py' -v
 ```
 
 `check_ops --backward` 对照随机上游梯度；其中的计时字段仍只测前向，不能当作 backward 性能数据。
-测试包含反向分组、空输入、非连续上游梯度、current stream、多 GPU guard、AMP 和共享参数训练。
+本文件对应的算子测试覆盖反向分组、空输入、非连续上游梯度、对齐、非法 ID 和 current stream。
+AMP、共享参数训练与缓存推理统一放在 [test_student_integration.py](../../tests/test_student_integration.py)；
+完整算子回归使用 `python -m unittest discover -s tests -p 'test_student_*.py' -v`。
+测试职责见 [tests/README.md](../../tests/README.md)。
 CPU 环境只验证 autograd wrapper 的接线（使用测试替身），CUDA 用例会明确跳过。
 
 补充用例：所有 ID 相同、ID 0 与最大合法 ID、重复 BOS/EOS、非连续 IDs、真实词表，

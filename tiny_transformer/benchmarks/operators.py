@@ -15,10 +15,10 @@ from .embedding import PATTERNS
 
 
 # Explicit implementation status, not a fallback. Update as student kernels land.
-STUDENT_PHASES = {"embedding": ("forward", "backward"), "rms_norm": ("forward",)}
+STUDENT_PHASES = {"embedding": ("forward", "backward"), "rms_norm": ("forward", "backward")}
 
 
-def unsupported_reason(operator, backend, precision, phase, layout):
+def unsupported_reason(operator, backend, precision, phase, layout, dim=None):
     if layout == "last-only" and operator != "rms_norm":
         return "last-only layout applies only to rms_norm"
     if backend == "sdpa" and operator != "attention":
@@ -28,6 +28,8 @@ def unsupported_reason(operator, backend, precision, phase, layout):
             return f"student {operator} {phase} is not implemented"
         if precision != "fp32":
             return f"student {operator} currently supports only fp32"
+        if operator == "rms_norm" and phase == "backward" and dim is not None and dim > 1024:
+            return "student rms_norm backward requires H <= 1024"
         if operator == "embedding" and layout != "contiguous":
             return "student embedding requires contiguous inputs"
     return None
@@ -118,7 +120,7 @@ def run(args, device):
                            (args.backward_impl,)) if operator == "embedding" and args.backend == "student" else (None,)
         for workload, layout, pattern in product(dict.fromkeys(args.workloads),
                                                 dict.fromkeys(args.layouts), patterns):
-            reasons = {phase: unsupported_reason(operator, args.backend, args.precision, phase, layout)
+            reasons = {phase: unsupported_reason(operator, args.backend, args.precision, phase, layout, args.dim)
                        for phase in dict.fromkeys(args.phases)}
             rows = args.batch_size * (1 if workload == "decode" else args.seq_length)
             if pattern == "unique" and rows > args.vocab_size:

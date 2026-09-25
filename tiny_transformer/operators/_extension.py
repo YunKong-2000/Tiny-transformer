@@ -58,6 +58,7 @@ def load_rms_norm_extension():
     sources = [
         source_root / "rms_norm" / "bindings.cpp",
         source_root / "rms_norm" / "rms_norm.cu",
+        source_root / "rms_norm" / "rms_norm_backward.cu",
     ]
     required = sources + [source_root / "rms_norm" / "rms_norm.h"]
     if not all(path.is_file() for path in required):

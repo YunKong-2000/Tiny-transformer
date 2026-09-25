@@ -5,12 +5,13 @@
 反向每个 warp 对最多 32 个位置按 ID 分组，合并组内梯度后原子累加到全零梯度表。
 另提供一 warp 一 token 的 baseline 反向，共用输入检查、清零和 stream 管理。
 另包含 RMSNorm 的 FP32 CUDA 前向，每个 warp 对一行归约；Python 入口显式复制非连续输入，
-支持 `[..., H]` 与 `[H]`。尚未实现 RMSNorm 反向或低精度路径。
+支持 `[..., H]` 与 `[H]`，前向返回 Y 和每行的 R。共享内存反向支持 H <= 1024，
+通过 autograd 缓存 R；dGamma 使用原子加，尚不支持低精度输入或二阶梯度。
 其他算子尚未实现；CUDA 编译、数值及性能需在目标 GPU 上验收。
 
 RMSNorm 使用独立的 `rms_norm/bindings.cpp` 和 `load_rms_norm_extension()`，
 只编译本算子的绑定与 CUDA 源码，避免与 embedding 互相产生未定义符号。
-逐步接入说明、代码检查结果与测试命令见 [RMSNorm 文档](../docs/operators/rms_norm.md#7-本次代码检查与-pytorch-接入步骤)。
+逐步接入说明、代码检查结果与测试命令见 [RMSNorm 文档](../docs/operators/rms_norm.md#7-前向缓存与-pytorch-调用链)。
 
 调用链：`student.embedding` → `operators/_extension.py` 的延迟 JIT 加载 →
 `bindings.cpp::embedding_forward` → `embedding_forward_cuda` → CUDA kernel。
@@ -30,7 +31,7 @@ export TORCH_CUDA_ARCH_LIST=8.0
 export MAX_JOBS=2
 python -m tiny_transformer.check_ops --operator embedding --backend student \
   --device cuda --precision fp32 --backward --output runs/embedding-fp32.json
-python -m unittest discover -s tests -p 'test_student_embedding.py' -v
+python -m unittest discover -s tests -p 'test_student_*.py' -v
 python -m tiny_transformer.benchmarks.embedding \
   --device cuda --backward-impl all --patterns random same unique hot \
   --output runs/embedding-performance.json
@@ -42,14 +43,14 @@ python -m tiny_transformer.benchmarks.model --config configs/smoke.json \
 测试会在有 CUDA 时真实编译扩展；没有 CUDA 时跳过 GPU 用例。
 `benchmarks.embedding` 通过统一框架测量四种 token 分布的前向与反向，并与 PyTorch 比较。
 全部八个算子共用 [benchmarks/](../tiny_transformer/benchmarks/README.md) 的测量方法；
-RMSNorm 性能入口为 `python -m tiny_transformer.benchmarks --operator rms_norm --phases forward`。
+RMSNorm 性能入口为 `python -m tiny_transformer.benchmarks --operator rms_norm --phases forward backward`。
 `--backward-impl all` 同时测试 grouped/baseline；也可仅指定其中一个，默认 grouped。
 反向计时包含梯度表清零，不含前向；参数和结果含义见
 [embedding 性能测试说明](../docs/operators/embedding.md#7-前向与反向性能四种-token-分布)。
 模型缓存对照测试临时将 FP32 matmul precision 设为 `highest`，结束后恢复原设置，
 避免 TF32 下不同 GEMM 尺寸的数值差异干扰 FP32 验收。
-该测试分别检查纯 reference 缓存路径、各输入的 embedding 精确相等、
-student/reference 相同缓存步骤及缓存结果与完整前向；不会放宽原有误差阈值。
+纯 reference 缓存与完整前向的一致性由 `test_model.py` 负责；两个学生算子的共同训练/推理
+放在 `test_student_integration.py`。各算子文件保留独有的数值与边界用例，职责见 [测试说明](../tests/README.md)。
 支持连续二维 int64 IDs、连续二维 FP32 weight，以及非零 storage offset；
 支持空 IDs，但 weight 的 V/H 必须为正。非连续输入显式报错。
 训练通过 `student.embedding` 使用一阶反向；直接调用原生前向不会建立 autograd 图，

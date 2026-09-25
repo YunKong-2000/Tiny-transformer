@@ -12,10 +12,12 @@ rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor
 默认模型每次 forward 共 17 次。输出交给 QKV、Gate/Up 或 LM head 的 Linear。
 本接口只做 RMSNorm，不包含 residual add、Linear 或 LayerNorm 的减均值步骤。
 
-**当前 student 实现**：CUDA FP32 前向，支持 `[..., H]` 与 `[H]`，`H > 0`；
+**当前 student 实现**：CUDA FP32 前向与一阶反向，支持 `[..., H]` 与 `[H]`；
+前向要求 `H > 0`，共享内存反向要求 `0 < H <= 1024`。需要梯度且超出该范围时，在前向入口报错；
 Python 入口显式复制非连续输入，原生入口只接受连续张量。前导维度可以为空，
-eps 必须是有限非负 FP32 标量。尚未实现 backward、BF16/FP16 或 torch.compile 注册。
-下文的低精度与反向说明是完整目标契约；当前接入步骤和验证命令见第 7、8 节。
+eps 必须是有限非负 FP32 标量。尚未支持 BF16/FP16 输入、二阶梯度或 torch.compile 注册。
+FP32 模型参数在 AMP 训练中保持 FP32，RMSNorm 也保持 FP32；这不同于把模型转成 BF16 推理。
+当前接入步骤和验证命令见第 7、8 节。
 
 ## 2. 输入与输出
 
@@ -112,73 +114,67 @@ python -m tiny_transformer.check_ops --operator rms_norm --backend student \
 batch 大于 1 的 last-only prefill，以及 dweight 跨多行累加。
 仅完成 BF16 inference kernel，不代表默认 AMP 训练的 FP32 norm 路径已经支持。
 
-## 7. 本次代码检查与 PyTorch 接入步骤
+## 7. 前向缓存与 PyTorch 调用链
 
-原来的 warp 分工与平方和归约符合 RMSNorm 公式。`H < 32` 或不是 32 的倍数时，
-没有列可读的 lane 保留零值，仍参与 shuffle；同一 warp 的 row 条件一致，因此 full mask 合法，
-不需要 block 级共享内存或 `__syncthreads()`。
-
-修复的主要问题：
-
-| 原问题 | 修复与原因 |
-|---|---|
-| `torch/extention.h`、`rms_nrom` 拼写 | 改为实际头文件与源码路径，否则不能编译/加载 |
-| `std::min{...}` 写法和 kernel 调用缺 epsilon | 使用 `std::min<int64_t>(..., 65535)`，按签名传入 epsilon |
-| 缺少 CUDA stream、launch check 等头文件 | 显式包含对应 c10 头文件，避免依赖间接 include |
-| 共享绑定引用另一算子和未实现的 backward | RMSNorm 使用独立 bindings，只导出已有前向，避免未定义符号 |
-| 使用当前设备直接 launch | 加入 `CUDAGuard(X.device())`，在该设备的 PyTorch current stream 上执行 |
-| `int` 保存形状和 `row * H` | 改为 64 位索引，防止大张量地址计算溢出 |
-| 先算 `x * weight` 再除以 RMS | 改为 `(x * rsqrtf(mean_square + eps)) * weight`；先归一化可避免缩放乘积提前溢出 |
-| 没有 autograd 却允许训练调用 | Python 和原生入口均检查 grad mode 与两项输入的 `requires_grad`，明确报错 |
-
-接入链路：
+前向保留一 warp 一行的 scalar/float4 两条路径。向量化要求 x、weight 地址 16 字节对齐且 H 能被 4 整除。
+每行只有 lane 0 写入 `R[row]`；两条路径都必须保存这个值。
+R 存的是 `rsqrt(mean(x²) + eps)`，形状 `[rows]`，dtype FP32。
+原生前向现在返回 `(Y, R)`，包括空输入时的两个空张量；Python 公共接口仍只返回 Y。
+当前推理也调用该原生入口，因此前向性能计时包含 R 的分配/写入。
 
 ```text
-Transformer / Operators({"rms_norm": "student"})
-  → student.rms_norm(x, weight, eps)
-  → load_rms_norm_extension()                   # 首次调用才编译
-  → module.rms_norm_forward(x, weight, eps)    # pybind11
-  → rms_norm_forward_cuda(...)                # 校验、分配、device/stream
-  → rms_norm_kernel<<<blocks, 256, 0, stream>>>
+student.rms_norm(x, weight, eps)
+  → x.contiguous(), weight.contiguous()        # 拷贝保留在 autograd 图中
+  → _RMSNorm.apply(xc, wc, eps)                # 需要梯度时
+      → extension.rms_norm_forward(xc, wc, eps)
+      ← Y, R
+      → ctx.save_for_backward(xc, wc, R)
+      ← Y
+loss.backward()
+  → _RMSNorm.backward(grad_y)
+      → ctx.saved_tensors                     # 取回本次前向的缓存
+      → extension.rms_norm_backward(xc, grad_y.contiguous(), wc, R)
+      ← dX, dGamma
+      ← dX, dGamma, None                      # 对应 x、weight、eps
 ```
 
-1. [rms_norm.h](../../csrc/rms_norm/rms_norm.h) 声明 C++ 前向签名，
-   [rms_norm.cu](../../csrc/rms_norm/rms_norm.cu) 定义 wrapper 和 kernel。
-   wrapper 分配与 x 同 shape/dtype/device 的新输出，空行输入直接返回，不 launch 空 grid。
-2. [rms_norm/bindings.cpp](../../csrc/rms_norm/bindings.cpp) 使用
-   `PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)` 将 C++ 函数导出为 `rms_norm_forward`。
-   一个扩展只编译一个 module 定义；这里不再使用 embedding 的 `csrc/bindings.cpp`。
-3. [_extension.py](../../tiny_transformer/operators/_extension.py) 的
-   `load_rms_norm_extension()` 将上述 `.cpp` 和 `.cu` 传给 `torch.utils.cpp_extension.load`，
-   模块名为 `tiny_transformer_rms_norm_cuda`。`lru_cache` 缓存进程内模块，
-   PyTorch 管理磁盘编译缓存；导入模型不会触发构建。embedding 的加载保持独立。
-4. [student.py](../../tiny_transformer/operators/student.py) 检查 CUDA 与前向使用条件，
-   用 `x.contiguous()` 和 `weight.contiguous()` 显式处理 view，然后调用扩展。
-   连续输入不发生额外复制；非连续输入的复制成本包含在 `check_ops` 和模型基准中。
-   原生入口仍会独立检查 device、dtype、shape、连续性、eps 和 autograd 条件。
-5. `Operators` 已按名字选择 student/reference，无需修改模型；只设置
-   `Operators({"rms_norm": "student"})` 或命令行 `--op rms_norm=student`。
+- [rms_norm.h](../../csrc/rms_norm/rms_norm.h) 声明两个返回 `std::tuple<Tensor, Tensor>` 的接口。
+- [bindings.cpp](../../csrc/rms_norm/bindings.cpp) 导出 `rms_norm_forward(X, weight, epsilon)` 和
+  `rms_norm_backward(X, gradient, weight, R)`。反向不再接收 epsilon，因为 R 已包含它。
+- [_extension.py](../../tiny_transformer/operators/_extension.py) 延迟编译 bindings、前向 `.cu` 和反向 `.cu`；
+  模块名仍为 `tiny_transformer_rms_norm_cuda`，导入模型不会编译，与 embedding 模块独立。
+- [student.py](../../tiny_transformer/operators/student.py) 用 `_RMSNorm` 建立一阶 autograd 节点。
+  `save_for_backward` 保存张量引用，由图管理生命周期；多个前向有各自的 R，无全局缓存。
+  只有 x 或只有 weight 需要梯度时，也能正确回传；二阶梯度通过 `once_differentiable` 明确拒绝。
 
-最小 PyTorch 调用（首次执行需要 CUDA 版 PyTorch、nvcc、C++ 编译器和 Ninja）：
+原生 pybind 本身不会建立 autograd 图。因此直接调用前向且输入需要梯度时，必须处于 `no_grad`，
+或者改用 `student.rms_norm`。`Function.forward` 自动关闭 grad mode；`Function.apply` 负责建立节点。
+
+最小训练调用：
 
 ```python
 import torch
 from tiny_transformer.operators import Operators
 
 ops = Operators({"rms_norm": "student"})
-x = torch.randn(2, 17, 65, device="cuda", dtype=torch.float32)
+x = torch.randn(2, 17, 65, device="cuda", requires_grad=True)
 weight = torch.nn.Parameter(torch.ones(65, device="cuda"))
-with torch.inference_mode():
-    y = ops.rms_norm(x, weight, 1e-6)
-assert y.shape == x.shape
+y = ops.rms_norm(x, weight, 1e-6)
+y.square().mean().backward()
+assert x.grad.shape == x.shape
+assert weight.grad.shape == weight.shape
 ```
 
-`model.eval()` 不关闭 autograd，含可训练参数的推理仍须使用 `no_grad()` 或 `inference_mode()`。
-pybind 不会为手写 CUDA 自动生成反向；当前不创建一个返回假梯度的 autograd 节点。
-后续实现第 5 节的 `dx/dweight` 后，再导出 backward，用 `torch.autograd.Function` 保存输入/eps
-并返回 `(dx, dweight, None)`，最后增加独立梯度对照与模型训练测试。
+## 8. 共享内存反向与运行命令
 
-## 8. 测试与运行命令
+反向每个 block 使用 256 线程处理一行。三个长度 1024 的共享数组保存 x、dy、u，
+八个 warp 小计先写入共享内存，再由首个 warp 归约。每行结束后同步，才能安全复用下一行的共享内存。
+固定共享内存为 `3 * 1024 * 4 + 8 * 4 = 12320` 字节，H=1024 合法。
+
+wrapper 在主机端校验 H 上限、gradient 与 x 完整形状相同、R 是同设备连续 FP32 `[rows]`。
+每次调用分配 dX 并将 dGamma 清零；每行使用 `atomicAdd(dGamma + col, ...)` 跨行累加。
+两条 wrapper 都使用设备 guard、current stream 和 kernel launch 检查，空行输入不发射 kernel。
+浮点原子加不保证确定性；严格 deterministic 模式下非空反向明确报错。
 
 在 A100 上从仓库根目录执行（其他 GPU 按实际计算能力设置架构）：
 
@@ -187,40 +183,32 @@ export TORCH_CUDA_ARCH_LIST=8.0
 export MAX_JOBS=2
 python -m unittest discover -s tests -p 'test_student_rms_norm.py' -v
 python -m tiny_transformer.check_ops --operator rms_norm --backend student \
-  --device cuda --precision fp32 --output runs/rmsnorm-fp32.json
+  --device cuda --precision fp32 --backward --output runs/rmsnorm-fp32.json
+python -m tiny_transformer.benchmarks --operator rms_norm \
+  --layouts contiguous strided last-only --phases forward backward \
+  --output runs/rmsnorm-performance.json
 python -m tiny_transformer.benchmarks.model --config configs/smoke.json \
   --device cuda --precision fp32 --op rms_norm=student \
   --prompt-length 16 --new-tokens 8 --output runs/rmsnorm-inference.json
 ```
 
-当前不要加 `--backward` 或选择 BF16/FP16；这些路径会明确报错。
+统一性能框架在 backward 阶段复用前向图和 R，包含梯度清零、分配和 autograd 调度，排除前向。
+H 超过 1024 时仍可测前向，反向记录为 skipped；已声明支持的路径发生编译或数值错误时直接失败。
 eps=0 可用于非零行；零行加零 eps 时与 reference 一样产生 NaN，不额外 clamp。
 
-[test_student_rms_norm.py](../../tests/test_student_rms_norm.py) 包含：
+[test_student_rms_norm.py](../../tests/test_student_rms_norm.py) 用同一组输入检查 Y、缓存 R、dX 和 dgamma，
+覆盖 scalar/vector 边界、地址偏移、H=1024/1025、空行、跨步输入、grid 循环、清零与 current stream。
+主机只保留一个测试替身用例，检查每图的 R 和跨步梯度累积；不视为 GPU 数值验收。
 
-- 主机测试：import/CPU 拒绝不加载编译器、两个扩展的构建隔离与缓存、CUDA/toolkit 缺失报错。
-  编译器 mock 仅验证加载配置，不作为 GPU 正确性证据。
-- CUDA 数值：warp 边界、奇数 H、默认训练形状与 decode 形状、任意前导维度、超过 grid 上限的行数、
-  零输入、不同幅值/eps、非全一权重、先缩放会溢出的输入、空行、输入不变与输出不别名。
-- 布局：末维 stride=2、转置、广播 view、last-only prefill、非零 storage offset；
-  原生入口拒绝非连续输入，Python 入口复制后正确计算。
-- 工程：非法参数、两项输入各自需要梯度时的拒绝、no_grad/inference_mode、autocast 保持 FP32、
-  非默认 stream、双 GPU 的 device guard 和设备不匹配。
-- 模型：FP32 完整前向、batch=2 的 last-only prefill、KV cache decode，与 reference 对照。
-
-单算子使用 `atol=1e-5, rtol=1e-4`；模型使用 `atol=2e-5, rtol=1e-4`，测试期间关闭 TF32 后恢复。
-有 CUDA 时测试会真实编译扩展，缺少 nvcc 会构建失败；无 CUDA 时跳过 GPU 用例。
-本次本地环境为 macOS / PyTorch 2.8.0，无 CUDA 和 nvcc，GPU 编译、数值及性能仍须按上述命令验收。
-
-## 统一性能测试入口
-
-本算子与其余七个算子共用 [benchmarks 测量框架](../../tiny_transformer/benchmarks/README.md)：
-先校验数值与可用梯度，再用 CUDA events、交替后端顺序、多轮中位数分别测前向/反向。
+模型训练及缓存推理统一放在 [test_student_integration.py](../../tests/test_student_integration.py)，
+分别启用 embedding、RMSNorm 和两者，对照 FP32/AMP 参数梯度及 last-only prefill/decode。
+运行两个算子和集成回归：
 
 ```bash
-python -m tiny_transformer.benchmarks --operator rms_norm --layouts contiguous strided last-only --phases forward \
-  --output runs/rms_norm-performance.json
+python -m unittest discover -s tests -p 'test_student_*.py' -v
 ```
 
-未实现的 student 算子/阶段会记录为 `skipped`，没有隐式 reference fallback；
-可用 `--backend reference` 验证完整测量流程。`check_ops --backward` 的结果不能替代反向性能数据。
+前向使用 `atol=1e-5, rtol=1e-4`，单算子反向与 FP32 模型梯度使用 `atol=3e-5, rtol=3e-4`；
+模型推理使用 `atol=2e-5, rtol=1e-4`，AMP 模型梯度使用 `atol=3e-3, rtol=3e-2`。
+测试职责及删除的重复覆盖见 [测试说明](../../tests/README.md)。
+本机无 CUDA/nvcc 时跳过 GPU 用例；GPU 编译、数值和性能仍须在目标环境验收。

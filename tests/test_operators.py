@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from tiny_transformer.operators import Operators, reference
+from tiny_transformer.operators import Operators, reference, student
 from tiny_transformer.check_ops import cases, differentiable_args
 
 
@@ -71,6 +71,8 @@ class OperatorTests(unittest.TestCase):
         self.assertIs(ops.linear, reference.linear)
 
     def test_invalid_dispatch_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "backward_impl"):
+            student.embedding(torch.zeros(1, 1, dtype=torch.long), torch.ones(2, 4), backward_impl="typo")
         for options in ({"typo": "student"}, {"linear": "sdpa"}, {"rope": "unknown"}):
             with self.assertRaises(ValueError):
                 Operators(options)

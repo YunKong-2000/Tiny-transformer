@@ -18,7 +18,7 @@ constexpr int kVector = 4;
 
 __global__ void rms_norm_scalar_kernel(
     int64_t rows, int64_t dim, float epsilon,
-    const float* X, const float* weight, float* output) {
+    const float* X, const float* weight, float* output, float* R) {
   const int64_t warp_num = static_cast<int64_t>(gridDim.x) * kWarpNum;
   const int64_t warp_id =
       static_cast<int64_t>(blockIdx.x) * kWarpNum + threadIdx.x / kWarpSize;
@@ -38,6 +38,7 @@ __global__ void rms_norm_scalar_kernel(
     }
     const float warp_sum = __shfl_sync(kFullWarp, local_sum, 0);
     const float inv_rms = rsqrtf(warp_sum / static_cast<float>(dim) + epsilon);
+    if (lane_id == 0) R[row] = inv_rms;
 
     for (int64_t col = lane_id; col < dim; col += kWarpSize) {
       // Normalize before scaling, matching reference.py's operation order.
@@ -48,7 +49,7 @@ __global__ void rms_norm_scalar_kernel(
 
 __global__ void rms_norm_vector_kernel(
     int64_t rows, int64_t dim, float epsilon,
-    const float* X, const float* weight, float* output) {
+    const float* X, const float* weight, float* output, float* R) {
   const int64_t warp_num = static_cast<int64_t>(gridDim.x) * kWarpNum;
   const int64_t warp_id =
       static_cast<int64_t>(blockIdx.x) * kWarpNum + threadIdx.x / kWarpSize;
@@ -71,6 +72,7 @@ __global__ void rms_norm_vector_kernel(
     }
     const float warp_sum = __shfl_sync(kFullWarp, local_sum, 0);
     const float inv_rms = rsqrtf(warp_sum / static_cast<float>(dim) + epsilon);
+    if (lane_id == 0) R[row] = inv_rms;
 
     for (int64_t col = static_cast<int64_t>(lane_id) * kVector; col < dim; col += kWarpSize * kVector) {
       // Normalize before scaling, matching reference.py's operation order.
@@ -88,7 +90,7 @@ __global__ void rms_norm_vector_kernel(
 
 }  // namespace
 
-torch::Tensor rms_norm_forward_cuda(torch::Tensor X, torch::Tensor weight, float epsilon) {
+std::tuple<torch::Tensor, torch::Tensor> rms_norm_forward_cuda(torch::Tensor X, torch::Tensor weight, float epsilon) {
   TORCH_CHECK(X.is_cuda() && weight.is_cuda(),
               "X and weight must be CUDA tensors");
   TORCH_CHECK(X.device() == weight.device(),
@@ -107,13 +109,14 @@ torch::Tensor rms_norm_forward_cuda(torch::Tensor X, torch::Tensor weight, float
   TORCH_CHECK(std::isfinite(epsilon) && epsilon >= 0.0f,
               "epsilon must be finite and non-negative");
   TORCH_CHECK(!(at::GradMode::is_enabled() && (X.requires_grad() || weight.requires_grad())),
-              "student rms_norm backward is not implemented; "
-              "use torch.no_grad()/torch.inference_mode() for forward-only inference");
+              "rms_norm_forward has no autograd binding; use student.rms_norm for training "
+              "or torch.no_grad()/torch.inference_mode() for inference");
 
   const c10::cuda::CUDAGuard device_guard(X.device());
   auto output = torch::empty(X.sizes(), X.options());
   const int64_t rows = X.numel() / dim;
-  if (rows == 0) return output;
+  auto R = torch::empty({rows}, X.options());
+  if (rows == 0) return {output, R};
 
   const int blocks = static_cast<int>(std::min<int64_t>((rows - 1) / kWarpNum + 1, 65535));
   const auto stream = c10::cuda::getCurrentCUDAStream(X.get_device());
@@ -125,12 +128,12 @@ torch::Tensor rms_norm_forward_cuda(torch::Tensor X, torch::Tensor weight, float
   if (vectorized) {
     rms_norm_vector_kernel<<<blocks, kThreadNum, 0, stream>>>(
       rows, dim, epsilon, X.data_ptr<float>(), weight.data_ptr<float>(),
-      output.data_ptr<float>());
+      output.data_ptr<float>(), R.data_ptr<float>());
   } else {
     rms_norm_scalar_kernel<<<blocks, kThreadNum, 0, stream>>>(
       rows, dim, epsilon, X.data_ptr<float>(), weight.data_ptr<float>(),
-      output.data_ptr<float>());
+      output.data_ptr<float>(), R.data_ptr<float>());
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return output;
+  return {output, R};
 }

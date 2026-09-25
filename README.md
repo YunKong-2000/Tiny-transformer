@@ -1,7 +1,7 @@
 # Tiny Transformer Lab
 
 面向 **A100 80GB PCIe + `nvcr.io/nvidia/pytorch:25.08-py3`** 的单卡训练与推理学习项目。
-完整 PyTorch 参考框架已经提供；student embedding 已接入 CUDA FP32 前向与一阶反向，RMSNorm 已接入 FP32 前向，其余学生算子待实现。
+完整 PyTorch 参考框架已经提供；student embedding 已接入 CUDA FP32 前向与一阶反向，RMSNorm 已接入 FP32 前向与一阶反向，其余学生算子待实现。
 
 ![模型与残差路径](docs/assets/architecture.png)
 
@@ -147,8 +147,8 @@ benchmark 报告冷请求、稳态 TTFT/TPOT、输出 token 吞吐、allocated/r
 它尚不支持二阶梯度、低精度 weight 或 torch.compile。
 
 修改 `tiny_transformer/operators/student.py` 对应函数，在 `csrc/` 添加实际代码。
-RMSNorm 当前支持 CUDA FP32 前向，非连续输入由 Python 入口显式复制，暂不支持反向。
-[代码检查与 PyTorch 接入步骤](docs/operators/rms_norm.md#7-本次代码检查与-pytorch-接入步骤) 包含各层职责和测试说明。
+RMSNorm 当前支持 CUDA FP32 前向与一阶反向（反向 H <= 1024），非连续输入由 Python 入口显式复制。
+[代码检查与 PyTorch 接入步骤](docs/operators/rms_norm.md#7-前向缓存与-pytorch-调用链) 包含各层职责和测试说明。
 例如只替换 RMSNorm：
 
 ```bash
@@ -162,6 +162,19 @@ python -m tiny_transformer.benchmarks.model --checkpoint runs/60m-sdpa/last.pt \
 未实现的算子会明确抛出 `NotImplementedError`；已接入算子的范围外调用会报错。没有自动退回 PyTorch 的隐藏路径。
 训练接入必须支持正确反向；仅完成前向时先用于 inference。
 
+## 正确性测试
+
+测试职责与精简说明见 [tests/README.md](tests/README.md)。日常使用一个回归入口：
+
+```bash
+python -m unittest discover -s tests -v
+# 只验证 embedding、RMSNorm 及它们的模型接入：
+python -m unittest discover -s tests -p 'test_student_*.py' -v
+```
+
+两个算子文件只维护 kernel 与 autograd 的核心回归；模型训练、prefill/decode 放在
+`test_student_integration.py` 共用。性能测量使用下面的 benchmarks 命令。
+
 ## 统一算子性能测试
 
 八个算子的性能代码集中在 [tiny_transformer/benchmarks](tiny_transformer/benchmarks/README.md)，
@@ -170,13 +183,13 @@ python -m tiny_transformer.benchmarks.model --checkpoint runs/60m-sdpa/last.pt \
 
 ```bash
 python -m tiny_transformer.benchmarks --operator rms_norm \
-  --layouts contiguous strided last-only --phases forward --output runs/rmsnorm-performance.json
+  --layouts contiguous strided last-only --phases forward backward --output runs/rmsnorm-performance.json
 python -m tiny_transformer.benchmarks --operator embedding \
   --backward-impl all --output runs/embedding-performance.json
 python -m tiny_transformer.benchmarks --operator all --output runs/all-operators-performance.json
 ```
 
-当前 student RMSNorm 只测 FP32 前向；未实现的算子、反向或低精度阶段在报告中明确跳过。
+当前 student RMSNorm 可测 FP32 前向与一阶反向（H <= 1024）；未实现的算子、反向或低精度阶段在报告中明确跳过。
 `--backend reference` 可验证八个算子的测量流程，`--operator attention --backend sdpa` 可比较 SDPA。
 模型端到端入口为 `python -m tiny_transformer.benchmarks.model`；旧命令保留转发兼容。
 
@@ -202,5 +215,5 @@ docs/transformer.md          算法手册
 docs/development.md          工程与优化手册
 ```
 
-当前未实现：embedding 二阶梯度、RMSNorm 反向与低精度路径、其余学生 GPU kernel、paged attention、CUDA Graph bucket、量化、分布式训练、HTTP serving。
+当前未实现：embedding 二阶梯度、RMSNorm 二阶梯度与低精度路径、其余学生 GPU kernel、paged attention、CUDA Graph bucket、量化、分布式训练、HTTP serving。
 这些是后续实验，不会被标记为已完成优化。

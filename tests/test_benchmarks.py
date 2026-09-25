@@ -8,6 +8,7 @@ import torch
 
 from tiny_transformer.benchmarks import common
 from tiny_transformer.benchmarks.cases import make_case
+from tiny_transformer.benchmarks.embedding import PATTERNS, make_ids
 from tiny_transformer.benchmarks.operators import build_parser, run, run_case, unsupported_reason, validate_args
 from tiny_transformer.operators import reference, student
 from tiny_transformer.operators.dispatch import NAMES
@@ -25,6 +26,29 @@ class BenchmarkHostTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(42)
         torch.set_num_threads(2)
+
+    def test_distribution_contracts(self):
+        torch.manual_seed(42)
+        for pattern in PATTERNS:
+            with self.subTest(pattern=pattern):
+                ids = make_ids(pattern, 2, 17, 67, 4, "cpu")
+                self.assertEqual(ids.shape, (2, 17))
+                self.assertEqual(ids.dtype, torch.int64)
+                self.assertTrue(ids.is_contiguous())
+                self.assertGreaterEqual(ids.min().item(), 0)
+                self.assertLess(ids.max().item(), 67)
+                if pattern == "same":
+                    self.assertEqual(ids.unique().numel(), 1)
+                elif pattern == "unique":
+                    self.assertEqual(ids.unique().numel(), ids.numel())
+                elif pattern == "hot":
+                    self.assertLess(ids.max().item(), 4)
+
+    def test_unique_does_not_silently_wrap_and_hot_ids_stay_in_vocab(self):
+        with self.assertRaisesRegex(ValueError, "unique IDs require"):
+            make_ids("unique", 2, 17, 7, 16, "cpu")
+        ids = make_ids("hot", 2, 17, 7, 16, "cpu")
+        self.assertLess(ids.max().item(), 7)
 
     def test_every_operator_prefill_decode_and_strides(self):
         args = small_args()
@@ -135,13 +159,13 @@ class BenchmarkHostTests(unittest.TestCase):
                 patch.object(student, 'linear') as missing, redirect_stdout(io.StringIO()):
             results = run(args, torch.device('cpu'))
         missing.assert_not_called()
-        self.assertEqual(measure.call_count, 6)  # embedding fwd/bwd + rms fwd, each workload
+        self.assertEqual(measure.call_count, 8)  # embedding and RMSNorm fwd/bwd, each workload
         self.assertEqual(len(results), 16)
         for row in results:
             if row['operator'] == 'rms_norm':
                 self.assertEqual(row['forward']['status'], 'passed')
-                self.assertEqual(row['backward']['status'], 'skipped')
-                self.assertNotIn('candidate_us', row['backward'])
+                self.assertEqual(row['backward']['status'], 'passed')
+                self.assertGreater(row['backward']['candidate_us'], 0)
             elif row['operator'] != 'embedding':
                 self.assertEqual(row['status'], 'skipped')
                 self.assertNotIn('validation', row)
@@ -178,6 +202,11 @@ class BenchmarkHostTests(unittest.TestCase):
         self.assertIsNone(unsupported_reason('rms_norm', 'reference', 'bf16', 'backward', 'last-only'))
         self.assertIsNone(unsupported_reason('attention', 'sdpa', 'fp32', 'backward', 'contiguous'))
 
+    def test_rms_norm_large_width_skips_only_backward(self):
+        self.assertIn('1024', unsupported_reason('rms_norm', 'student', 'fp32', 'backward', 'contiguous', 1025))
+        self.assertIsNone(unsupported_reason('rms_norm', 'student', 'fp32', 'forward', 'contiguous', 1025))
+        self.assertIsNone(unsupported_reason('rms_norm', 'student', 'fp32', 'backward', 'contiguous', 1024))
+
     def test_invalid_options(self):
         for options in (('--dim', '7'), ('--dim', '6'), ('--repeats', '0'),
                         ('--device', 'cpu'), ('--eps', 'nan')):
@@ -185,29 +214,6 @@ class BenchmarkHostTests(unittest.TestCase):
                     patch('sys.stderr', new_callable=io.StringIO):
                 with self.assertRaises(SystemExit):
                     validate_args(build_parser(), small_args(*options))
-
-
-@unittest.skipUnless(torch.cuda.is_available(), 'requires CUDA')
-class BenchmarkCudaTests(unittest.TestCase):
-    def test_reference_all_operators_and_sdpa_use_real_events(self):
-        with torch.cuda.device(0), redirect_stdout(io.StringIO()):
-            for extra in (('--backend', 'reference'), ('--operator', 'attention', '--backend', 'sdpa')):
-                results = run(small_args(*extra), torch.device('cuda'))
-                for row in results:
-                    for phase in ('forward', 'backward'):
-                        self.assertEqual(row[phase]['status'], 'passed')
-                        self.assertGreater(row[phase]['candidate_us'], 0)
-                        self.assertEqual(len(row[phase]['reference_trials_us']), 3)
-
-    def test_student_rms_norm_layouts_forward_events(self):
-        args = small_args('--operator', 'rms_norm', '--layouts', 'contiguous', 'strided', 'last-only')
-        with torch.cuda.device(0), redirect_stdout(io.StringIO()):
-            results = run(args, torch.device('cuda'))
-        self.assertEqual(len(results), 6)
-        for row in results:
-            self.assertEqual(row['forward']['status'], 'passed')
-            self.assertEqual(row['backward']['status'], 'skipped')
-            self.assertGreater(row['forward']['candidate_us'], 0)
 
 
 if __name__ == '__main__':

@@ -1,88 +1,64 @@
-"""RMSNorm integration tests; CUDA cases JIT-build and execute the real kernel."""
-from contextlib import contextmanager
-from pathlib import Path
-import subprocess
-import sys
+"""RMSNorm Y/R and gradient correctness. Shared model tests live in test_student_integration.py."""
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
-from tiny_transformer.config import ModelConfig
-from tiny_transformer.model import Transformer
-from tiny_transformer.operators import Operators, reference, student
-from tiny_transformer.operators._extension import load_embedding_extension, load_rms_norm_extension
-
-ROOT = Path(__file__).resolve().parents[1]
+from tiny_transformer.operators import reference, student
+from tiny_transformer.operators._extension import load_rms_norm_extension
 
 
-@contextmanager
-def full_precision_matmul():
-    previous = torch.get_float32_matmul_precision()
-    try:
-        torch.set_float32_matmul_precision("highest")
-        yield
-    finally:
-        torch.set_float32_matmul_precision(previous)
+def cpu_extension_double():
+    """Mimic the native API for host autograd tests; does not execute CUDA."""
+    def forward(x, weight, eps):
+        assert not torch.is_grad_enabled()
+        inv_rms = torch.rsqrt(x.square().mean(-1) + eps).reshape(-1)
+        return reference.rms_norm(x, weight, eps), inv_rms
+
+    def backward(x, gradient, weight, inv_rms):
+        assert not torch.is_grad_enabled()
+        assert gradient.is_contiguous()
+        r = inv_rms.reshape(*x.shape[:-1], 1)
+        u = gradient * weight
+        dx = r * (u - x * r.square() * (u * x).mean(-1, keepdim=True))
+        dw = (gradient * x * r).reshape(-1, x.shape[-1]).sum(0)
+        return dx, dw
+
+    return Mock(rms_norm_forward=Mock(side_effect=forward),
+                rms_norm_backward=Mock(side_effect=backward))
 
 
 class StudentRMSNormHostTests(unittest.TestCase):
-    def test_import_and_cpu_rejection_do_not_load_compiler(self):
-        result = subprocess.run([sys.executable, "-c", """
-import sys
-import torch
-from tiny_transformer.operators import Operators
-assert 'torch.utils.cpp_extension' not in sys.modules
-try:
-    Operators({'rms_norm': 'student'}).rms_norm(torch.ones(2, 3, 65), torch.ones(65), 1e-6)
-except RuntimeError as error:
-    assert 'CUDA' in str(error)
-else:
-    raise AssertionError('CPU input was accepted')
-assert 'torch.utils.cpp_extension' not in sys.modules
-"""], cwd=ROOT, capture_output=True, text=True, timeout=60)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    def setUp(self):
+        torch.manual_seed(42)
 
-    def test_jit_modules_have_independent_sources_and_cache(self):
-        # Mock compilation only: this checks build configuration, not GPU correctness.
-        import torch.utils.cpp_extension as cpp_extension
-
-        loaders = (load_rms_norm_extension, load_embedding_extension)
-        for loader in loaders:
-            loader.cache_clear()
-        try:
-            with patch.object(torch.cuda, "is_available", return_value=True), \
-                    patch.object(cpp_extension, "CUDA_HOME", "/test/cuda"), \
-                    patch.object(cpp_extension, "load", side_effect=[object(), object()]) as build:
-                rms_module = load_rms_norm_extension()
-                embedding_module = load_embedding_extension()
-                self.assertIs(load_rms_norm_extension(), rms_module)
-                self.assertIs(load_embedding_extension(), embedding_module)
-                self.assertIsNot(rms_module, embedding_module)
-            self.assertEqual(build.call_count, 2)
-            rms_args, embedding_args = [call.kwargs for call in build.call_args_list]
-            self.assertNotEqual(rms_args['name'], embedding_args['name'])
-            self.assertTrue(rms_args['with_cuda'])
-            self.assertEqual({Path(p).name for p in rms_args['sources']},
-                             {'bindings.cpp', 'rms_norm.cu'})
-            self.assertTrue(all(Path(p).is_file() for p in rms_args['sources']))
-            self.assertTrue(all(Path(p).parent.name == 'rms_norm' for p in rms_args['sources']))
-            self.assertTrue(set(rms_args['sources']).isdisjoint(embedding_args['sources']))
-        finally:
-            for loader in loaders:
-                loader.cache_clear()
-
-    def test_loader_reports_missing_cuda_and_toolkit(self):
-        import torch.utils.cpp_extension as cpp_extension
-
-        load_rms_norm_extension.cache_clear()
-        with patch.object(torch.cuda, 'is_available', return_value=False):
-            with self.assertRaisesRegex(RuntimeError, 'rms_norm.*CUDA'):
-                load_rms_norm_extension()
-        with patch.object(torch.cuda, 'is_available', return_value=True), \
-                patch.object(cpp_extension, 'CUDA_HOME', None):
-            with self.assertRaisesRegex(RuntimeError, 'nvcc'):
-                load_rms_norm_extension()
+    def test_saved_r_per_graph_strided_inputs_and_accumulation(self):
+        x = torch.randn(2, 3, 10, requires_grad=True)
+        weight = torch.randn(10, requires_grad=True)
+        expected_x = x.detach().clone().requires_grad_()
+        expected_weight = weight.detach().clone().requires_grad_()
+        extension = cpu_extension_double()
+        with patch.object(student, 'load_rms_norm_extension', return_value=extension):
+            # Match the public wrapper's copies; their backward must map to the base.
+            actual = [student._RMSNorm.apply(x[..., ::2].contiguous(), weight[::2].contiguous(), eps)
+                      for eps in (1e-6, 0.5)]
+            expected = [reference.rms_norm(expected_x[..., ::2], expected_weight[::2], eps)
+                        for eps in (1e-6, 0.5)]
+            saved_r = [value.grad_fn.saved_tensors[2] for value in actual]
+            self.assertNotEqual(saved_r[0].data_ptr(), saved_r[1].data_ptr())
+            for index in (1, 0):
+                if index:
+                    # sum() produces an expanded upstream gradient.
+                    actual[index].sum().backward()
+                    expected[index].sum().backward()
+                else:
+                    upstream = torch.randn(2, 3, 10)[..., ::2] * 0.3
+                    actual[index].backward(upstream)
+                    expected[index].backward(upstream)
+                self.assertIs(extension.rms_norm_backward.call_args.args[3], saved_r[index])
+            torch.testing.assert_close(x.grad, expected_x.grad)
+            torch.testing.assert_close(weight.grad, expected_weight.grad)
+            self.assertEqual(extension.rms_norm_forward.call_count, 2)  # No recomputation.
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA and nvcc")
@@ -94,73 +70,67 @@ class StudentRMSNormCudaTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(42)
 
-    def assert_norm(self, x, weight, eps=1e-6):
-        old_x, old_weight = x.clone(), weight.clone()
-        expected = reference.rms_norm(x, weight, eps)
-        actual = Operators({'rms_norm': 'student'}).rms_norm(x, weight, eps)
-        native = self.extension.rms_norm_forward(x.contiguous(), weight.contiguous(), eps)
-        self.assertEqual(actual.shape, x.shape)
-        self.assertEqual(actual.dtype, x.dtype)
-        self.assertEqual(actual.device, x.device)
-        self.assertTrue(actual.is_contiguous())
-        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4, equal_nan=True)
-        torch.testing.assert_close(native, actual, atol=0, rtol=0, equal_nan=True)
-        torch.testing.assert_close(x, old_x, atol=0, rtol=0)
-        torch.testing.assert_close(weight, old_weight, atol=0, rtol=0)
-        actual.fill_(123)
-        torch.testing.assert_close(x, old_x, atol=0, rtol=0)
-        torch.testing.assert_close(weight, old_weight, atol=0, rtol=0)
+    def assert_forward_backward(self, x, weight, eps=1e-6, upstream=None):
+        x = x.detach().requires_grad_()
+        weight = weight.detach().requires_grad_()
+        expected_x = x.detach().clone().requires_grad_()
+        expected_weight = weight.detach().clone().requires_grad_()
+        actual = student.rms_norm(x, weight, eps)
+        # Inspect the cache from this forward instead of launching forward twice.
+        r = actual.grad_fn.saved_tensors[2]
+        torch.testing.assert_close(r, torch.rsqrt(x.square().mean(-1) + eps).reshape(-1),
+                                   atol=1e-5, rtol=1e-4)
+        expected = reference.rms_norm(expected_x, expected_weight, eps)
+        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
+        if upstream is None:
+            upstream = torch.randn_like(actual) / max(1, x.numel() // x.shape[-1])
+        gradients = torch.autograd.grad(actual, (x, weight), upstream)
+        torch.testing.assert_close(x, expected_x, atol=0, rtol=0)
+        torch.testing.assert_close(weight, expected_weight, atol=0, rtol=0)
+        expected_gradients = torch.autograd.grad(expected, (expected_x, expected_weight), upstream)
+        for left, right in zip(gradients, expected_gradients):
+            torch.testing.assert_close(left, right, atol=3e-5, rtol=3e-4)
+        self.assertEqual(gradients[0].shape, x.shape)
+        self.assertEqual(gradients[1].shape, weight.shape)
 
-    @torch.no_grad()
-    def test_warp_tails_real_shapes_and_capped_grid(self):
-        shapes = [(2, 17, h) for h in (1, 3, 31, 32, 33, 64, 65, 768, 1025)]
-        shapes += [(8, 512, 768), (4, 1, 768), (65,), (7, 65), (2, 3, 4, 65),
-                   (1, 65535 * 8 + 1, 3)]
-        for shape in shapes:
+    def test_shapes_scales_and_shared_memory_boundary(self):
+        for shape in [(2, 3, h) for h in (1, 4, 31, 32, 33, 64, 65, 124, 128, 132, 768, 1024)] + [
+                (65,), (3, 65), (2, 3, 4, 65), (8, 512, 768), (4, 1, 768), (0, 3, 65), (2, 0, 65)]:
             with self.subTest(shape=shape):
-                self.assert_norm(torch.randn(shape, device='cuda'),
-                                 torch.randn(shape[-1], device='cuda'))
+                self.assert_forward_backward(torch.randn(shape, device='cuda'),
+                                     torch.randn(shape[-1], device='cuda'))
+        for dim in (65, 768):
+            for scale, eps in ((0, 1e-6), (1e-4, 0.1), (1e3, 1e-4)):
+                with self.subTest(dim=dim, scale=scale, eps=eps):
+                    self.assert_forward_backward(torch.randn(2, 3, dim, device='cuda') * scale,
+                                         torch.randn(dim, device='cuda'), eps)
 
-    @torch.no_grad()
-    def test_zero_input_scales_weights_and_epsilon(self):
-        weight = torch.linspace(-3, 3, 65, device='cuda')
-        for scale in (0, 1e-8, 1, 1e6):
-            for eps in (1e-12, 1e-6, 0.1):
-                with self.subTest(scale=scale, eps=eps):
-                    self.assert_norm(torch.randn(2, 17, 65, device='cuda') * scale, weight, eps)
-        self.assert_norm(torch.ones(2, 3, 65, device='cuda'), weight, 0.0)
-        # eps=0 and a zero row follow reference's NaN semantics, without clamping.
-        self.assert_norm(torch.zeros(2, 3, 65, device='cuda'), weight, 0.0)
-        # Multiplying X * weight before normalization would overflow here.
-        self.assert_norm(torch.full((2, 3, 65), 1e10, device='cuda'),
-                         torch.full((65,), 1e30, device='cuda'))
-
-    @torch.no_grad()
-    def test_strided_inputs_and_storage_offsets(self):
+    def test_strides_alignment_and_expanded_upstream(self):
         base = torch.randn(2, 5, 130, device='cuda')
-        weight = torch.randn(130, device='cuda')[::2]
-        inputs = [base[..., ::2], base[..., :65][:, -1:, :],
-                  base[..., :65].transpose(0, 1),
-                  torch.randn(65, device='cuda').expand(2, 3, 65)]
-        for x in inputs:
-            self.assertFalse(x.is_contiguous())
-            self.assert_norm(x, weight)
-        x = torch.randn(2 * 3 * 65 + 1, device='cuda')[1:].view(2, 3, 65)
-        weight = torch.randn(66, device='cuda')[1:]
-        self.assertTrue(x.is_contiguous() and weight.is_contiguous())
-        self.assertGreater(x.storage_offset(), 0)
-        self.assert_norm(x, weight)
+        for x in (base[..., ::2], base[..., :65][:, -1:, :], base[..., :65].transpose(0, 1)):
+            gradient = torch.ones((), device='cuda').expand(x.shape)
+            self.assert_forward_backward(x, torch.randn(130, device='cuda')[::2], upstream=gradient)
+        for x_offset, w_offset in ((0, 0), (1, 0), (0, 1), (1, 1), (4, 4)):
+            x = torch.randn(6 * 768 + x_offset, device='cuda')[x_offset:].view(2, 3, 768)
+            w = torch.randn(768 + w_offset, device='cuda')[w_offset:]
+            gradient = torch.randn(2, 3, 1536, device='cuda')[..., ::2]
+            self.assert_forward_backward(x, w, upstream=gradient)
 
     @torch.no_grad()
-    def test_empty_leading_dimensions(self):
-        for shape in ((0, 17, 65), (2, 0, 65), (0, 65)):
-            self.assert_norm(torch.empty(shape, device='cuda'), torch.randn(65, device='cuda'))
+    def test_capped_grid_and_zeroing_on_each_call(self):
+        rows = 65535 + 1
+        x = torch.ones(rows, 1, device='cuda')
+        w = torch.ones(1, device='cuda')
+        _, r = self.extension.rms_norm_forward(x, w, 0.0)
+        for value in (1, 2):
+            dx, dw = self.extension.rms_norm_backward(x, torch.full_like(x, value), w, r)
+            torch.testing.assert_close(dx, torch.zeros_like(x), atol=0, rtol=0)
+            torch.testing.assert_close(dw, torch.full_like(w, rows * value), atol=0, rtol=0)
 
     def test_native_rejects_unsupported_inputs(self):
         x, weight = torch.randn(2, 3, 65, device='cuda'), torch.randn(65, device='cuda')
         cases = [(x.cpu(), weight, 'CUDA tensors'), (x, weight.cpu(), 'CUDA tensors'),
                  (x.half(), weight, 'float32'), (x, weight.bfloat16(), 'float32'),
-                 (x.double(), weight.double(), 'float32'),
                  (x[0, 0, 0], weight, 'at least one dimension'),
                  (x, weight[None, :], '1D'), (x, weight[:64], 'same last dimension'),
                  (x.transpose(0, 1), weight, 'contiguous'),
@@ -175,27 +145,61 @@ class StudentRMSNormCudaTests(unittest.TestCase):
             with self.subTest(eps=eps), self.assertRaisesRegex(RuntimeError, 'epsilon'):
                 self.extension.rms_norm_forward(x, weight, eps)
 
-    def test_forward_only_gradient_guard(self):
-        for x_grad, weight_grad in ((True, False), (False, True), (True, True)):
-            x = torch.randn(2, 3, 65, device='cuda', requires_grad=x_grad)
-            weight = torch.randn(65, device='cuda', requires_grad=weight_grad)
-            for function in (student.rms_norm, self.extension.rms_norm_forward):
-                with self.assertRaisesRegex(RuntimeError, 'backward is not implemented'):
-                    function(x, weight, 1e-6)
-                for mode in (torch.no_grad, torch.inference_mode):
-                    with mode():
-                        actual = function(x, weight, 1e-6)
-                        self.assertFalse(actual.requires_grad)
-                        torch.testing.assert_close(actual, reference.rms_norm(x, weight, 1e-6),
-                                                   atol=1e-5, rtol=1e-4)
-        # Grad mode itself is fine when neither input requires gradients.
-        self.assert_norm(x.detach(), weight.detach())
+    @torch.no_grad()
+    def test_backward_rejects_unsupported_inputs(self):
+        x = torch.randn(2, 3, 65, device='cuda')
+        g, w = torch.randn_like(x), torch.randn(65, device='cuda')
+        _, r = self.extension.rms_norm_forward(x, w, 1e-6)
+        args = [x, g, w, r]
+        cases = [(i, tensor.cpu(), 'CUDA tensors') for i, tensor in enumerate(args)]
+        cases += [(i, tensor.half(), 'float32') for i, tensor in enumerate(args)]
+        cases += [(1, g[:, :1], 'same shape'), (3, r[:-1], 'shape'), (3, r.view(2, 3), 'shape'),
+                  (3, torch.ones(12, device='cuda')[::2], 'contiguous'),
+                  (2, w[None, :], '1D'), (2, w[:-1], 'same last dimension'),
+                  (1, torch.randn(2, 3, 130, device='cuda')[..., ::2], 'contiguous')]
+        for index, value, message in cases:
+            with self.subTest(index=index, message=message):
+                call_args = args.copy()
+                call_args[index] = value
+                with self.assertRaisesRegex(RuntimeError, message):
+                    self.extension.rms_norm_backward(*call_args)
+        for h in (0, 1025):
+            with self.assertRaisesRegex(RuntimeError, 'H <= 1024'):
+                self.extension.rms_norm_backward(torch.empty(2, h, device='cuda'),
+                                                torch.empty(2, h, device='cuda'),
+                                                torch.empty(h, device='cuda'),
+                                                torch.empty(2, device='cuda'))
+
+    def test_training_width_limit_and_native_double_backward_guard(self):
+        x = torch.randn(2, 1025, device='cuda', requires_grad=True)
+        w = torch.ones(1025, device='cuda', requires_grad=True)
+        with self.assertRaisesRegex(RuntimeError, 'H <= 1024'):
+            student.rms_norm(x, w, 1e-6)
+        with torch.no_grad():
+            torch.testing.assert_close(student.rms_norm(x, w, 1e-6), reference.rms_norm(x, w, 1e-6))
+        x, w = x[:, :65].contiguous().detach(), w[:65].detach()
+        with torch.no_grad():
+            _, r = self.extension.rms_norm_forward(x, w, 1e-6)
+        with self.assertRaisesRegex(RuntimeError, 'first-order'):
+            self.extension.rms_norm_backward(x, torch.ones_like(x, requires_grad=True), w, r)
 
     @torch.no_grad()
-    def test_autocast_preserves_fp32(self):
-        with torch.autocast('cuda', dtype=torch.float16):
-            self.assert_norm(torch.randn(2, 17, 65, device='cuda'),
-                             torch.randn(65, device='cuda'))
+    def test_backward_reads_cached_r_on_current_stream(self):
+        x, g = torch.zeros(2, 3, 65, device='cuda'), torch.zeros(2, 3, 65, device='cuda')
+        w, r = torch.zeros(65, device='cuda'), torch.zeros(6, device='cuda')
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(10_000_000)
+            x.fill_(2)
+            g.fill_(3)
+            w.fill_(4)
+            r.fill_(0.25)  # Deliberately supplied cache; backward must consume it.
+            dx, dw = self.extension.rms_norm_backward(x, g, w, r)
+            dx, dw = dx.clone(), dw.clone()
+        stream.synchronize()
+        torch.testing.assert_close(dx, torch.full_like(x, 2.25), atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(dw, torch.full_like(w, 9), atol=1e-6, rtol=1e-5)
 
     @torch.no_grad()
     def test_current_stream(self):
@@ -211,39 +215,16 @@ class StudentRMSNormCudaTests(unittest.TestCase):
         stream.synchronize()
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
 
-    @unittest.skipUnless(torch.cuda.device_count() >= 2, 'requires two CUDA devices')
     @torch.no_grad()
-    def test_device_guard_and_mismatched_devices(self):
-        with torch.cuda.device(0):
-            x = torch.randn(2, 3, 65, device='cuda:1')
-            weight = torch.randn(65, device='cuda:1')
-            self.assert_norm(x, weight)
-            self.assertEqual(torch.cuda.current_device(), 0)
-            with self.assertRaisesRegex(RuntimeError, 'same CUDA device'):
-                self.extension.rms_norm_forward(x.to('cuda:0'), weight, 1e-6)
-
-    @torch.inference_mode()
-    def test_model_full_prefill_last_only_and_cached_decode(self):
-        with full_precision_matmul():
-            model = Transformer(ModelConfig(vocab_size=31, dim=64, n_layers=2,
-                                            n_heads=4, hidden_dim=96, max_seq_len=32)).cuda().eval()
-            ids = torch.randint(31, (2, 11), device='cuda')
-            chunks = [ids[:, :4]] + [ids[:, i:i + 1] for i in range(4, 11)]
-            expected_full = model(ids)
-            expected_last = model(ids, last_only=True)
-            reference_cache = model.new_cache(2, 16)
-            expected_parts = [model(chunk, cache=reference_cache, last_only=True) for chunk in chunks]
-            model.ops = Operators({'rms_norm': 'student'})
-            torch.testing.assert_close(model(ids), expected_full, atol=2e-5, rtol=1e-4)
-            torch.testing.assert_close(model(ids, last_only=True), expected_last, atol=2e-5, rtol=1e-4)
-            cache = model.new_cache(2, 16)
-            end = 0
-            for chunk, expected in zip(chunks, expected_parts):
-                end += chunk.shape[1]
-                actual = model(chunk, cache=cache, last_only=True)
-                torch.testing.assert_close(actual, expected, atol=2e-5, rtol=1e-4)
-                torch.testing.assert_close(actual, expected_full[:, end - 1:end], atol=2e-5, rtol=1e-4)
+    def test_forward_only_extremes_and_capped_grid(self):
+        for rows, dim, value, scale, eps in ((6, 65, 0., 1., 0.),
+                                           (6, 65, 1e10, 1e30, 1e-6),
+                                           (65535 * 8 + 1, 4, 1., 2., 1e-6)):
+            x, w = torch.full((rows, dim), value, device="cuda"), torch.full((dim,), scale, device="cuda")
+            y, r = self.extension.rms_norm_forward(x, w, eps)
+            torch.testing.assert_close(y, reference.rms_norm(x, w, eps), atol=1e-5, rtol=1e-4, equal_nan=True)
+            torch.testing.assert_close(r, torch.rsqrt(x.square().mean(-1) + eps), atol=1e-5, rtol=1e-4)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

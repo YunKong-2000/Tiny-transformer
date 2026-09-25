@@ -22,9 +22,9 @@
 默认分别测 prefill 和 decode，并请求 forward/backward。只支持前向时，backward 明确跳过。
 
 ```bash
-# RMSNorm：前向，包含连续、末维 stride=2 和 last-only prefill。
+# RMSNorm：前向与反向，包含连续、末维 stride=2 和 last-only prefill。
 python -m tiny_transformer.benchmarks --operator rms_norm \
-  --layouts contiguous strided last-only --phases forward \
+  --layouts contiguous strided last-only --phases forward backward \
   --output runs/rmsnorm-performance.json
 
 # Embedding：同一输入/上游梯度，对比四种分布与两个反向实现。
@@ -60,7 +60,7 @@ python -m tiny_transformer.benchmarks.model --config configs/smoke.json \
 |---|---|---|---|
 | embedding | `[B,T]` IDs、`[V,H]` weight；random/same/unique/hot；grouped/baseline | weight | FP32 前向、反向，连续输入 |
 | linear | `[B,T,H]`、`[out_features,H]` | x、weight | 未实现 |
-| rms_norm | `[B,T,H]`、`[H]`、eps；可测 last-only `[B,1,H]` | x、weight | FP32 前向；wrapper 复制跨步输入 |
+| rms_norm | `[B,T,H]`、`[H]`、eps；可测 last-only `[B,1,H]` | x、weight | FP32 前向/反向（H <= 1024）；wrapper 复制跨步输入 |
 | rope | `[B,heads,T,H/heads]` 与共享 cos/sin | x；cos/sin 是常量 | 未实现 |
 | attention | prefill `Q=K=T`；decode `Q=1,K=seq_length`，携带 past_len | q、k、v | 未实现；可用 SDPA 比较 |
 | swiglu | `[B,T,hidden_dim]` gate/up；跨步用例保留 chunk view | gate、up | 未实现 |
@@ -83,7 +83,7 @@ JSON 逐项记录实际 shape、stride、storage offset 和 dtype，last-only �
 
 1. 在计时前完成 JIT 编译和与 reference 的前向比较。需要测 backward 时，还检查每个可微输入的梯度。
    Embedding 前向要求精确相等；其他算子按 dtype 使用公用阈值，JSON 保存实际阈值与误差。
-   RMSNorm 前向验证/计时使用 `no_grad`，不会因 weight 是参数而误入尚未实现的反向。
+   RMSNorm 前向验证/计时使用 `no_grad`；反向计时保存每图的 R 并直接复用。H > 1024 时跳过反向。
 2. 两个后端都先预热；CUDA events 在计时区间外完成首次初始化。
    每轮用当前设备/stream 的 events 包围 repeats 次调用，得到每次调用的平均微秒数；
    交替 reference/candidate 顺序，最后报告 trials 轮的中位数、全部原始样本和加速比。
@@ -109,10 +109,11 @@ CPU 上的 check_ops 使用多轮主机时钟，并标注为 smoke diagnostics�
 ## 测试
 
 ```bash
-python -m unittest discover -s tests -p 'test_benchmark*.py' -v
+python -m unittest discover -s tests -p 'test_benchmarks.py' -v
 ```
 
 主机测试覆盖八个算子的输入/梯度契约、非连续布局、反向不重跑前向或积累 `.grad`、
 错误结果拒绝、CUDA event 交替顺序/单位换算/中位数、未实现路径和变体间的输入公平性。
-CUDA 测试真实测量八个 reference、SDPA、student embedding 和 student RMSNorm。
-没有 CUDA 时 GPU 用例跳过，不能将主机测试通过视为 GPU 性能验收。
+该文件只测试公共框架，不重复跑学生 kernel 的数值或性能。
+学生 kernel 正确性运行 `python -m unittest discover -s tests -p 'test_student_*.py' -v`；
+真实性能运行上方 benchmark CLI，其中已包含计时前的数值校验。完整测试分工见 [测试说明](../../tests/README.md)。
