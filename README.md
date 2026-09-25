@@ -1,7 +1,7 @@
 # Tiny Transformer Lab
 
 面向 **A100 80GB PCIe + `nvcr.io/nvidia/pytorch:25.08-py3`** 的单卡训练与推理学习项目。
-完整 PyTorch 参考框架已经提供；student embedding 已接入 CUDA FP32 前向，其余学生算子待实现。
+完整 PyTorch 参考框架已经提供；student embedding 已接入 CUDA FP32 前向与一阶反向，其余学生算子待实现。
 
 ![模型与残差路径](docs/assets/architecture.png)
 
@@ -141,9 +141,10 @@ benchmark 报告冷请求、稳态 TTFT/TPOT、输出 token 吞吐、allocated/r
 
 ## 实现你的第一个算子
 
-已有 embedding 的一 warp 一 ID 前向实现，支持 CUDA 连续 int64 IDs 与 FP32 weight，
+已有 embedding 的一 warp 一 ID 前向和 warp 内分组累加反向，支持 CUDA 连续 int64 IDs 与 FP32 weight，
 首次调用延迟编译扩展。构建依赖、检查与推理命令见 [csrc 说明](csrc/README.md)。
-它尚不支持 backward、低精度 weight 或 torch.compile。
+已通过 eager autograd 接入一阶梯度；GPU 编译、数值及性能需在目标 CUDA 环境验收。
+它尚不支持二阶梯度、低精度 weight 或 torch.compile。
 
 修改 `tiny_transformer/operators/student.py` 对应函数，在 `csrc/` 添加实际代码。
 例如只替换 RMSNorm：
@@ -180,5 +181,5 @@ docs/transformer.md          算法手册
 docs/development.md          工程与优化手册
 ```
 
-当前未实现：embedding backward、其余学生 GPU kernel、paged attention、CUDA Graph bucket、量化、分布式训练、HTTP serving。
+当前未实现：embedding 二阶梯度、其余学生 GPU kernel、paged attention、CUDA Graph bucket、量化、分布式训练、HTTP serving。
 这些是后续实验，不会被标记为已完成优化。

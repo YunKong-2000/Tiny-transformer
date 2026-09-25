@@ -54,42 +54,144 @@ $$
 
 ## 5. 训练反向
 
-上游梯度 $G$ 的形状为 $[B,T,H]$：
+student 已接入 CUDA FP32 的一阶反向与 eager autograd；下文给出输入输出契约和调用链。
+CUDA 编译、数值和性能验收须在目标 GPU 上执行，不能以 CPU 接线测试代替。
+
+### 5.1 反向算子的输入与输出
+
+前向是从 weight 查出各个 token 的向量；反向则把各位置的上游梯度累加回对应的 weight 行。
+记 `grad_output` 为 $G=\partial\mathcal{L}/\partial X$，它由下游计算图传入，
+不是前向的 weight，也不是前向输出 X 本身。
+
+底层 CUDA 接口显式接收词表大小（C++ 参数名为 `gradient`，对应下文的 grad_output）：
+
+```cpp
+torch::Tensor embedding_backward_cuda(
+    torch::Tensor ids, torch::Tensor gradient, int64_t vocab_size);
+```
+
+| 方向 | 项目 | 含义 / 来源 | shape | dtype / device |
+|---|---|---|---|---|
+| 输入 | ids | 前向保存的 token ID，决定每个梯度累加到哪一行 | $[B,T]$ | `torch.int64`；与 grad_output 同设备 |
+| 输入 | grad_output | 下游传入的 $\partial\mathcal{L}/\partial X$ | $[B,T,H]$ | 与前向输出 X 对应；本项目 FP32/AMP 训练均为 FP32 |
+| 输入 | vocab_size | 前向保存的 `weight.shape[0]`，即 V | 整数标量 | C++ `int64_t`，不是 tensor |
+| 输出 | dweight | 本次 embedding 调用贡献的 $\partial\mathcal{L}/\partial W$ | $[V,H]$ | dense tensor；与前向 weight 同 dtype/device |
+
+反向不需要读取 weight 或 X 的数值。当前 autograd wrapper 使用 `ctx.save_for_backward(ids)`
+保存索引，使用 `ctx.vocab_size = weight.shape[0]` 保存 V。autograd 校验上游梯度与前向输出的
+shape/dtype/device；H 从 grad_output 的末维取得，FP32 输出梯度表在相同设备上分配。
+**不能用 `ids.max() + 1` 推断 V**：一个 batch 通常只包含词表中的一部分 token，空 IDs 也没有最大值。
+若底层只接收 `ids, grad_output`，还必须通过其他明确约定提供 V，例如传入预分配的 `[V,H]` 输出；
+这两个输入本身不足以确定完整梯度表的行数。
+
+底层 CUDA 算子只返回 `dweight`。对于前向签名 `embedding(ids, weight)`，
+`torch.autograd.Function.backward(ctx, grad_output)` 应按前向参数顺序返回 **`(None, dweight)`**：
+ids 是离散整数索引，不求导，其梯度为 `None`，而不是一个全零 tensor。
+保存到 ctx 的 V 等元信息不属于该前向签名的额外参数，因此不增加 backward 返回项。
+
+默认训练时，反向输入为 ids `[8,512]`、grad_output `[8,512,768]` 和 V=8192，
+输出 dweight `[8192,768]`。kernel 内可将 ids 展平为 `[B*T]`、grad_output 展平为 `[B*T,H]`，
+但 `[B*T,H]` 表示每个位置的上游梯度，不是 weight 的形状；输出始终保留完整 `[V,H]`。
+
+### 5.2 梯度计算过程
+
+对每个词表行 v 和通道 h：
 
 $$
 \frac{\partial\mathcal{L}}{\partial W_{v,h}}
 =\sum_{b,t:\,\mathrm{ids}_{b,t}=v}G_{b,t,h}.
 $$
 
-反向返回 `None, dweight`，`dweight` 的形状为 $[V,H]$，dtype 与 weight 对应。
+1. 为本次调用分配独立的 `[V,H]` 梯度表，并初始化为零。
+2. 遍历每个位置 `(b,t)`，读取 `v = ids[b,t]`，将 `grad_output[b,t,:]` 累加到 `dweight[v,:]`。
+3. 返回该梯度表，由 autograd 将它传递并累加到 weight 对应的梯度。
+
 只考虑 embedding 这一条分支时，未出现的 token 行梯度为零；重复 ID 的梯度是**相加**，不是覆盖或求平均。
-用 atomics 时要考虑竞争、累加精度和非确定性误差。
+例如 `ids = [[2,1,2]]`，三个位置的梯度为 `g0, g1, g2`，则
+`dweight[2] = g0 + g2`、`dweight[1] = g1`，其余行全零。ID 0 也按相同规则参与累加。
+空 IDs 对应空的 grad_output，仍返回完整 `[V,H]` 全零梯度表。
+
+并行实现可使用 scatter-add / atomicAdd，或先按 ID 分组再归约；重复 ID 会产生写竞争，
+不能直接赋值或使用没有同步保护的读改写。用 atomics 时要考虑累加精度和非确定性误差。
+上游已包含 loss 的平均、microbatch 权重及可能的 loss scaling，反向不再除以 B、T 或 token 出现次数，
+也不自行解除 loss scaling。
+
+底层反向 wrapper 检查 grad_output 的前两维与 ids 一致、H/V 为正、dtype/device 符合契约，
+并在 kernel 内检查 ID 在 `[0,V)` 内。底层只接受连续输入；Python backward 显式执行
+`grad_output.contiguous()` 并将复制计入反向成本。特别是 `x.sum().backward()` 可能传入
+零 stride 的展开梯度，不能仅凭 shape 按连续内存读取。
+
+### 5.3 与共享参数和 autograd 的衔接
 
 默认模型的 embedding 与 LM head 共享同一个 Parameter。整模型训练时，该权重还会收到
 输出 Linear 的梯度，因此不能用“未作为输入出现的 token 行必须为零”检查共享权重的最终 `.grad`。
 交由 autograd 累加两条分支，不要在 embedding backward 中清空或覆盖共享参数梯度。
 本项目参考使用 dense gradient；第一版无需实现 sparse embedding optimizer 路径。
 
+### 5.4 从绑定到 loss.backward() 的调用链
+
+1. [扩展加载器](../../tiny_transformer/operators/_extension.py) 将 `bindings.cpp`、
+   `embedding.cu` 和 `embedding_backward.cu` 一起传给 `torch.utils.cpp_extension.load`，
+   延迟编译并加载同一个扩展模块。只在头文件声明函数不会编译其实现。
+2. [bindings.cpp](../../csrc/bindings.cpp) 中的
+   `m.def("embedding_backward", &embedding_backward_cuda, ...)` 将 C++ host wrapper
+   暴露为 Python 的 `extension.embedding_backward(ids, gradient, vocab_size)`。
+   **pybind 只提供可调用函数，不会自动把 forward 与 backward 关联起来。**
+3. [student.py](../../tiny_transformer/operators/student.py) 在梯度开启且 weight 需要梯度时，
+   调用 `_Embedding.apply(ids, weight)`。`apply` 创建 autograd 节点；其 `forward`
+   在关闭梯度记录的上下文中调用扩展前向，并保存 ids 和 V。
+4. 下游执行 `loss.backward()` 或 `torch.autograd.grad(...)` 时，autograd 沿计算图把
+   `[B,T,H]` 上游梯度传给 `_Embedding.backward(ctx, grad_output)`；用户不需要手动调用 kernel。
+5. Python backward 将上游梯度转为连续张量，再调用扩展的 `embedding_backward`。
+   C++ wrapper 校验输入，设置 device guard，分配 `[V,H]` 全零输出，并在当前 CUDA stream
+   上启动 kernel。kernel 在 warp 内合并相同 ID，再用 `atomicAdd` 累加跨 warp 的贡献。
+6. Python backward 返回 `(None, dweight)`；autograd 将 dweight 与 LM head 分支、已有
+   microbatch 梯度一起累加到同一个参数。算子自身不直接修改 `weight.grad`，也不更新 weight。
+
+```python
+import torch
+from tiny_transformer.operators import student
+
+ids = torch.tensor([[2, 1, 2]], device="cuda", dtype=torch.int64)
+weight = torch.randn(7, 65, device="cuda", requires_grad=True)
+x = student.embedding(ids, weight)  # x.grad_fn 对应 _EmbeddingBackward
+x.sum().backward()                 # 自动调用绑定的 CUDA backward
+# weight.grad.shape == (7, 65)
+# 第 2 行全为 2，第 1 行全为 1，其余行全为 0。
+```
+
+`no_grad` / `inference_mode` 或 weight 不需要梯度时，直接调用扩展前向，不创建此节点。
+直接调用 pybind 前向不会建立梯度关系，因此原生前向仍在需要 autograd 时拒绝调用，并提示使用
+`student.embedding`。当前 backward 用 `once_differentiable` 明确限定一阶梯度；
+尚未提供二阶反向或 `torch.compile` 的自定义算子注册。
+
+反向使用浮点原子加，不保证逐 bit 确定性。开启 `torch.use_deterministic_algorithms(True)`
+时，非空反向明确报错；`warn_only=True` 时警告后执行。空输入只返回全零表。
+
 ## 6. 建议的实现阶段与验收
 
-当前 student 已接入 **CUDA FP32 连续输入的前向**，保留一 warp 一 ID 的标量和 float4 两条路径。
+当前 student 已接入 **CUDA FP32 连续输入的前向与一阶反向**，前向保留一 warp 一 ID 的标量和 float4 两条路径。
 weight/output 指针均为 16 字节对齐且 H 能被 4 整除时使用 float4，否则使用标量 kernel。
 支持空 IDs，拒绝 V/H 为零、非连续输入和低精度 weight。
 扩展在首次调用时延迟编译，构建依赖和完整命令见 [csrc 说明](../../csrc/README.md)。
-当前尚无 backward：梯度开启且 weight 需要梯度时明确报错，不能用于训练。
+反向每个 warp 对最多 32 个输入位置按 ID 分组，所有 lane 协作处理通道；索引与地址计算使用 int64。
+SM70 及以上使用 `__match_any_sync`，更早架构使用 shuffle/ballot 分组。
+采用限制 grid 大小的 warp-stride 循环；尾部 token 和 H 不整除 32 均有对应处理。
 非法 ID 通过异步设备断言报错；不会静默跳过或通过 CPU 读回检查。
 
-1. FP32/BF16 inference：按 ID gather 一整行，保证向量 load/store 对齐与行尾处理。
-2. 加入重复 ID 的 backward 累加，验证不同 batch/sequence 的重复情况。
-3. 验证 FP32 master 参数的 AMP 训练，再考虑查表缓存与带宽优化。
+1. 在目标 GPU 上验收 FP32 前向/反向、尾部形状、重复 ID 和共享权重梯度。
+2. 验证 FP32 master 参数的 AMP 训练；BF16/FP16 weight 仍不支持。
+3. 比较高/低重复率下分组反向与逐 token 原子累加的耗时，再考虑通道切分等并行度优化。
 
 ```bash
 python -m tiny_transformer.check_ops --operator embedding --backend student \
-  --device cuda --precision fp32 --output runs/embedding-fp32.json
+  --device cuda --precision fp32 --backward --output runs/embedding-fp32.json
 python -m unittest discover -s tests -p 'test_student_embedding.py' -v
 ```
 
-完成 backward 后再为 `check_ops` 加 `--backward`；该选项当前应明确失败。
+`check_ops --backward` 对照随机上游梯度；其中的计时字段仍只测前向，不能当作 backward 性能数据。
+测试包含反向分组、空输入、非连续上游梯度、current stream、多 GPU guard、AMP 和共享参数训练。
+CPU 环境只验证 autograd wrapper 的接线（使用测试替身），CUDA 用例会明确跳过。
 
 补充用例：所有 ID 相同、ID 0 与最大合法 ID、重复 BOS/EOS、非连续 IDs、真实词表，
 以及共享 embedding/LM head 权重的整模型梯度。BF16 推理和 BF16 AMP 训练要分别检查。

@@ -74,8 +74,8 @@ torch::Tensor embedding_forward_cuda(torch::Tensor ids, torch::Tensor weight) {
   TORCH_CHECK(ids.is_contiguous() && weight.is_contiguous(),
               "ids and weight must be contiguous");
   TORCH_CHECK(!(at::GradMode::is_enabled() && weight.requires_grad()),
-              "student embedding is forward-only; use torch.no_grad() or "
-              "torch.inference_mode(), or select the reference backend for training");
+              "embedding_forward has no autograd binding; use student.embedding "
+              "for training, or torch.no_grad()/torch.inference_mode() for inference");
 
   const int64_t batch = ids.size(0);
   const int64_t length = ids.size(1);

@@ -18,7 +18,11 @@ def load_embedding_extension():
         raise RuntimeError("student embedding requires a CUDA toolkit with nvcc; set CUDA_HOME")
 
     source_root = Path(__file__).resolve().parents[2] / "csrc"
-    sources = [source_root / "bindings.cpp", source_root / "embedding" / "embedding.cu"]
+    sources = [
+        source_root / "bindings.cpp",
+        source_root / "embedding" / "embedding.cu",
+        source_root / "embedding" / "embedding_backward.cu",
+    ]
     required = sources + [source_root / "embedding" / "embedding.h"]
     if not all(path.is_file() for path in required):
         raise RuntimeError(

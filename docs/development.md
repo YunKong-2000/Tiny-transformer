@@ -15,8 +15,9 @@
 | benchmark、Profiler、CPU/GPU 测试入口 | A100 上的真实实验结果和瓶颈解释 |
 
 `operators/reference.py` 是可执行规范，不是要求你提交的优化实现。
-`operators/student.py` 已接入 embedding 的 CUDA FP32 连续输入前向，其余入口保留为
-`NotImplementedError`，没有隐藏 reference fallback。embedding 尚无 backward。
+`operators/student.py` 已接入 embedding 的 CUDA FP32 连续输入前向与一阶反向，其余入口保留为
+`NotImplementedError`，没有隐藏 reference fallback。embedding 使用 eager autograd 连接反向，
+GPU 编译、数值和性能仍需在目标环境验收；尚未接入二阶梯度和 torch.compile。
 你可以只实现其中一个，通过 `--op rms_norm=student` 启用，其余继续使用参考路径。
 
 开始实现前，阅读 [Student 算子总契约与八份逐算子文档](operators/README.md)。
