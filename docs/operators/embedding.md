@@ -196,3 +196,52 @@ CPU 环境只验证 autograd wrapper 的接线（使用测试替身），CUDA �
 补充用例：所有 ID 相同、ID 0 与最大合法 ID、重复 BOS/EOS、非连续 IDs、真实词表，
 以及共享 embedding/LM head 权重的整模型梯度。BF16 推理和 BF16 AMP 训练要分别检查。
 不需要为了这一个算子实现 tokenizer 或 vocab projection。
+
+## 7. 前向与反向性能：四种 token 分布
+
+使用 [benchmark_embedding.py](../../tiny_transformer/benchmark_embedding.py) 在 CUDA 机器上比较
+student 和 PyTorch reference。默认测量 FP32、`B=8,T=512,V=8192,H=768`，每组先验证
+前向/反向数值，再分别测量两个阶段。首次扩展编译和预热不计入结果。
+
+```bash
+# A100；其他 GPU 请按实际架构设置。
+export TORCH_CUDA_ARCH_LIST=8.0
+python -m tiny_transformer.benchmark_embedding \
+  --device cuda --patterns random same unique hot \
+  --warmup 20 --repeats 100 --trials 5 \
+  --output runs/embedding-performance.json
+```
+
+| pattern | 输入分布 | 观察重点 |
+|---|---|---|
+| `random` | 在整个词表中均匀随机采样 | 一般分布下的前向与反向耗时 |
+| `same` | 所有位置的 ID 都为 0 | warp 内合并收益和跨 warp 原子竞争 |
+| `unique` | ID 为 `0..B*T-1`，每个位置各不相同 | 没有重复 ID 时的分组开销 |
+| `hot` | 在前 `min(hot_tokens,V)` 个 ID 中随机采样 | 热门 token 的重复与竞争；默认 16 个 |
+
+当 `B*T > V` 时，`unique` 明确记录为 `skipped`，不会通过取模制造重复 ID。
+控制台和 JSON 分别报告各分布的 `forward` / `backward`：`reference_us`、`student_us`、
+`speedup`，JSON 另存每轮原始计时、实际不同 ID 数量、误差、参数和硬件环境。
+`speedup = reference_us / student_us`，大于 1 表示 student 更快。
+
+计时使用当前设备/stream 上的 CUDA Event，每轮执行 repeats 次并计算平均耗时，最后取
+trials 轮的中位数；轮次交替 reference/student 的测量顺序。前向使用不需要梯度的 weight。
+反向复用计时前构建的计算图，调用 `autograd.grad(..., retain_graph=True)`：
+**包含梯度表分配、清零、autograd 调度及梯度计算，不包含前向，也不累积到 `weight.grad`。**
+两种实现使用相同的连续 FP32 上游梯度，随机正态值除以 `B*T`，模拟平均 loss 的缩放。
+
+这是固定输入、缓存和 allocator 预热后的 eager 调用区间，可能包含 CPU 提交造成的 GPU 空隙，
+不等于单个 kernel 的纯执行时间，也不代表完整训练 step。需要分离清零和累加 kernel 时使用
+Nsight Systems/Compute；不要把清零移出算子反向计时来计算加速比。
+
+可改变形状或单独比较热门 token 数量：
+
+```bash
+python -m tiny_transformer.benchmark_embedding \
+  --batch-size 1 --seq-length 512 --vocab-size 8192 --dim 768 \
+  --output runs/embedding-b1-t512.json
+python -m tiny_transformer.benchmark_embedding \
+  --patterns hot --hot-tokens 4 --output runs/embedding-hot4.json
+```
+
+该脚本不提供 CPU 性能替代结果；当前 student 只支持 FP32 weight，不能据此推断低精度性能。

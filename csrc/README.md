@@ -24,12 +24,18 @@ export MAX_JOBS=2
 python -m tiny_transformer.check_ops --operator embedding --backend student \
   --device cuda --precision fp32 --backward --output runs/embedding-fp32.json
 python -m unittest discover -s tests -p 'test_student_embedding.py' -v
+python -m tiny_transformer.benchmark_embedding \
+  --device cuda --patterns random same unique hot \
+  --output runs/embedding-performance.json
 python -m tiny_transformer.benchmark --config configs/smoke.json \
   --device cuda --precision fp32 --op embedding=student \
   --prompt-length 16 --new-tokens 8 --output runs/embedding-inference.json
 ```
 
 测试会在有 CUDA 时真实编译扩展；没有 CUDA 时跳过 GPU 用例。
+`benchmark_embedding` 独立测量四种 token 分布的前向与反向，并与 PyTorch 比较。
+反向计时包含梯度表清零，不含前向；参数和结果含义见
+[embedding 性能测试说明](../docs/operators/embedding.md#7-前向与反向性能四种-token-分布)。
 模型缓存对照测试临时将 FP32 matmul precision 设为 `highest`，结束后恢复原设置，
 避免 TF32 下不同 GEMM 尺寸的数值差异干扰 FP32 验收。
 该测试分别检查纯 reference 缓存路径、各输入的 embedding 精确相等、
