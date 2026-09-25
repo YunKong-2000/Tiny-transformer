@@ -90,6 +90,39 @@ python -m tiny_transformer.check_ops --operator residual --backend student \
 residual+RMSNorm 的融合不在当前接口内：norm 需要 weight/eps，且后续仍需要未归一化的 residual。
 到融合阶段应明确设计参数和两个结果，而不是把当前输出悄悄改成 normalized x。
 
+## 7. 当前 student 实现与调用链
+
+`student.residual(x, update)` → `load_residual_extension()` 延迟编译独立扩展 →
+`residual/bindings.cpp` → `residual_forward_cuda`。首次调用需要 CUDA 版 PyTorch、
+nvcc、C++ 编译器和 Ninja；import 模型或 reference 路径不会触发编译。
+
+- 原生接口只接受同设备、同 shape、连续的 FP32 CUDA 张量；支持标量和任意维度，
+  包括空张量。空输入直接返回，不发射 kernel。不支持广播。
+- Python 入口接受 FP32、FP16、BF16 及三者的混合输入。先显式转换为连续 FP32，
+  经自定义 kernel 相加，再转回 `torch.promote_types` 的结果类型。
+  这是正确性基线，低精度路径尚未使用专用 kernel；转换和分配成本计入性能测试。
+- 训练通过 `_Residual.apply` 建立 autograd 节点，反向调用 `residual_backward(dY)`，
+  返回独立分配的 `dX` 和 `dUpdate`。导数为常数，不需要缓存 X、update 或 Y。
+  wrapper 的转换/复制留在计算图中，将梯度映射回输入 dtype 和原始视图。
+- 非连续上游梯度（例如 `sum()` 产生的展开视图）会先显式复制。前后向都检查 float4
+  地址对齐和元素数整除条件，否则用标量路径；使用 64 位索引、device guard、
+  current CUDA stream 和 launch error 检查，无设备同步或原子累加。
+- 仅支持一阶梯度。直接调用 native API 不会建立 autograd 图，梯度模式下传入
+  需要梯度的张量会明确报错；训练应使用 `student.residual`。尚未接入 `torch.compile`。
+
+正确性回归：
+
+```bash
+python -m unittest discover -s tests -p 'test_student_residual.py' -v
+python -m unittest discover -s tests -p 'test_student_*.py' -v
+```
+
+专属用例覆盖精确前向/反向、空输入/标量/尾部、各输入地址对齐、非连续视图、
+相同输入的梯度累加、混合 dtype 和 AMP 精度、非法参数、非默认 stream、grid 上限循环。
+最大 grid 用例需要约 1.4 GB 显存；共享 integration 覆盖单独启用 residual 和三个算子
+共同启用时的 FP32/AMP 模型梯度、prefill/decode、native grad guard 和确定性模式。
+无 CUDA 时只执行 CPU autograd 接线测试并跳过 GPU 项目，不能据此认定 CUDA 验收通过。
+
 ## 统一性能测试入口
 
 本算子与其余七个算子共用 [benchmarks 测量框架](../../tiny_transformer/benchmarks/README.md)：

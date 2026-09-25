@@ -1,4 +1,4 @@
-"""Lazy JIT build of the student CUDA extension from this source checkout."""
+"""Lazy JIT builds of independent student CUDA extensions from this checkout."""
 from functools import lru_cache
 from pathlib import Path
 
@@ -70,6 +70,36 @@ def load_rms_norm_extension():
     # MAX_JOBS and TORCH_CUDA_ARCH_LIST. No compilation at package import time.
     return load(
         name="tiny_transformer_rms_norm_cuda",
+        sources=[str(path) for path in sources],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "-lineinfo"],
+        with_cuda=True,
+    )
+
+
+@lru_cache(maxsize=1)
+def load_residual_extension():
+    # Keep compiler imports and compilation out of model/reference imports.
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("student residual requires CUDA-enabled PyTorch and a CUDA device")
+
+    from torch.utils.cpp_extension import CUDA_HOME, load
+
+    if CUDA_HOME is None:
+        raise RuntimeError("student residual requires a CUDA toolkit with nvcc; set CUDA_HOME")
+
+    source_root = Path(__file__).resolve().parents[2] / "csrc" / "residual"
+    sources = [source_root / name for name in
+               ("bindings.cpp", "residual.cu", "residual_backward.cu")]
+    if not all(path.is_file() for path in sources + [source_root / "residual.h"]):
+        raise RuntimeError(
+            "student CUDA sources are missing; run from the repository or an editable install"
+        )
+
+    return load(
+        name="tiny_transformer_residual_cuda",
         sources=[str(path) for path in sources],
         extra_cflags=["-O3"],
         extra_cuda_cflags=["-O3", "-lineinfo"],

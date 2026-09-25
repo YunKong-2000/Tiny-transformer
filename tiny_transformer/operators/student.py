@@ -1,6 +1,7 @@
 """Your CUDA / CuTe / CUTLASS implementation entry points.
 
 Embedding supports contiguous CUDA FP32 forward/backward; RMSNorm supports FP32 forward/backward (backward H <= 1024).
+Residual supports same-shape FP32/FP16/BF16 inputs via FP32 kernels and explicit casts.
 There is no silent reference fallback.
 Match reference.py semantics, device, shape, dtype, strides and gradients.
 Use --op NAME=student to enable only a completed operator.
@@ -10,7 +11,7 @@ See docs/development.md before registering a compiled/custom operator.
 import torch
 from torch.autograd.function import once_differentiable
 
-from ._extension import load_embedding_extension, load_rms_norm_extension
+from ._extension import load_embedding_extension, load_residual_extension, load_rms_norm_extension
 
 
 def _todo(name):
@@ -108,8 +109,45 @@ def swiglu(gate, up):
     return _todo("swiglu")
 
 
+class _Residual(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, update):
+        # The derivative is constant: no input tensors need to be saved.
+        return load_residual_extension().residual_forward(x, update)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        dx, dupdate = load_residual_extension().residual_backward(grad_output.contiguous())
+        return (dx if ctx.needs_input_grad[0] else None,
+                dupdate if ctx.needs_input_grad[1] else None)
+
+
 def residual(x, update):
-    return _todo("residual")
+    """Same-shape CUDA add with dtype promotion and first-order autograd.
+
+    FP16/BF16 inputs are explicitly converted to FP32 for the native kernels;
+    the result is cast to the promoted dtype. Copies/casts remain in the graph
+    so gradients return to the original input layout and dtype. No broadcasting.
+    """
+    if not x.is_cuda or not update.is_cuda:
+        raise RuntimeError("student residual requires x and update to be CUDA tensors")
+    if x.device != update.device:
+        raise RuntimeError("x and update must be on the same CUDA device")
+    if x.layout != torch.strided or update.layout != torch.strided:
+        raise RuntimeError("x and update must have strided layout")
+    if x.shape != update.shape:
+        raise RuntimeError("x and update must have the same shape; broadcasting is not supported")
+    supported = (torch.float32, torch.float16, torch.bfloat16)
+    if x.dtype not in supported or update.dtype not in supported:
+        raise RuntimeError("student residual supports only float32, float16 and bfloat16")
+    dtype = torch.promote_types(x.dtype, update.dtype)
+    xc, uc = x.float().contiguous(), update.float().contiguous()
+    if torch.is_grad_enabled() and (xc.requires_grad or uc.requires_grad):
+        output = _Residual.apply(xc, uc)
+    else:
+        output = load_residual_extension().residual_forward(xc, uc)
+    return output.to(dtype)
 
 
 def cross_entropy(logits, targets):
