@@ -87,7 +87,7 @@ __global__ void embedding_backward_baseline_kernel_vector(
     const int64_t index = ids[row];
     CUDA_KERNEL_ASSERT(index >= 0 && index < vocab_size);
     if (index < 0 || index >= vocab_size) continue;
-    for (int64_t channel = static_cast<int64_t>lane * kVector; channel * kVector < dim; channel += warp_stride) {
+    for (int64_t channel = static_cast<int64_t>(lane) * kVector; channel < dim; channel += warp_stride) {
       const float4 grad = *reinterpret_cast<const float4*>(&gradient[row * dim + channel]);
       atomicAdd(output + index * dim + channel + 0, grad.x);
       atomicAdd(output + index * dim + channel + 1, grad.y);
