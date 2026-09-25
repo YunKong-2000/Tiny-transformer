@@ -14,8 +14,9 @@ constexpr int kWarpSize = 32;
 constexpr unsigned kFullWarp = 0xffffffff;
 constexpr int kThreadNum = 256;
 constexpr int kWarpNum = kThreadNum / kWarpSize;
+constexpr int kVector = 4;
 
-__global__ void rms_norm_kernel(
+__global__ void rms_norm_scalar_kernel(
     int64_t rows, int64_t dim, float epsilon,
     const float* X, const float* weight, float* output) {
   const int64_t warp_num = static_cast<int64_t>(gridDim.x) * kWarpNum;
@@ -41,6 +42,46 @@ __global__ void rms_norm_kernel(
     for (int64_t col = lane_id; col < dim; col += kWarpSize) {
       // Normalize before scaling, matching reference.py's operation order.
       output[base + col] = (X[base + col] * inv_rms) * weight[col];
+    }
+  }
+}
+
+__global__ void rms_norm_vector_kernel(
+    int64_t rows, int64_t dim, float epsilon,
+    const float* X, const float* weight, float* output) {
+  const int64_t warp_num = static_cast<int64_t>(gridDim.x) * kWarpNum;
+  const int64_t warp_id =
+      static_cast<int64_t>(blockIdx.x) * kWarpNum + threadIdx.x / kWarpSize;
+  const int lane_id = threadIdx.x % kWarpSize;
+
+  // A whole warp handles one row. Even lanes with no columns participate in
+  // every shuffle, so the full mask is valid for H < 32 and odd row widths.
+  for (int64_t row = warp_id; row < rows; row += warp_num) {
+    float local_sum = 0.0f;
+    const int64_t base = row * dim;
+    for (int64_t col = static_cast<int64_t>(lane_id) * kVector; col < dim; col += kWarpSize * kVector) {
+      const float4 x_value = *reinterpret_cast<const float4*>(X + base + col);
+      local_sum += x_value.x * x_value.x;
+      local_sum += x_value.y * x_value.y;
+      local_sum += x_value.z * x_value.z;
+      local_sum += x_value.w * x_value.w;
+    }
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+      local_sum += __shfl_down_sync(kFullWarp, local_sum, offset);
+    }
+    const float warp_sum = __shfl_sync(kFullWarp, local_sum, 0);
+    const float inv_rms = rsqrtf(warp_sum / static_cast<float>(dim) + epsilon);
+
+    for (int64_t col = static_cast<int64_t>(lane_id) * kVector; col < dim; col += kWarpSize * kVector) {
+      // Normalize before scaling, matching reference.py's operation order.
+      const float4 x_value = *reinterpret_cast<const float4*>(X + base + col);
+      const float4 w_value = *reinterpret_cast<const float4*>(weight + col);
+      float4 y_value;
+      y_value.x = (x_value.x * inv_rms) * w_value.x;
+      y_value.y = (x_value.y * inv_rms) * w_value.y;
+      y_value.z = (x_value.z * inv_rms) * w_value.z;
+      y_value.w = (x_value.w * inv_rms) * w_value.w;
+      *reinterpret_cast<float4*>(output + base + col) = y_value;
     }
   }
 }
@@ -76,9 +117,20 @@ torch::Tensor rms_norm_forward_cuda(torch::Tensor X, torch::Tensor weight, float
 
   const int blocks = static_cast<int>(std::min<int64_t>((rows - 1) / kWarpNum + 1, 65535));
   const auto stream = c10::cuda::getCurrentCUDAStream(X.get_device());
-  rms_norm_kernel<<<blocks, kThreadNum, 0, stream>>>(
+  auto X_addr = reinterpret_cast<std::uintptr_t>(X.data_ptr<float>());
+  auto weight_addr = reinterpret_cast<std::uintptr_t>(weight.data_ptr<float>());
+  bool vectorized = (X_addr % alignof(float4) == 0)
+                    && (weight_addr % alignof(float4) == 0)
+                    && (dim % kVector == 0);
+  if (vectorized) {
+    rms_norm_vector_kernel<<<blocks, kThreadNum, 0, stream>>>(
       rows, dim, epsilon, X.data_ptr<float>(), weight.data_ptr<float>(),
       output.data_ptr<float>());
+  } else {
+    rms_norm_scalar_kernel<<<blocks, kThreadNum, 0, stream>>>(
+      rows, dim, epsilon, X.data_ptr<float>(), weight.data_ptr<float>(),
+      output.data_ptr<float>());
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }
