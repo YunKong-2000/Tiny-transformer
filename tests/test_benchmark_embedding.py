@@ -1,11 +1,12 @@
 """Input distribution and measurement-boundary checks for embedding benchmarks."""
 import unittest
+from functools import partial
 from unittest.mock import Mock
 
 import torch
 
 from tiny_transformer.benchmark_embedding import PATTERNS, make_ids, measure_pair, prepare_calls
-from tiny_transformer.operators import reference
+from tiny_transformer.operators import reference, student
 
 
 class EmbeddingBenchmarkHostTests(unittest.TestCase):
@@ -64,11 +65,12 @@ class EmbeddingBenchmarkCudaTests(unittest.TestCase):
         with torch.cuda.device(0):
             weight = torch.randn(67, 33, device="cuda", requires_grad=True)
             upstream = torch.randn(2, 17, 33, device="cuda") / 34
-            for pattern in PATTERNS:
+            for pattern, implementation in [(p, i) for p in PATTERNS for i in ("grouped", "baseline")]:
                 ids = make_ids(pattern, 2, 17, 67, 4, "cuda")
-                calls, _ = prepare_calls(ids, weight, upstream)
+                candidate = partial(student.embedding, backward_impl=implementation)
+                calls, _ = prepare_calls(ids, weight, upstream, candidate=candidate)
                 for phase, functions in calls.items():
-                    with self.subTest(pattern=pattern, phase=phase):
+                    with self.subTest(pattern=pattern, implementation=implementation, phase=phase):
                         result = measure_pair(functions, warmup=2, repeats=2, trials=3)
                         self.assertEqual(len(result["reference_trials_us"]), 3)
                         self.assertEqual(len(result["student_trials_us"]), 3)

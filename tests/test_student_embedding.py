@@ -40,16 +40,17 @@ class StudentEmbeddingHostTests(unittest.TestCase):
             self.assertFalse(torch.is_grad_enabled())
             return reference.embedding(saved_ids, saved_weight)
 
-        def backward(saved_ids, gradient, vocab_size):
+        def backward(saved_ids, gradient, vocab_size, implementation):
             self.assertTrue(gradient.is_contiguous())
+            self.assertIn(implementation, ("grouped", "baseline"))
             return gradient.new_zeros(vocab_size, gradient.shape[-1]).index_add_(
                 0, saved_ids.reshape(-1), gradient.reshape(-1, gradient.shape[-1]))
 
         extension = Mock(embedding_forward=Mock(side_effect=forward),
                          embedding_backward=Mock(side_effect=backward))
         with patch.object(student, "load_embedding_extension", return_value=extension):
-            for use_sum in (False, True):
-                actual = student._Embedding.apply(ids, weight)
+            for use_sum, implementation in ((False, "grouped"), (True, "baseline")):
+                actual = student._Embedding.apply(ids, weight, implementation)
                 expected = reference.embedding(ids, expected_weight)
                 self.assertIsNotNone(actual.grad_fn)
                 torch.testing.assert_close(actual, expected)
@@ -64,6 +65,8 @@ class StudentEmbeddingHostTests(unittest.TestCase):
                 torch.testing.assert_close(weight.grad, expected_weight.grad)
             self.assertEqual(extension.embedding_backward.call_count, 2)
             self.assertEqual(extension.embedding_backward.call_args.args[2], 7)
+            self.assertEqual([call.args[3] for call in extension.embedding_backward.call_args_list],
+                             ["grouped", "baseline"])
             self.assertIsNone(ids.grad)
 
     def test_autograd_bridge_detects_modified_saved_ids(self):
@@ -71,11 +74,29 @@ class StudentEmbeddingHostTests(unittest.TestCase):
         weight = torch.randn(7, 5, requires_grad=True)
         extension = Mock(embedding_forward=Mock(side_effect=reference.embedding))
         with patch.object(student, "load_embedding_extension", return_value=extension):
-            output = student._Embedding.apply(ids, weight)
+            output = student._Embedding.apply(ids, weight, "grouped")
             ids[0, 0] = 2
             with self.assertRaisesRegex(RuntimeError, "modified by an inplace operation"):
                 output.sum().backward()
         extension.embedding_backward.assert_not_called()
+
+    def test_backward_implementation_is_saved_per_graph(self):
+        ids = torch.tensor([[0, 1]])
+        weight = torch.randn(7, 5, requires_grad=True)
+        extension = Mock(embedding_forward=Mock(side_effect=reference.embedding),
+                         embedding_backward=Mock(return_value=torch.ones_like(weight)))
+        with patch.object(student, "load_embedding_extension", return_value=extension):
+            grouped = student._Embedding.apply(ids, weight, "grouped")
+            baseline = student._Embedding.apply(ids, weight, "baseline")
+            torch.autograd.grad(baseline.sum(), weight)
+            torch.autograd.grad(grouped.sum(), weight)
+        self.assertEqual([call.args[3] for call in extension.embedding_backward.call_args_list],
+                         ["baseline", "grouped"])
+
+    def test_unknown_backward_implementation_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "backward_impl"):
+            student.embedding(torch.zeros(1, 1, dtype=torch.long), torch.ones(2, 4),
+                              backward_impl="typo")
 
     def test_import_and_cpu_rejection_do_not_load_compiler(self):
         result = subprocess.run(
@@ -230,7 +251,10 @@ class StudentEmbeddingCudaTests(unittest.TestCase):
                     expected = torch.autograd.grad(reference.embedding(ids, weight), weight, upstream)[0]
                     native = self.extension.embedding_backward(ids, upstream, vocab)
                     actual = torch.autograd.grad(student.embedding(ids, weight), weight, upstream)[0]
-                    for result in (native, actual):
+                    baseline_native = self.extension.embedding_backward(ids, upstream, vocab, "baseline")
+                    baseline = torch.autograd.grad(
+                        student.embedding(ids, weight, backward_impl="baseline"), weight, upstream)[0]
+                    for result in (native, actual, baseline_native, baseline):
                         self.assertEqual(result.shape, weight.shape)
                         self.assertEqual(result.dtype, weight.dtype)
                         self.assertEqual(result.device, weight.device)
@@ -245,8 +269,10 @@ class StudentEmbeddingCudaTests(unittest.TestCase):
                      torch.randn(2 * 3 * 65 + 1, device="cuda")[1:].view(2, 3, 65)]
         for upstream in upstreams:
             expected = torch.autograd.grad(reference.embedding(ids, weight), weight, upstream)[0]
-            actual = torch.autograd.grad(student.embedding(ids, weight), weight, upstream)[0]
-            torch.testing.assert_close(actual, expected, atol=3e-5, rtol=3e-4)
+            for implementation in ("grouped", "baseline"):
+                actual = torch.autograd.grad(
+                    student.embedding(ids, weight, backward_impl=implementation), weight, upstream)[0]
+                torch.testing.assert_close(actual, expected, atol=3e-5, rtol=3e-4)
 
     def test_backward_native_rejects_unsupported_inputs(self):
         ids = torch.zeros(2, 3, device="cuda", dtype=torch.long)
@@ -269,6 +295,8 @@ class StudentEmbeddingCudaTests(unittest.TestCase):
         for bad_ids, bad_gradient, vocab, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(RuntimeError, message):
                 self.extension.embedding_backward(bad_ids, bad_gradient, vocab)
+        with self.assertRaisesRegex(RuntimeError, "implementation"):
+            self.extension.embedding_backward(ids, gradient, 7, "typo")
 
     def test_backward_respects_deterministic_mode(self):
         enabled = torch.are_deterministic_algorithms_enabled()
@@ -334,12 +362,14 @@ class StudentEmbeddingCudaTests(unittest.TestCase):
         torch.testing.assert_close(consumed, expected, atol=0, rtol=0)
 
     def test_backward_capped_grid(self):
-        rows = 65535 * 256 + 1
-        ids = torch.zeros(1, rows, device="cuda", dtype=torch.long)
-        gradient = torch.ones(1, rows, 1, device="cuda")
-        output = self.extension.embedding_backward(ids, gradient, 2)
-        expected = torch.tensor([[rows], [0]], device="cuda", dtype=torch.float32)
-        torch.testing.assert_close(output, expected, atol=0, rtol=0)
+        for implementation, rows_per_block in (("grouped", 256), ("baseline", 8)):
+            with self.subTest(implementation=implementation):
+                rows = 65535 * rows_per_block + 1
+                ids = torch.zeros(1, rows, device="cuda", dtype=torch.long)
+                gradient = torch.ones(1, rows, 1, device="cuda")
+                output = self.extension.embedding_backward(ids, gradient, 2, implementation)
+                expected = torch.tensor([[rows], [0]], device="cuda", dtype=torch.float32)
+                torch.testing.assert_close(output, expected, atol=0, rtol=0)
 
     @unittest.skipUnless(torch.cuda.device_count() >= 2, "requires two CUDA devices")
     @torch.no_grad()
@@ -422,14 +452,16 @@ torch.cuda.synchronize()
 
     def test_backward_invalid_ids_fail_in_isolated_processes(self):
         # Call backward directly: a failing forward would hide its missing check.
-        for invalid in (-1, -100, 7):
-            with self.subTest(invalid=invalid):
+        cases = [(implementation, invalid) for implementation in ("grouped", "baseline")
+                 for invalid in (-1, -100, 7)]
+        for implementation, invalid in cases:
+            with self.subTest(implementation=implementation, invalid=invalid):
                 code = f"""
 import torch
 from tiny_transformer.operators._extension import load_embedding_extension
 ids = torch.tensor([[0, {invalid}, 2]], device='cuda')
 gradient = torch.ones(1, 3, 33, device='cuda')
-load_embedding_extension().embedding_backward(ids, gradient, 7)
+load_embedding_extension().embedding_backward(ids, gradient, 7, {implementation!r})
 torch.cuda.synchronize()
 """
                 result = subprocess.run([sys.executable, "-c", code], cwd=ROOT,

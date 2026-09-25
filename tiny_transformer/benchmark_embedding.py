@@ -1,5 +1,6 @@
 """Compare FP32 embedding forward/backward latency across token distributions."""
 import argparse
+from functools import partial
 import statistics
 
 import torch
@@ -93,6 +94,8 @@ def main():
     parser.add_argument("--dim", type=int, default=768)
     parser.add_argument("--patterns", choices=PATTERNS, nargs="+", default=list(PATTERNS))
     parser.add_argument("--hot-tokens", type=int, default=16)
+    parser.add_argument("--backward-impl", choices=("grouped", "baseline", "all"), default="grouped",
+                        help="student backward kernel; all compares both on identical inputs")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--trials", type=int, default=5)
@@ -108,6 +111,7 @@ def main():
     seed_all(args.seed)
 
     rows = args.batch_size * args.seq_length
+    implementations = ("grouped", "baseline") if args.backward_impl == "all" else (args.backward_impl,)
     results = []
     with torch.cuda.device(device):
         weight = torch.randn(args.vocab_size, args.dim, device=device, requires_grad=True)
@@ -121,19 +125,23 @@ def main():
                 continue
             ids = make_ids(pattern, args.batch_size, args.seq_length, args.vocab_size,
                            args.hot_tokens, device)
-            calls, errors = prepare_calls(ids, weight, upstream)
-            result = {"pattern": pattern, "status": "passed",
-                      "distinct_ids": ids.unique().numel(), "validation": errors}
-            for phase, functions in calls.items():
-                timings = measure_pair(functions, args.warmup, args.repeats, args.trials)
-                result[phase] = timings
-                speedup = timings["speedup"]
-                ratio = f"{speedup:.2f}x" if speedup is not None else "n/a"
-                print(f"{pattern:6s} {phase:8s}: reference={timings['reference_us']:.2f} us, "
-                      f"student={timings['student_us']:.2f} us, speedup={ratio}")
-            results.append(result)
-            # Release the retained graphs before creating the next distribution.
-            del calls, functions
+            distinct_ids = ids.unique().numel()
+            for implementation in implementations:
+                candidate = partial(student.embedding, backward_impl=implementation)
+                calls, errors = prepare_calls(ids, weight, upstream, candidate=candidate)
+                result = {"pattern": pattern, "backward_impl": implementation, "status": "passed",
+                          "distinct_ids": distinct_ids, "validation": errors}
+                for phase, functions in calls.items():
+                    timings = measure_pair(functions, args.warmup, args.repeats, args.trials)
+                    result[phase] = timings
+                    speedup = timings["speedup"]
+                    ratio = f"{speedup:.2f}x" if speedup is not None else "n/a"
+                    print(f"{pattern:6s} {implementation:8s} {phase:8s}: "
+                          f"reference={timings['reference_us']:.2f} us, "
+                          f"student={timings['student_us']:.2f} us, speedup={ratio}")
+                results.append(result)
+                # Release retained graphs before constructing the next variant.
+                del calls, functions
 
         write_json(args.output, {
             "environment": environment(device), "arguments": vars(args), "dtype": "float32",

@@ -63,10 +63,32 @@ __global__ void embedding_backward_kernel_scalar(
   }
 }
 
+__global__ void embedding_backward_baseline_kernel(
+    int64_t rows, int64_t vocab_size, int64_t dim,
+    const int64_t* ids, const float* gradient, float* output) {
+  const int64_t warp_id =
+      static_cast<int64_t>(blockIdx.x) * (blockDim.x / kWarpSize) +
+      threadIdx.x / kWarpSize;
+  const int64_t warp_count =
+      static_cast<int64_t>(gridDim.x) * (blockDim.x / kWarpSize);
+  const int lane = threadIdx.x % kWarpSize;
+  for (int64_t row = warp_id; row < rows; row += warp_count) {
+    const int64_t index = ids[row];
+    CUDA_KERNEL_ASSERT(index >= 0 && index < vocab_size);
+    if (index < 0 || index >= vocab_size) continue;
+    for (int64_t channel = lane; channel < dim; channel += kWarpSize) {
+      atomicAdd(output + index * dim + channel, gradient[row * dim + channel]);
+    }
+  }
+}
+
 }  // namespace
 
 torch::Tensor embedding_backward_cuda(
-    torch::Tensor ids, torch::Tensor gradient, int64_t vocab_size) {
+    torch::Tensor ids, torch::Tensor gradient, int64_t vocab_size,
+    const std::string& implementation) {
+  TORCH_CHECK(implementation == "grouped" || implementation == "baseline",
+              "embedding backward implementation must be 'grouped' or 'baseline'");
   TORCH_CHECK(ids.is_cuda() && gradient.is_cuda(),
               "ids and gradient must be CUDA tensors");
   TORCH_CHECK(ids.device() == gradient.device(),
@@ -93,12 +115,21 @@ torch::Tensor embedding_backward_cuda(
   // Floating atomicAdd order across warps is not deterministic.
   at::globalContext().alertNotDeterministic("embedding_backward_cuda");
 
+  // Baseline: eight warps => eight rows per block. Grouped: 256 rows per block.
+  const bool baseline = implementation == "baseline";
+  const int rows_per_block = baseline ? kThreads / kWarpSize : kThreads;
   const int blocks = static_cast<int>(std::min<int64_t>(
-      (rows - 1) / kThreads + 1, 65535));
+      (rows - 1) / rows_per_block + 1, 65535));
   const auto stream = c10::cuda::getCurrentCUDAStream(gradient.get_device());
-  embedding_backward_kernel_scalar<<<blocks, kThreads, 0, stream>>>(
-      rows, vocab_size, dim, ids.data_ptr<int64_t>(),
-      gradient.data_ptr<float>(), output.data_ptr<float>());
+  if (baseline) {
+    embedding_backward_baseline_kernel<<<blocks, kThreads, 0, stream>>>(
+        rows, vocab_size, dim, ids.data_ptr<int64_t>(),
+        gradient.data_ptr<float>(), output.data_ptr<float>());
+  } else {
+    embedding_backward_kernel_scalar<<<blocks, kThreads, 0, stream>>>(
+        rows, vocab_size, dim, ids.data_ptr<int64_t>(),
+        gradient.data_ptr<float>(), output.data_ptr<float>());
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
 }

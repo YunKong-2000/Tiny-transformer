@@ -16,6 +16,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Embedding CUDA backward (contiguous int64 IDs, FP32 gradient, vocabulary size)",
         pybind11::arg("ids"),
         pybind11::arg("gradient"),
-        pybind11::arg("vocab_size")
+        pybind11::arg("vocab_size"),
+        pybind11::arg("implementation") = "grouped"
     );
 }

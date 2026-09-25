@@ -8,6 +8,9 @@
 embedding(ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor
 ```
 
+student 另提供实验用关键字参数 `backward_impl="grouped"`，可设为 `"baseline"` 选择
+一 warp 一 token 的反向实现；默认模型调用仍使用 grouped，前向计算相同。
+
 每次模型前向开始时调用一次。`ids` 来自 packed batch、prompt 编码或上一步生成的 token；
 `weight` 是 `model.embedding` 参数。输出送入第一个 block 的 RMSNorm。
 本接口只负责查表；tokenizer、位置编码、mask、Linear 和 loss 均由其他模块处理。
@@ -67,7 +70,8 @@ CUDA 编译、数值和性能验收须在目标 GPU 上执行，不能以 CPU �
 
 ```cpp
 torch::Tensor embedding_backward_cuda(
-    torch::Tensor ids, torch::Tensor gradient, int64_t vocab_size);
+    torch::Tensor ids, torch::Tensor gradient, int64_t vocab_size,
+    const std::string& implementation = "grouped");
 ```
 
 | 方向 | 项目 | 含义 / 来源 | shape | dtype / device |
@@ -75,6 +79,7 @@ torch::Tensor embedding_backward_cuda(
 | 输入 | ids | 前向保存的 token ID，决定每个梯度累加到哪一行 | $[B,T]$ | `torch.int64`；与 grad_output 同设备 |
 | 输入 | grad_output | 下游传入的 $\partial\mathcal{L}/\partial X$ | $[B,T,H]$ | 与前向输出 X 对应；本项目 FP32/AMP 训练均为 FP32 |
 | 输入 | vocab_size | 前向保存的 `weight.shape[0]`，即 V | 整数标量 | C++ `int64_t`，不是 tensor |
+| 输入 | implementation | 选择 `grouped` 或 `baseline`，默认 grouped | 字符串 | 不是 tensor，无梯度 |
 | 输出 | dweight | 本次 embedding 调用贡献的 $\partial\mathcal{L}/\partial W$ | $[V,H]$ | dense tensor；与前向 weight 同 dtype/device |
 
 反向不需要读取 weight 或 X 的数值。当前 autograd wrapper 使用 `ctx.save_for_backward(ids)`
@@ -84,10 +89,10 @@ shape/dtype/device；H 从 grad_output 的末维取得，FP32 输出梯度表在
 若底层只接收 `ids, grad_output`，还必须通过其他明确约定提供 V，例如传入预分配的 `[V,H]` 输出；
 这两个输入本身不足以确定完整梯度表的行数。
 
-底层 CUDA 算子只返回 `dweight`。对于前向签名 `embedding(ids, weight)`，
-`torch.autograd.Function.backward(ctx, grad_output)` 应按前向参数顺序返回 **`(None, dweight)`**：
-ids 是离散整数索引，不求导，其梯度为 `None`，而不是一个全零 tensor。
-保存到 ctx 的 V 等元信息不属于该前向签名的额外参数，因此不增加 backward 返回项。
+底层 CUDA 算子只返回 `dweight`。当前 Python wrapper 内部调用
+`_Embedding.apply(ids, weight, backward_impl)`，因此 backward 按这三个参数的顺序返回
+**`(None, dweight, None)`**。ids 是离散整数索引，backward_impl 是实现选择字符串，
+两者的梯度均为 `None`，不是全零 tensor。V 保存于 ctx，不是 apply 的参数，不增加返回项。
 
 默认训练时，反向输入为 ids `[8,512]`、grad_output `[8,512,768]` 和 V=8192，
 输出 dweight `[8192,768]`。kernel 内可将 ids 展平为 `[B*T]`、grad_output 展平为 `[B*T,H]`，
@@ -135,17 +140,19 @@ $$
    延迟编译并加载同一个扩展模块。只在头文件声明函数不会编译其实现。
 2. [bindings.cpp](../../csrc/bindings.cpp) 中的
    `m.def("embedding_backward", &embedding_backward_cuda, ...)` 将 C++ host wrapper
-   暴露为 Python 的 `extension.embedding_backward(ids, gradient, vocab_size)`。
+   暴露为 Python 的 `extension.embedding_backward(ids, gradient, vocab_size, implementation="grouped")`。
    **pybind 只提供可调用函数，不会自动把 forward 与 backward 关联起来。**
 3. [student.py](../../tiny_transformer/operators/student.py) 在梯度开启且 weight 需要梯度时，
-   调用 `_Embedding.apply(ids, weight)`。`apply` 创建 autograd 节点；其 `forward`
-   在关闭梯度记录的上下文中调用扩展前向，并保存 ids 和 V。
+   调用 `_Embedding.apply(ids, weight, backward_impl)`。`apply` 创建 autograd 节点；其 `forward`
+   在关闭梯度记录的上下文中调用扩展前向，并保存 ids、V 和 backward_impl。
+   实现选择保存在每个节点的 ctx 中，同时存在 grouped/baseline 两张图也不会串用。
 4. 下游执行 `loss.backward()` 或 `torch.autograd.grad(...)` 时，autograd 沿计算图把
    `[B,T,H]` 上游梯度传给 `_Embedding.backward(ctx, grad_output)`；用户不需要手动调用 kernel。
 5. Python backward 将上游梯度转为连续张量，再调用扩展的 `embedding_backward`。
    C++ wrapper 校验输入，设置 device guard，分配 `[V,H]` 全零输出，并在当前 CUDA stream
-   上启动 kernel。kernel 在 warp 内合并相同 ID，再用 `atomicAdd` 累加跨 warp 的贡献。
-6. Python backward 返回 `(None, dweight)`；autograd 将 dweight 与 LM head 分支、已有
+   上启动选择的 kernel。grouped 在 warp 内合并相同 ID 后原子累加，baseline 由每个 warp
+   直接原子累加一个 token 的梯度。两者共用输入检查、输出分配和清零代码。
+6. Python backward 返回 `(None, dweight, None)`；autograd 将 dweight 与 LM head 分支、已有
    microbatch 梯度一起累加到同一个参数。算子自身不直接修改 `weight.grad`，也不更新 weight。
 
 ```python
@@ -165,6 +172,10 @@ x.sum().backward()                 # 自动调用绑定的 CUDA backward
 `student.embedding`。当前 backward 用 `once_differentiable` 明确限定一阶梯度；
 尚未提供二阶反向或 `torch.compile` 的自定义算子注册。
 
+单独使用 baseline 时调用 `student.embedding(ids, weight, backward_impl="baseline")`，
+然后正常执行 `loss.backward()`。直接测试底层入口可调用
+`extension.embedding_backward(ids, grad_output, V, "baseline")`；此时上游梯度必须连续。
+
 反向使用浮点原子加，不保证逐 bit 确定性。开启 `torch.use_deterministic_algorithms(True)`
 时，非空反向明确报错；`warn_only=True` 时警告后执行。空输入只返回全零表。
 
@@ -177,6 +188,9 @@ weight/output 指针均为 16 字节对齐且 H 能被 4 整除时使用 float4�
 反向每个 warp 对最多 32 个输入位置按 ID 分组，所有 lane 协作处理通道；索引与地址计算使用 int64。
 SM70 及以上使用 `__match_any_sync`，更早架构使用 shuffle/ballot 分组。
 采用限制 grid 大小的 warp-stride 循环；尾部 token 和 H 不整除 32 均有对应处理。
+baseline 每个 warp 只处理一个 token，每个 256 线程 block 处理 8 个 token；
+因此默认 4096 个位置启动 512 个 block，而 grouped 启动 16 个 block。
+baseline 同样使用 int64 索引和 warp-stride 循环，以覆盖 grid 截断后的剩余位置。
 非法 ID 通过异步设备断言报错；不会静默跳过或通过 CPU 读回检查。
 
 1. 在目标 GPU 上验收 FP32 前向/反向、尾部形状、重复 ID 和共享权重梯度。
@@ -207,7 +221,7 @@ student 和 PyTorch reference。默认测量 FP32、`B=8,T=512,V=8192,H=768`，�
 # A100；其他 GPU 请按实际架构设置。
 export TORCH_CUDA_ARCH_LIST=8.0
 python -m tiny_transformer.benchmark_embedding \
-  --device cuda --patterns random same unique hot \
+  --device cuda --backward-impl all --patterns random same unique hot \
   --warmup 20 --repeats 100 --trials 5 \
   --output runs/embedding-performance.json
 ```
@@ -223,6 +237,18 @@ python -m tiny_transformer.benchmark_embedding \
 控制台和 JSON 分别报告各分布的 `forward` / `backward`：`reference_us`、`student_us`、
 `speedup`，JSON 另存每轮原始计时、实际不同 ID 数量、误差、参数和硬件环境。
 `speedup = reference_us / student_us`，大于 1 表示 student 更快。
+
+`--backward-impl grouped|baseline|all` 选择反向实现，默认 grouped。
+`all` 在每种分布下使用相同的 ids、weight 和上游梯度，分别测量两个实现；控制台增加实现名，
+JSON 的每条测量记录增加 `backward_impl`。两种实现都先与 PyTorch 检查数值再计时。
+它们共用同一个前向，因此两行前向数据是重复测量，差异不代表前向算法发生了变化。
+只测试 baseline 可运行：
+
+```bash
+python -m tiny_transformer.benchmark_embedding \
+  --backward-impl baseline --patterns random same unique hot \
+  --output runs/embedding-baseline.json
+```
 
 计时使用当前设备/stream 上的 CUDA Event，每轮执行 repeats 次并计算平均耗时，最后取
 trials 轮的中位数；轮次交替 reference/student 的测量顺序。前向使用不需要梯度的 weight。

@@ -22,12 +22,13 @@ def _todo(name):
 
 class _Embedding(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, ids, weight):
+    def forward(ctx, ids, weight, backward_impl):
         # Function.forward runs with grad mode disabled; the raw pybind call
         # supplies values while Function.apply creates the autograd node.
         output = load_embedding_extension().embedding_forward(ids, weight)
         ctx.save_for_backward(ids)
         ctx.vocab_size = weight.shape[0]
+        ctx.backward_impl = backward_impl
         return output
 
     @staticmethod
@@ -36,18 +37,20 @@ class _Embedding(torch.autograd.Function):
         (ids,) = ctx.saved_tensors
         # E.g. output.sum().backward() supplies an expanded, zero-stride tensor.
         dweight = load_embedding_extension().embedding_backward(
-            ids, grad_output.contiguous(), ctx.vocab_size
+            ids, grad_output.contiguous(), ctx.vocab_size, ctx.backward_impl
         )
-        # One result per forward argument: IDs are discrete, weight is trainable.
-        return None, dweight
+        # IDs and implementation selector are not differentiable.
+        return None, dweight, None
 
 
-def embedding(ids, weight):
+def embedding(ids, weight, *, backward_impl="grouped"):
     """Gather [B,T] int64 IDs from [V,H] FP32 CUDA weights; first-order autograd."""
+    if backward_impl not in ("grouped", "baseline"):
+        raise ValueError("embedding backward_impl must be 'grouped' or 'baseline'")
     if not ids.is_cuda or not weight.is_cuda:
         raise RuntimeError("student embedding requires ids and weight to be CUDA tensors")
     if torch.is_grad_enabled() and weight.requires_grad:
-        return _Embedding.apply(ids, weight)
+        return _Embedding.apply(ids, weight, backward_impl)
     return load_embedding_extension().embedding_forward(ids, weight)
 
 

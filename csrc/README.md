@@ -3,13 +3,14 @@
 当前包含 embedding 的 FP32 CUDA 前向与一阶反向。前向每个 warp 搬运一个 ID 对应的行，
 256 线程的 block 同时处理 8 个 ID；按地址与行宽对齐选择 float4 或标量 kernel。
 反向每个 warp 对最多 32 个位置按 ID 分组，合并组内梯度后原子累加到全零梯度表。
+另提供一 warp 一 token 的 baseline 反向，共用输入检查、清零和 stream 管理。
 其他算子尚未实现；CUDA 编译、数值及性能需在目标 GPU 上验收。
 
 调用链：`student.embedding` → `operators/_extension.py` 的延迟 JIT 加载 →
 `bindings.cpp::embedding_forward` → `embedding_forward_cuda` → CUDA kernel。
-训练时由 `student._Embedding.apply` 建立 autograd 节点，保存 ids 和 V；执行
+训练时由 `student._Embedding.apply` 建立 autograd 节点，保存 ids、V 和 backward_impl；执行
 `loss.backward()` 时进入 `_Embedding.backward`，再经 `bindings.cpp::embedding_backward`
-调用 `embedding_backward_cuda` 和反向 kernel，返回 `(None, dweight)` 给 autograd。
+调用 `embedding_backward_cuda` 和选定的反向 kernel，返回 `(None, dweight, None)` 给 autograd。
 pybind 绑定只暴露函数，forward/backward 的关联由 Python `torch.autograd.Function` 建立。
 逐步说明见 [embedding 开发文档](../docs/operators/embedding.md#54-从绑定到-lossbackward-的调用链)。
 首次调用需要 CUDA 版 PyTorch、CUDA toolkit/nvcc、C++ 编译器和 Ninja；
@@ -25,7 +26,7 @@ python -m tiny_transformer.check_ops --operator embedding --backend student \
   --device cuda --precision fp32 --backward --output runs/embedding-fp32.json
 python -m unittest discover -s tests -p 'test_student_embedding.py' -v
 python -m tiny_transformer.benchmark_embedding \
-  --device cuda --patterns random same unique hot \
+  --device cuda --backward-impl all --patterns random same unique hot \
   --output runs/embedding-performance.json
 python -m tiny_transformer.benchmark --config configs/smoke.json \
   --device cuda --precision fp32 --op embedding=student \
@@ -34,6 +35,7 @@ python -m tiny_transformer.benchmark --config configs/smoke.json \
 
 测试会在有 CUDA 时真实编译扩展；没有 CUDA 时跳过 GPU 用例。
 `benchmark_embedding` 独立测量四种 token 分布的前向与反向，并与 PyTorch 比较。
+`--backward-impl all` 同时测试 grouped/baseline；也可仅指定其中一个，默认 grouped。
 反向计时包含梯度表清零，不含前向；参数和结果含义见
 [embedding 性能测试说明](../docs/operators/embedding.md#7-前向与反向性能四种-token-分布)。
 模型缓存对照测试临时将 FP32 matmul precision 设为 `highest`，结束后恢复原设置，
