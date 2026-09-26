@@ -116,6 +116,44 @@ python -m tiny_transformer.check_ops --operator cross_entropy --backend student 
 对全部 ignored 的边界单独检查并记录策略。
 融合 LM head 与 CE 需要隐藏状态及输出权重，当前接口只接收 logits，无法无接口变化地完成该融合。
 
+## 8. 当前 student 实现与调用链
+
+`student.cross_entropy` 已接入独立的 CUDA 扩展，支持 `[B,T,V]` FP32/FP16/BF16 logits、
+`[B,T]` int64 targets，以及一阶 eager autograd。非连续输入显式复制，低精度 logits 显式转成
+FP32；loss 始终为 FP32 标量，梯度经复制/类型转换回到原始输入。FP64、二阶梯度与
+`torch.compile` 集成尚不支持，也没有 reference fallback。
+
+调用链：`student.cross_entropy` → `_CrossEntropy.apply` → 延迟 JIT loader →
+`cross_entropy/bindings.cpp` → CUDA 前向。每个 warp 处理一行，先求最大值再归约指数和，
+原生前向返回逐行 loss `[B,T]` 和分拆的 LSE 缓存 `[B,T,2]`。
+缓存的两个分量为 `max(logits)` 与 `log(sum(exp(logits-max)))`；不先合并成一个 FP32 数，
+避免大共同偏移下 loss/概率的消减误差。它不是普通 `[B,T]` logsumexp 张量。
+
+Python 在设备上将逐行 loss 求和，除以有效 target 数。autograd 保存 logits、targets、
+分拆缓存和有效数；反向将 `grad_output / count` 保留为 CUDA 上的零维 FP32 Tensor，交给原生
+`cross_entropy_backward(logits, targets, lse, grad_loss)`。kernel 读取 `grad_loss[0]`，
+在所有有效行共享该缩放，计算 `(exp((logit-max)-log_sum)-one_hot) * grad_loss[0]`，
+忽略行直接写零。不再展开或分配 `[B,T]` 梯度缓冲区，也不通过 `.item()` 或 C++ `float`
+参数将缩放值读回主机。此反向接口不接受逐 token 权重；平均的标量除法仍在 Python 层执行。
+全 ignored 或空输入返回 NaN mean loss 和零梯度；一般训练仍应避免无有效 token 的 batch。
+PyTorch 对非有限 logits 的梯度可能与此处直接清零 ignored 行不同；数值对齐测试以有限 logits 为准。
+
+原生入口要求连续 FP32 logits，并检查 shape、dtype、device、layout；直接在开启梯度时调用
+需要梯度的原生张量会报错，应使用 Python 入口训练。CUDA kernel 使用当前 stream、64 位索引、
+有上限的 grid-stride 循环；非法且非 `-100` 的标签触发设备断言，无主机读回或额外设备同步。
+反向没有浮点原子加，可用于严格 deterministic 模式。
+
+```bash
+python -m unittest discover -s tests -p 'test_student_cross_entropy.py' -v
+python -m unittest discover -s tests -p 'test_student_*.py' -v
+```
+
+测试覆盖逐行 loss/缓存、标量 mean、梯度和外部缩放、一个/零个有效 token、空输入、
+极端 logits 与共同偏移、warp 尾部和 V=8192、非连续输入、低精度/GradScaler、
+grid 复用、非默认 stream、非法标签子进程，以及单独/组合启用的 FP32/AMP 模型训练。
+CPU 测试使用明确的扩展替身，只验证 Python autograd 接线；无 CUDA 时 GPU 测试跳过，
+不能据此认定 CUDA 编译或 GPU 数值验收已通过。
+
 ## 统一性能测试入口
 
 本算子与其余七个算子共用 [benchmarks 测量框架](../../tiny_transformer/benchmarks/README.md)：

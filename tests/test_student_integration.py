@@ -37,6 +37,7 @@ for function, args in (
     (student.embedding, (torch.zeros(1, 1, dtype=torch.long), torch.ones(7, 4))),
     (student.rms_norm, (torch.ones(2, 3, 4), torch.ones(4), 1e-6)),
     (student.residual, (torch.ones(2, 3, 4), torch.ones(2, 3, 4))),
+    (student.cross_entropy, (torch.ones(2, 3, 4), torch.zeros(2, 3, dtype=torch.long))),
 ):
     try:
         function(*args)
@@ -59,8 +60,9 @@ class StudentIntegrationCudaTests(unittest.TestCase):
                                   hidden_dim=96, max_seq_len=16)
 
     def test_model_training_and_cached_inference(self):
-        for names in (('embedding',), ('rms_norm',), ('residual',),
-                      ('embedding', 'rms_norm'), ('embedding', 'rms_norm', 'residual')):
+        for names in (('embedding',), ('rms_norm',), ('residual',), ('cross_entropy',),
+                      ('embedding', 'rms_norm'), ('embedding', 'rms_norm', 'residual'),
+                      ('embedding', 'rms_norm', 'residual', 'cross_entropy')):
             with self.subTest(operators=names), full_precision_matmul():
                 expected, actual = Transformer(self.config).cuda(), Transformer(self.config).cuda()
                 actual.load_state_dict(expected.state_dict())
@@ -74,6 +76,7 @@ class StudentIntegrationCudaTests(unittest.TestCase):
                     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
                     for _ in range(2):
                         ids, targets = [torch.randint(31, (2, 5), device='cuda') for _ in range(2)]
+                        targets[0, 1::2] = -100
                         for model in (expected, actual):
                             with torch.autocast('cuda', dtype=dtype, enabled=amp):
                                 loss = model.loss(ids, targets)

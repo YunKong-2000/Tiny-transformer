@@ -105,3 +105,33 @@ def load_residual_extension():
         extra_cuda_cflags=["-O3", "-lineinfo"],
         with_cuda=True,
     )
+
+
+@lru_cache(maxsize=1)
+def load_cross_entropy_extension():
+    # Keep compiler imports and compilation out of model/reference imports.
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("student cross_entropy requires CUDA-enabled PyTorch and a CUDA device")
+
+    from torch.utils.cpp_extension import CUDA_HOME, load
+
+    if CUDA_HOME is None:
+        raise RuntimeError("student cross_entropy requires a CUDA toolkit with nvcc; set CUDA_HOME")
+
+    source_root = Path(__file__).resolve().parents[2] / "csrc" / "cross_entropy"
+    sources = [source_root / name for name in
+               ("bindings.cpp", "cross_entropy.cu", "cross_entropy_backward.cu")]
+    if not all(path.is_file() for path in sources + [source_root / "cross_entropy.h"]):
+        raise RuntimeError(
+            "student CUDA sources are missing; run from the repository or an editable install"
+        )
+
+    return load(
+        name="tiny_transformer_cross_entropy_cuda",
+        sources=[str(path) for path in sources],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "-lineinfo"],
+        with_cuda=True,
+    )

@@ -2,6 +2,7 @@
 
 Embedding supports contiguous CUDA FP32 forward/backward; RMSNorm supports FP32 forward/backward (backward H <= 1024).
 Residual supports same-shape FP32/FP16/BF16 inputs via FP32 kernels and explicit casts.
+Cross entropy supports FP32/FP16/BF16 logits, ignored labels and first-order autograd.
 There is no silent reference fallback.
 Match reference.py semantics, device, shape, dtype, strides and gradients.
 Use --op NAME=student to enable only a completed operator.
@@ -11,7 +12,10 @@ See docs/development.md before registering a compiled/custom operator.
 import torch
 from torch.autograd.function import once_differentiable
 
-from ._extension import load_embedding_extension, load_residual_extension, load_rms_norm_extension
+from ._extension import (
+    load_cross_entropy_extension, load_embedding_extension,
+    load_residual_extension, load_rms_norm_extension,
+)
 
 
 def _todo(name):
@@ -150,5 +154,53 @@ def residual(x, update):
     return output.to(dtype)
 
 
+class _CrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, logits, targets):
+        # apply() disables grad mode here; pybind itself does not create a graph.
+        loss, lse = load_cross_entropy_extension().cross_entropy_forward(logits, targets)
+        count = (targets != -100).sum()
+        ctx.save_for_backward(logits, targets, lse, count)
+        # Match PyTorch: empty/all-ignored mean is NaN, with zero input gradients.
+        return loss.sum() / count
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        logits, targets, lse, count = ctx.saved_tensors
+        # Keep the shared scale on the GPU; the kernel broadcasts it to all rows.
+        grad_loss = grad_output / count
+        dz = load_cross_entropy_extension().cross_entropy_backward(
+            logits, targets, lse, grad_loss
+        )
+        return dz, None
+
+
 def cross_entropy(logits, targets):
-    return _todo("cross_entropy")
+    """Mean CUDA cross entropy: [B,T,V] logits, [B,T] int64 targets, ignore=-100.
+
+    FP16/BF16 logits are explicitly converted to FP32; the scalar loss is FP32.
+    Copies/casts preserve gradients to input views and their original dtype.
+    Supports first-order eager autograd; empty/all-ignored targets yield NaN loss
+    and zero gradients, matching the reference. No class weights or smoothing.
+    """
+    if not logits.is_cuda or not targets.is_cuda:
+        raise RuntimeError("student cross_entropy requires logits and targets to be CUDA tensors")
+    if logits.device != targets.device:
+        raise RuntimeError("logits and targets must be on the same CUDA device")
+    if logits.layout != torch.strided or targets.layout != torch.strided:
+        raise RuntimeError("logits and targets must have strided layout")
+    supported = (torch.float32, torch.float16, torch.bfloat16)
+    if logits.dtype not in supported:
+        raise RuntimeError("student cross_entropy logits supports only float32, float16 and bfloat16")
+    if targets.dtype != torch.long:
+        raise RuntimeError("cross_entropy targets must be int64")
+    if logits.ndim != 3 or targets.ndim != 2 or logits.shape[:2] != targets.shape:
+        raise RuntimeError("cross_entropy requires logits [B,T,V] and matching targets [B,T] shape")
+    if logits.shape[-1] == 0:
+        raise RuntimeError("vocabulary size must be positive")
+    logits, targets = logits.float().contiguous(), targets.contiguous()
+    if torch.is_grad_enabled() and logits.requires_grad:
+        return _CrossEntropy.apply(logits, targets)
+    loss, _ = load_cross_entropy_extension().cross_entropy_forward(logits, targets)
+    return loss.sum() / (targets != -100).sum()
