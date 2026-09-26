@@ -15,7 +15,8 @@ from .embedding import PATTERNS
 
 
 # Explicit implementation status, not a fallback. Update as student kernels land.
-STUDENT_PHASES = {name: ("forward", "backward") for name in ("embedding", "rms_norm", "residual")}
+STUDENT_PHASES = {name: ("forward", "backward")
+                  for name in ("embedding", "rms_norm", "residual", "cross_entropy")}
 
 
 def unsupported_reason(operator, backend, precision, phase, layout, dim=None):
@@ -26,7 +27,7 @@ def unsupported_reason(operator, backend, precision, phase, layout, dim=None):
     if backend == "student":
         if phase not in STUDENT_PHASES.get(operator, ()):
             return f"student {operator} {phase} is not implemented"
-        if precision != "fp32" and operator != "residual":
+        if precision != "fp32" and operator not in ("residual", "cross_entropy"):
             return f"student {operator} currently supports only fp32"
         if operator == "rms_norm" and phase == "backward" and dim is not None and dim > 1024:
             return "student rms_norm backward requires H <= 1024"

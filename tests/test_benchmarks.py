@@ -156,14 +156,15 @@ class BenchmarkHostTests(unittest.TestCase):
         with patch.object(student, 'embedding', side_effect=embedding), \
                 patch.object(student, 'rms_norm', side_effect=reference.rms_norm), \
                 patch.object(student, 'residual', side_effect=reference.residual), \
+                patch.object(student, 'cross_entropy', side_effect=reference.cross_entropy), \
                 patch('tiny_transformer.benchmarks.operators.measure_pair', return_value=timing) as measure, \
                 patch.object(student, 'linear') as missing, redirect_stdout(io.StringIO()):
             results = run(args, torch.device('cpu'))
         missing.assert_not_called()
-        self.assertEqual(measure.call_count, 12)  # Three operators, fwd/bwd, each workload.
+        self.assertEqual(measure.call_count, 16)  # Four operators, fwd/bwd, each workload.
         self.assertEqual(len(results), 16)
         for row in results:
-            if row['operator'] in ('rms_norm', 'residual'):
+            if row['operator'] in ('rms_norm', 'residual', 'cross_entropy'):
                 self.assertEqual(row['forward']['status'], 'passed')
                 self.assertEqual(row['backward']['status'], 'passed')
                 self.assertGreater(row['backward']['candidate_us'], 0)
@@ -172,13 +173,15 @@ class BenchmarkHostTests(unittest.TestCase):
                 self.assertNotIn('validation', row)
 
     def test_build_and_correctness_failures_are_not_skips(self):
-        args = small_args('--operator', 'rms_norm', '--workloads', 'prefill')
-        for error in (RuntimeError('compiler failed'), AssertionError('wrong result')):
-            with patch.object(student, 'rms_norm', side_effect=error), \
-                    patch('tiny_transformer.benchmarks.operators.measure_pair') as measure:
-                with self.assertRaises(type(error)):
-                    run(args, torch.device('cpu'))
-            measure.assert_not_called()
+        for operator in ('rms_norm', 'cross_entropy'):
+            args = small_args('--operator', operator, '--workloads', 'prefill')
+            for error in (RuntimeError('compiler failed'), AssertionError('wrong result')):
+                with self.subTest(operator=operator, error=error), \
+                        patch.object(student, operator, side_effect=error), \
+                        patch('tiny_transformer.benchmarks.operators.measure_pair') as measure:
+                    with self.assertRaises(type(error)):
+                        run(args, torch.device('cpu'))
+                measure.assert_not_called()
 
     def test_variants_share_upstream_and_restore_rng(self):
         args = small_args('--operator', 'embedding', '--backward-impl', 'all')
@@ -205,6 +208,8 @@ class BenchmarkHostTests(unittest.TestCase):
         for precision in ('fp32', 'fp16', 'bf16'):
             for phase in ('forward', 'backward'):
                 self.assertIsNone(unsupported_reason('residual', 'student', precision, phase, 'strided'))
+                for layout in ('contiguous', 'strided'):
+                    self.assertIsNone(unsupported_reason('cross_entropy', 'student', precision, phase, layout))
 
     def test_rms_norm_large_width_skips_only_backward(self):
         self.assertIn('1024', unsupported_reason('rms_norm', 'student', 'fp32', 'backward', 'contiguous', 1025))
