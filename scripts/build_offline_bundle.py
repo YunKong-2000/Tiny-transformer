@@ -29,6 +29,23 @@ def verify_data(directory):
     return metadata
 
 
+def copy_cutlass(staging):
+    """Include the pinned checkout's headers and license, never its Git metadata."""
+    source = ROOT / "third_party" / "cutlass"
+    required = ("include/cutlass/cutlass.h", "include/cute/tensor.hpp",
+                "tools/util/include/cutlass/util/host_tensor.h", "LICENSE.txt")
+    if not all((source / name).is_file() for name in required):
+        raise RuntimeError("Initialize CUTLASS before bundling: "
+                           "git submodule update --init --recursive third_party/cutlass")
+    target = staging / "third_party" / "cutlass"
+    for directory in ("include", "tools/util/include"):
+        shutil.copytree(source / directory, target / directory)
+    shutil.copy2(source / "LICENSE.txt", target / "LICENSE.txt")
+    for name in ("README.md", "cutlass.json"):
+        shutil.copy2(ROOT / "third_party" / name, staging / "third_party" / name)
+    return json.loads((ROOT / "third_party" / "cutlass.json").read_text())
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, required=True)
@@ -50,6 +67,7 @@ def main():
                             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         for name in ("README.md", "pyproject.toml", "Dockerfile", ".gitignore", ".dockerignore"):
             shutil.copy2(ROOT / name, staging / name)
+        cutlass = copy_cutlass(staging)
         shutil.copytree(args.data, staging / "data" / args.data.name)
         (staging / "wheelhouse").mkdir()
         for wheel in wheels:
@@ -57,8 +75,10 @@ def main():
         bundle_info = {"format_version": 1, "data_path": f"data/{args.data.name}",
                        "target": "Linux x86_64; NGC pytorch:25.08-py3 (Python 3.12)",
                        "tokenizers_version": "0.21.4", "data_source": metadata["source"],
-                       "includes": ["project", "prepared tokens", "tokenizer", "selected raw texts", "Linux tokenizer wheel"],
-                       "not_included": ["NGC container image", "NVIDIA driver", "CUTLASS source", "trained model weights"]}
+                       "includes": ["project", "prepared tokens", "tokenizer", "selected raw texts", "Linux tokenizer wheel",
+                                    "CUTLASS/CuTe headers and license"],
+                       "cutlass": cutlass,
+                       "not_included": ["NGC container image", "NVIDIA driver", "trained model weights"]}
         (staging / "BUNDLE.json").write_text(json.dumps(bundle_info, indent=2) + "\n")
         paths = sorted(path for path in staging.rglob("*") if path.is_file())
         manifest = "".join(f"{sha256(path)}  {path.relative_to(staging).as_posix()}\n" for path in paths)

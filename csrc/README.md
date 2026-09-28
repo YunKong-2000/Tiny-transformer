@@ -30,7 +30,9 @@ pybind 绑定只暴露函数，forward/backward 的关联由 Python `torch.autog
 逐步说明见 [embedding 开发文档](../docs/operators/embedding.md#54-从绑定到-lossbackward-的调用链)。
 首次调用需要 CUDA 版 PyTorch、CUDA toolkit/nvcc、C++ 编译器和 Ninja；
 后续使用 PyTorch 的编译缓存。当前从源码 checkout 或 editable install 加载 `csrc`，
-不支持不含这些源码的普通 wheel。此算子不依赖 CUTLASS。
+不支持不含这些源码的普通 wheel。所有现有 JIT loader 已统一配置 CUTLASS/CuTe 头文件路径和 C++17，
+首次编译前需初始化 `third_party/cutlass`；详见 [CUTLASS / CuTe 接入说明](../third_party/README.md)。
+可运行 `python -m tiny_transformer.check_cutlass` 验证头文件、CUDA 编译及小 kernel 执行。
 
 在 A100 的 CUDA 开发环境中，从仓库根目录运行：
 

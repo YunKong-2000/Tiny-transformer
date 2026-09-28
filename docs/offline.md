@@ -32,8 +32,10 @@ CHECKSUMS.sha256
 目标环境为 Linux x86_64 的 `nvcr.io/nvidia/pytorch:25.08-py3`，其 Python 版本为 3.12。
 wheel 使用 CPython 3.9+ 的稳定 ABI，适用于该容器。这里没有把 macOS 虚拟环境拷给 Linux。
 
-包内不含 NGC 镜像、NVIDIA 驱动、CUTLASS 源码或已训练模型权重。服务器需已具备目标容器与 GPU 运行环境。
-后续开发学生 CUTLASS/CuTe kernel 时，需要另外准备并固定 CUTLASS 源码版本；参考框架不依赖它。
+新生成的离线包还包含 `third_party/cutlass/include`、`tools/util/include`、CUTLASS 许可及
+`third_party/cutlass.json` 版本记录，可直接用于 CUTLASS/CuTe C++ kernel 编译。
+旧离线包需重新生成才能包含这些文件。参考框架不依赖 CUTLASS。
+包内不含 NGC 镜像、NVIDIA 驱动或已训练模型权重。服务器需已具备目标容器与 GPU 运行环境。
 
 ## 2. 在服务器校验并解压
 
@@ -63,6 +65,7 @@ export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 
 python3 -m unittest discover -s tests -v
+TORCH_CUDA_ARCH_LIST=8.0 python3 -m tiny_transformer.check_cutlass
 ```
 
 setup 先校验每个打包文件，再从 `wheelhouse` 安装 tokenizer。
@@ -118,6 +121,7 @@ python3 -m tiny_transformer.generate \
   --implementation cp --abi abi3 'tokenizers==0.21.4'
 
 # 补入该版本的数据卡片和许可文件后，在目标输出不存在时打包。
+git submodule update --init --recursive third_party/cutlass
 python3 scripts/build_offline_bundle.py \
   --data data/tinystories-8k \
   --wheelhouse data/offline-wheelhouse \

@@ -18,6 +18,16 @@
 
 ## 环境
 
+先在联网机器的项目根目录初始化固定版本的 CUTLASS（其中包含 CuTe C++）：
+
+```bash
+git submodule update --init --recursive third_party/cutlass
+python3 -m tiny_transformer.check_cutlass --headers-only
+```
+
+已固定为 CUTLASS v3.9.2；现有 student JIT 扩展自动配置其头文件路径和 C++17。
+安装方式、`CUTLASS_PATH` 覆盖路径及新增算子接入见 [依赖说明](third_party/README.md)。
+
 在 GPU 主机的项目根目录执行。宿主机需要 NVIDIA 驱动、Docker 和 NVIDIA Container Toolkit；
 驱动兼容性以 NVIDIA 对该镜像的 release notes 为准。容器不提供宿主机驱动。
 
@@ -32,6 +42,7 @@ docker run --rm -it --gpus all --ipc=host \
 python -m pip install -e '.[data]'
 python -c 'import torch; print(torch.__version__, torch.version.cuda); print(torch.cuda.get_device_name())'
 export TORCH_CUDA_ARCH_LIST=8.0
+python -m tiny_transformer.check_cutlass
 ```
 
 也可用仓库 Dockerfile 构建已安装数据依赖的派生镜像：
@@ -209,6 +220,7 @@ tiny_transformer/
   check_ops.py              小形状算子数值/梯度检查
   benchmarks/               集中的算子性能与整模型性能测试
 csrc/                       你的 CUDA / CuTe / CUTLASS 实现
+third_party/cutlass/         固定版本的 CUTLASS 子模块（包含 CuTe）
 tests/                      算法、数据、缓存、梯度、续训测试
 scripts/                    CPU/GPU 验收、图表重建
 docs/transformer.md          算法手册

@@ -33,6 +33,7 @@ python -m unittest discover -s tests -p 'test_student_*.py' -v
 | `test_benchmarks.py` | 公共测量框架自身：输入分布、校验后计时、反向不重跑前向、采样顺序、统计与跳过规则 |
 | `test_data_training.py` | 数据准备、packing、tokenizer、续训一致性 |
 | `test_offline_bundle.py` | 离线文件校验与路径合法性 |
+| `test_cutlass.py` | CUTLASS/CuTe 路径、离线依赖及真实 CUDA 编译/执行（无 GPU 时跳过后者） |
 
 每个学生算子只保留一个 CPU autograd 接线测试，使用明确的测试替身。
 它用于没有 GPU 时检查 Python 接线，不证明 CUDA 数值正确。

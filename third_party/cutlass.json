@@ -1,0 +1,5 @@
+{
+  "repository": "https://github.com/NVIDIA/cutlass.git",
+  "version": "v3.9.2",
+  "commit": "ad7b2f5e84fcfa124cb02b91d5bd26d238c0459e"
+}

@@ -2,6 +2,8 @@
 from functools import lru_cache
 from pathlib import Path
 
+from tiny_transformer._cutlass import cutlass_include_paths
+
 
 @lru_cache(maxsize=1)
 def load_embedding_extension():
@@ -34,8 +36,9 @@ def load_embedding_extension():
     return load(
         name="tiny_transformer_embedding_cuda",
         sources=[str(path) for path in sources],
-        extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3", "-lineinfo"],
+        extra_include_paths=cutlass_include_paths(),
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-lineinfo"],
         with_cuda=True,
     )
 
@@ -71,8 +74,9 @@ def load_rms_norm_extension():
     return load(
         name="tiny_transformer_rms_norm_cuda",
         sources=[str(path) for path in sources],
-        extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3", "-lineinfo"],
+        extra_include_paths=cutlass_include_paths(),
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-lineinfo"],
         with_cuda=True,
     )
 
@@ -101,8 +105,9 @@ def load_residual_extension():
     return load(
         name="tiny_transformer_residual_cuda",
         sources=[str(path) for path in sources],
-        extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3", "-lineinfo"],
+        extra_include_paths=cutlass_include_paths(),
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-lineinfo"],
         with_cuda=True,
     )
 
@@ -131,7 +136,8 @@ def load_cross_entropy_extension():
     return load(
         name="tiny_transformer_cross_entropy_cuda",
         sources=[str(path) for path in sources],
-        extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3", "-lineinfo"],
+        extra_include_paths=cutlass_include_paths(),
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-lineinfo"],
         with_cuda=True,
     )
