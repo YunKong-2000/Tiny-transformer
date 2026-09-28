@@ -3,6 +3,7 @@
 Embedding supports contiguous CUDA FP32 forward/backward; RMSNorm supports FP32 forward/backward (backward H <= 1024).
 Residual supports same-shape FP32/FP16/BF16 inputs via FP32 kernels and explicit casts.
 Cross entropy supports FP32/FP16/BF16 logits, ignored labels and first-order autograd.
+RoPE supports strided CUDA FP32 inputs and first-order gradients with constant cos/sin.
 There is no silent reference fallback.
 Match reference.py semantics, device, shape, dtype, strides and gradients.
 Use --op NAME=student to enable only a completed operator.
@@ -14,7 +15,7 @@ from torch.autograd.function import once_differentiable
 
 from ._extension import (
     load_cross_entropy_extension, load_embedding_extension,
-    load_residual_extension, load_rms_norm_extension,
+    load_residual_extension, load_rms_norm_extension, load_rope_extension,
 )
 
 
@@ -101,8 +102,36 @@ def rms_norm(x, weight, eps):
     return output
 
 
+class _Rope(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, cos, sin):
+        output = load_rope_extension().rope_forward(x, cos, sin)
+        # dx depends on the coefficients, but not on the input activation.
+        ctx.save_for_backward(cos, sin)
+        return output
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_y):
+        cos, sin = ctx.saved_tensors
+        dx = load_rope_extension().rope_backward(grad_y, cos, sin)
+        return dx, None, None
+
+
 def rope(x, cos, sin):
-    return _todo("rope")
+    """Adjacent-pair CUDA FP32 [B,Nh,T,Dh] RoPE with first-order autograd.
+
+    Inputs and upstream gradients retain their strides, including Q/K storage
+    offsets and expanded gradients. Cos/sin are constants with shape
+    [1 or B, 1, T, Dh/2]. The native wrapper validates shape, dtype and device.
+    """
+    if not x.is_cuda or not cos.is_cuda or not sin.is_cuda:
+        raise RuntimeError("student rope requires x, cos and sin to be CUDA tensors")
+    if cos.requires_grad or sin.requires_grad:
+        raise RuntimeError("student rope requires constant cos/sin; trainable coefficients are not supported")
+    if torch.is_grad_enabled() and x.requires_grad:
+        return _Rope.apply(x, cos, sin)
+    return load_rope_extension().rope_forward(x, cos, sin)
 
 
 def attention(q, k, v, past_len=0, segment_ids=None):

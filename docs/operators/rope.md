@@ -94,12 +94,45 @@ RoPE 与 K-cache write 融合属于新接口设计，不能在当前纯函数中
 
 ```bash
 python -m tiny_transformer.check_ops --operator rope --backend student \
-  --device cuda --precision bf16 --backward --output runs/rope-bf16.json
+  --device cuda --precision fp32 --backward --output runs/rope-fp32.json
 ```
 
 该工具的 transpose 输入与真实 QKV view 的 stride 并不完全相同，必须增加上表布局的用例。
 检查位置 0、较大位置、isolated position reset、Q/K 不同 offset、batch 大于 1，以及反向。
 额外检查每对分量的平方和近似保持不变，并对比整段前向与缓存解码的 logits。
+
+## 7. 当前 student 实现与 PyTorch 接入
+
+当前实现支持 CUDA FP32 前向与 x 的一阶反向；x、cos、sin 都必须为 FP32。
+支持真实 Q/K view、连续输入、末维 stride 大于 1、非零 storage offset，以及
+广播产生的零 stride；kernel 直接读取实际 stride，不在 Python 中调用 `.contiguous()`。
+cos/sin 支持 batch 为 1 或 B，head 维必须为 1，并且必须为常量。
+不支持 FP16/BF16、可训练 cos/sin、二阶梯度或 torch.compile 注册，输入不符时明确报错。
+允许 B、head 数或 T 为零；Dh 必须为正偶数。输出及 dx 是新分配的连续张量。
+
+每个 CTA 使用 128 个线程，4 个 warp 分别处理 4 个 head。
+CuTe 偶数/奇数视图都使用 `(head_in_tile, pair)` 坐标；线程布局为 `(4,32):(32,1)`，
+lane 在第 i 轮处理 `p = lane + 32*i`，读取 `x[2*p]`、`x[2*p+1]` 与 `cos[p]`、`sin[p]`。
+系数视图的 head stride 为零，因此所有 head 共享当前 batch/token 的系数。
+head 和 pair 尾部都在读写前屏蔽。CTA 编号展平为 `(b,head_tile,t)`，使用有上限的一维
+grid 和循环遍历，避免 grid.y/grid.z 的尺寸限制。地址和 stride 计算使用 64 位整数。
+
+调用链为 `student.rope` → `load_rope_extension()` → `bindings.cpp::rope_forward`
+→ CuTe kernel。只有首次使用才编译本算子的两个源文件。
+需要梯度时，`_Rope.apply` 建立 autograd 节点，保存 cos/sin；backward 只接收上游梯度，
+从 ctx 取回系数，调用 `rope_backward` 并返回 `(dx, None, None)`。
+原生反向复用相同分区，以 `sin -> -sin` 执行转置旋转，也直接支持 `sum()` 产生的零 stride 梯度。
+原生 pybind 前向不建立计算图，因此拒绝梯度开启时直接传入需要梯度的 x。
+
+```bash
+python -m unittest discover -s tests -p 'test_student_rope.py' -v
+python -m unittest discover -s tests -p 'test_student_integration.py' -v
+```
+
+独立测试覆盖真实 Q/K offset、B 与 T 不同、head 尾块、Dh=2/16/32/64/80/128/130、
+共享及逐样本系数、相邻 pair 符号、位置零和较大位置、输入不变性、空输入、非默认 stream、
+grid 循环及错误输入。共用模型测试覆盖 FP32 梯度、isolated 位置重置、prefill 与缓存解码。
+没有 CUDA 时只执行 CPU autograd 接线测试并跳过 GPU 用例；CPU 通过不代表 CUDA 编译或数值验收通过。
 
 ## 统一性能测试入口
 

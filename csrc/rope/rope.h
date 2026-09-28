@@ -1,7 +1,6 @@
 #pragma once
 
-#include <torch/extention.h>
+#include <torch/extension.h>
 
-torcH::Tensor rope_forward(torch::Tensor X, torch::Tensor cos, torch::Tensor sin);
-
-torcH::Tensor rope_backward(torch::Tensor dY, torch::Tensor cos, torch::Tensor sin);
+torch::Tensor rope_forward(torch::Tensor x, torch::Tensor cos, torch::Tensor sin);
+torch::Tensor rope_backward(torch::Tensor gradient, torch::Tensor cos, torch::Tensor sin);

@@ -37,6 +37,7 @@ for function, args in (
     (student.embedding, (torch.zeros(1, 1, dtype=torch.long), torch.ones(7, 4))),
     (student.rms_norm, (torch.ones(2, 3, 4), torch.ones(4), 1e-6)),
     (student.residual, (torch.ones(2, 3, 4), torch.ones(2, 3, 4))),
+    (student.rope, (torch.ones(2, 4, 3, 16), torch.ones(1, 1, 3, 8), torch.zeros(1, 1, 3, 8))),
     (student.cross_entropy, (torch.ones(2, 3, 4), torch.zeros(2, 3, dtype=torch.long))),
 ):
     try:
@@ -60,9 +61,10 @@ class StudentIntegrationCudaTests(unittest.TestCase):
                                   hidden_dim=96, max_seq_len=16)
 
     def test_model_training_and_cached_inference(self):
-        for names in (('embedding',), ('rms_norm',), ('residual',), ('cross_entropy',),
+        for names in (('embedding',), ('rms_norm',), ('residual',), ('cross_entropy',), ('rope',),
                       ('embedding', 'rms_norm'), ('embedding', 'rms_norm', 'residual'),
-                      ('embedding', 'rms_norm', 'residual', 'cross_entropy')):
+                      ('embedding', 'rms_norm', 'residual', 'cross_entropy'),
+                      ('embedding', 'rms_norm', 'residual', 'cross_entropy', 'rope')):
             with self.subTest(operators=names), full_precision_matmul():
                 expected, actual = Transformer(self.config).cuda(), Transformer(self.config).cuda()
                 actual.load_state_dict(expected.state_dict())
@@ -70,7 +72,9 @@ class StudentIntegrationCudaTests(unittest.TestCase):
                 self.assertIs(actual.embedding, actual.output_weight)
                 # Accumulated parameter gradients exercise tied embedding weights
                 # and norm/residual calls, in FP32 and in the model's AMP path.
-                for amp in (False, True):
+                # RoPE currently supports FP32 only; its dtype rejection is
+                # tested separately instead of silently casting AMP activations.
+                for amp in ((False,) if 'rope' in names else (False, True)):
                     expected.zero_grad(set_to_none=True)
                     actual.zero_grad(set_to_none=True)
                     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -91,6 +95,15 @@ class StudentIntegrationCudaTests(unittest.TestCase):
                     ids = torch.randint(31, (2, 7), device='cuda')
                     atol, rtol = (0, 0) if names == ('embedding',) else (2e-5, 1e-4)
                     torch.testing.assert_close(actual(ids), expected(ids), atol=atol, rtol=rtol)
+                    if 'rope' in names:
+                        segments = torch.tensor([[0, 0, 1, 1, 1, 2, 2],
+                                                 [0, 1, 1, 2, 2, 2, 2]], device='cuda')
+                        positions = torch.tensor([[0, 1, 0, 1, 2, 0, 1],
+                                                  [0, 0, 1, 0, 1, 2, 3]], device='cuda')
+                        torch.testing.assert_close(
+                            actual(ids, segment_ids=segments, position_ids=positions),
+                            expected(ids, segment_ids=segments, position_ids=positions),
+                            atol=atol, rtol=rtol)
                     caches = [model.new_cache(2, 12) for model in (expected, actual)]
                     # last_only with B>1 exposes the final norm's strided prefill input.
                     chunks = [ids[:, :4].contiguous(), ids[:, 4:5].contiguous(), ids[:, 5:].contiguous()]

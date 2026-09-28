@@ -13,6 +13,10 @@ Python wrapper 显式复制非连续输入、转换 FP16/BF16 并保留 dtype pr
 标签求平均。反向消费分拆的 LSE 缓存和已包含平均/外部缩放的 CUDA 零维梯度 Tensor，
 kernel 内广播该标量，不物化逐行梯度，也不读回主机。
 详见 [cross entropy 接入与测试](../docs/operators/cross_entropy.md#8-当前-student-实现与调用链)。
+RoPE 使用 CuTe `(head,pair)` 线程分区，每个 CTA 4 个 warp，支持 FP32 前向与一阶反向；
+直接读取 Q/K、系数与上游梯度的实际 stride，支持共享或逐样本位置系数。
+Python autograd 保存 cos/sin，并通过独立 `load_rope_extension()` 连接原生前后向。
+支持范围、线程映射及测试见 [RoPE 接入说明](../docs/operators/rope.md#7-当前-student-实现与-pytorch-接入)。
 其他算子尚未实现；CUDA 编译、数值及性能需在目标 GPU 上验收。
 
 RMSNorm 使用独立的 `rms_norm/bindings.cpp` 和 `load_rms_norm_extension()`，
@@ -59,7 +63,7 @@ RMSNorm 性能入口为 `python -m tiny_transformer.benchmarks --operator rms_no
 [embedding 性能测试说明](../docs/operators/embedding.md#7-前向与反向性能四种-token-分布)。
 模型缓存对照测试临时将 FP32 matmul precision 设为 `highest`，结束后恢复原设置，
 避免 TF32 下不同 GEMM 尺寸的数值差异干扰 FP32 验收。
-纯 reference 缓存与完整前向的一致性由 `test_model.py` 负责；四个学生算子的共同训练/推理
+纯 reference 缓存与完整前向的一致性由 `test_model.py` 负责；五个学生算子的共同训练/推理
 放在 `test_student_integration.py`。各算子文件保留独有的数值与边界用例，职责见 [测试说明](../tests/README.md)。
 支持连续二维 int64 IDs、连续二维 FP32 weight，以及非零 storage offset；
 支持空 IDs，但 weight 的 V/H 必须为正。非连续输入显式报错。

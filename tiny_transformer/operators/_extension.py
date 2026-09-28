@@ -141,3 +141,34 @@ def load_cross_entropy_extension():
         extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-lineinfo"],
         with_cuda=True,
     )
+
+
+@lru_cache(maxsize=1)
+def load_rope_extension():
+    # Keep compiler imports and compilation out of model/reference imports.
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("student rope requires CUDA-enabled PyTorch and a CUDA device")
+
+    from torch.utils.cpp_extension import CUDA_HOME, load
+
+    if CUDA_HOME is None:
+        raise RuntimeError("student rope requires a CUDA toolkit with nvcc; set CUDA_HOME")
+
+    source_root = Path(__file__).resolve().parents[2] / "csrc" / "rope"
+    sources = [source_root / name for name in
+               ("bindings.cpp", "rope.cu")]
+    if not all(path.is_file() for path in sources + [source_root / "rope.h"]):
+        raise RuntimeError(
+            "student CUDA sources are missing; run from the repository or an editable install"
+        )
+
+    return load(
+        name="tiny_transformer_rope_cuda",
+        sources=[str(path) for path in sources],
+        extra_include_paths=cutlass_include_paths(),
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-lineinfo"],
+        with_cuda=True,
+    )

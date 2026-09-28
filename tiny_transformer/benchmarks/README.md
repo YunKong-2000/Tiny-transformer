@@ -61,7 +61,7 @@ python -m tiny_transformer.benchmarks.model --config configs/smoke.json \
 | embedding | `[B,T]` IDs、`[V,H]` weight；random/same/unique/hot；grouped/baseline | weight | FP32 前向、反向，连续输入 |
 | linear | `[B,T,H]`、`[out_features,H]` | x、weight | 未实现 |
 | rms_norm | `[B,T,H]`、`[H]`、eps；可测 last-only `[B,1,H]` | x、weight | FP32 前向/反向（H <= 1024）；wrapper 复制跨步输入 |
-| rope | `[B,heads,T,H/heads]` 与共享 cos/sin | x；cos/sin 是常量 | 未实现 |
+| rope | `[B,heads,T,H/heads]` 与共享 cos/sin | x；cos/sin 是常量 | FP32 CuTe 前向/反向；直接消费输入及梯度的 stride |
 | attention | prefill `Q=K=T`；decode `Q=1,K=seq_length`，携带 past_len | q、k、v | 未实现；可用 SDPA 比较 |
 | swiglu | `[B,T,hidden_dim]` gate/up；跨步用例保留 chunk view | gate、up | 未实现 |
 | residual | 两个 `[B,T,H]` | 两项输入 | FP32 kernel 前向/反向；wrapper 支持 FP16/BF16 与跨步输入，计入转换/复制成本 |
