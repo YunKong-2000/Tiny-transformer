@@ -16,7 +16,7 @@ from .embedding import PATTERNS
 
 # Explicit implementation status, not a fallback. Update as student kernels land.
 STUDENT_PHASES = {name: ("forward", "backward")
-                  for name in ("embedding", "rms_norm", "residual", "cross_entropy", "rope")}
+                  for name in ("embedding", "rms_norm", "residual", "cross_entropy", "rope", "swiglu")}
 
 
 def unsupported_reason(operator, backend, precision, phase, layout, dim=None):

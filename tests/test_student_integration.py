@@ -39,6 +39,7 @@ for function, args in (
     (student.residual, (torch.ones(2, 3, 4), torch.ones(2, 3, 4))),
     (student.rope, (torch.ones(2, 4, 3, 16), torch.ones(1, 1, 3, 8), torch.zeros(1, 1, 3, 8))),
     (student.cross_entropy, (torch.ones(2, 3, 4), torch.zeros(2, 3, dtype=torch.long))),
+    (student.swiglu, (torch.ones(2, 3, 4), torch.ones(2, 3, 4))),
 ):
     try:
         function(*args)
@@ -61,10 +62,11 @@ class StudentIntegrationCudaTests(unittest.TestCase):
                                   hidden_dim=96, max_seq_len=16)
 
     def test_model_training_and_cached_inference(self):
-        for names in (('embedding',), ('rms_norm',), ('residual',), ('cross_entropy',), ('rope',),
+        for names in (('embedding',), ('rms_norm',), ('residual',), ('cross_entropy',), ('rope',), ('swiglu',),
                       ('embedding', 'rms_norm'), ('embedding', 'rms_norm', 'residual'),
                       ('embedding', 'rms_norm', 'residual', 'cross_entropy'),
-                      ('embedding', 'rms_norm', 'residual', 'cross_entropy', 'rope')):
+                      ('embedding', 'rms_norm', 'residual', 'cross_entropy', 'rope'),
+                      ('embedding', 'rms_norm', 'residual', 'cross_entropy', 'rope', 'swiglu')):
             with self.subTest(operators=names), full_precision_matmul():
                 expected, actual = Transformer(self.config).cuda(), Transformer(self.config).cuda()
                 actual.load_state_dict(expected.state_dict())
@@ -72,9 +74,9 @@ class StudentIntegrationCudaTests(unittest.TestCase):
                 self.assertIs(actual.embedding, actual.output_weight)
                 # Accumulated parameter gradients exercise tied embedding weights
                 # and norm/residual calls, in FP32 and in the model's AMP path.
-                # RoPE currently supports FP32 only; its dtype rejection is
+                # RoPE/SwiGLU currently support FP32 only; dtype rejection is
                 # tested separately instead of silently casting AMP activations.
-                for amp in ((False,) if 'rope' in names else (False, True)):
+                for amp in ((False,) if {'rope', 'swiglu'}.intersection(names) else (False, True)):
                     expected.zero_grad(set_to_none=True)
                     actual.zero_grad(set_to_none=True)
                     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16

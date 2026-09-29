@@ -4,6 +4,7 @@ Embedding supports contiguous CUDA FP32 forward/backward; RMSNorm supports FP32 
 Residual supports same-shape FP32/FP16/BF16 inputs via FP32 kernels and explicit casts.
 Cross entropy supports FP32/FP16/BF16 logits, ignored labels and first-order autograd.
 RoPE supports strided CUDA FP32 inputs and first-order gradients with constant cos/sin.
+SwiGLU supports strided CUDA FP32 gate/up inputs and first-order gradients.
 There is no silent reference fallback.
 Match reference.py semantics, device, shape, dtype, strides and gradients.
 Use --op NAME=student to enable only a completed operator.
@@ -15,7 +16,7 @@ from torch.autograd.function import once_differentiable
 
 from ._extension import (
     load_cross_entropy_extension, load_embedding_extension,
-    load_residual_extension, load_rms_norm_extension, load_rope_extension,
+    load_residual_extension, load_rms_norm_extension, load_rope_extension, load_swiglu_extension,
 )
 
 
@@ -138,8 +139,33 @@ def attention(q, k, v, past_len=0, segment_ids=None):
     return _todo("attention")
 
 
+class _SwiGLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, gate, up):
+        output = load_swiglu_extension().swiglu_forward(gate, up)
+        ctx.save_for_backward(gate, up)
+        return output
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        gate, up = ctx.saved_tensors
+        dgate, dup = load_swiglu_extension().swiglu_backward(grad_output, gate, up)
+        return (dgate if ctx.needs_input_grad[0] else None,
+                dup if ctx.needs_input_grad[1] else None)
+
+
 def swiglu(gate, up):
-    return _todo("swiglu")
+    """CUDA FP32 [B,T,I] SiLU(gate) * up with first-order autograd.
+
+    Preserve independent input strides and storage offsets, including chunk
+    views. The native backward also accepts strided and expanded gradients.
+    """
+    if not gate.is_cuda or not up.is_cuda:
+        raise RuntimeError("student swiglu requires gate and up to be CUDA tensors")
+    if torch.is_grad_enabled() and (gate.requires_grad or up.requires_grad):
+        return _SwiGLU.apply(gate, up)
+    return load_swiglu_extension().swiglu_forward(gate, up)
 
 
 class _Residual(torch.autograd.Function):

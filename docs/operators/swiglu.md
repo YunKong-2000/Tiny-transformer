@@ -88,7 +88,7 @@ $$
 
 ```bash
 python -m tiny_transformer.check_ops --operator swiglu --backend student \
-  --device cuda --precision bf16 --backward --output runs/swiglu-bf16.json
+  --device cuda --precision fp32 --backward --output runs/swiglu-fp32.json
 ```
 
 补充真实 `.chunk(2, -1)` 输入、正负大幅值、零 gate/零 up、$I=65$ 尾部和 $I=2048$ 主配置。
@@ -107,3 +107,28 @@ python -m tiny_transformer.benchmarks --operator swiglu \
 
 未实现的 student 算子/阶段会记录为 `skipped`，没有隐式 reference fallback；
 可用 `--backend reference` 验证完整测量流程。`check_ops --backward` 的结果不能替代反向性能数据。
+
+## 当前 student 实现与回归测试
+
+当前实现支持 CUDA FP32、同 shape 的三维 `[B,T,I]` 输入和一阶梯度。
+前后向均使用一个 CTA 处理 4 个 token、一个 warp 处理一个 token 的 CuTe 分区；
+token 和列尾部均显式屏蔽。输入 gate、up 和上游梯度分别使用实际 stride，
+不调用 `.contiguous()`，支持标准 chunk、独立连续张量、转置、末维步长 2 和 expand 零 stride。
+输出及返回的 dgate/dup 是新建连续张量，空输入直接返回空结果。
+`student.swiglu` 保存 gate/up 并连接一阶 autograd；原生 pybind 接口不自动构建计算图。
+FP16/BF16 与高阶梯度暂不支持，也不会隐式转成 FP32 或回退 reference。
+
+```bash
+python -m unittest discover -s tests -p 'test_student_swiglu.py' -v
+python -m unittest discover -s tests -p 'test_student_integration.py' -v
+python -m tiny_transformer.benchmarks --operator swiglu --precision fp32 \
+  --layouts contiguous strided --output runs/swiglu-performance.json
+# 检查无效 token/列的读写；需要 CUDA Toolkit 中的 compute-sanitizer。
+compute-sanitizer --tool memcheck --error-exitcode 1 \
+  python -m unittest discover -s tests -p 'test_student_swiglu.py' -v
+```
+
+专用测试覆盖真实 chunk offset、T/I 尾块、decode、I=2048、非连续/零 stride 梯度、
+零 gate、大幅值、单输入求导、共享输入、空张量、封顶 grid 的第二轮、当前 CUDA stream、
+参数校验以及 Linear→chunk→SwiGLU→Linear 的梯度链路。多 GPU 校验仅在至少两张卡时运行。
+CPU mock 测试只验证 Python autograd 接线，不能证明 CUDA kernel 正确。
