@@ -159,14 +159,15 @@ class BenchmarkHostTests(unittest.TestCase):
                 patch.object(student, 'cross_entropy', side_effect=reference.cross_entropy), \
                 patch.object(student, 'rope', side_effect=reference.rope), \
                 patch.object(student, 'swiglu', side_effect=reference.swiglu), \
+                patch.object(student, 'linear', side_effect=reference.linear), \
                 patch('tiny_transformer.benchmarks.operators.measure_pair', return_value=timing) as measure, \
-                patch.object(student, 'linear') as missing, redirect_stdout(io.StringIO()):
+                patch.object(student, 'attention') as missing, redirect_stdout(io.StringIO()):
             results = run(args, torch.device('cpu'))
         missing.assert_not_called()
-        self.assertEqual(measure.call_count, 24)  # Six operators, fwd/bwd, each workload.
+        self.assertEqual(measure.call_count, 28)  # Seven operators, fwd/bwd, each workload.
         self.assertEqual(len(results), 16)
         for row in results:
-            if row['operator'] in ('rms_norm', 'residual', 'cross_entropy', 'rope', 'swiglu'):
+            if row['operator'] in ('linear', 'rms_norm', 'residual', 'cross_entropy', 'rope', 'swiglu'):
                 self.assertEqual(row['forward']['status'], 'passed')
                 self.assertEqual(row['backward']['status'], 'passed')
                 self.assertGreater(row['backward']['candidate_us'], 0)
@@ -175,7 +176,7 @@ class BenchmarkHostTests(unittest.TestCase):
                 self.assertNotIn('validation', row)
 
     def test_build_and_correctness_failures_are_not_skips(self):
-        for operator in ('rms_norm', 'cross_entropy', 'rope', 'swiglu'):
+        for operator in ('linear', 'rms_norm', 'cross_entropy', 'rope', 'swiglu'):
             args = small_args('--operator', operator, '--workloads', 'prefill')
             for error in (RuntimeError('compiler failed'), AssertionError('wrong result')):
                 with self.subTest(operator=operator, error=error), \
@@ -207,9 +208,11 @@ class BenchmarkHostTests(unittest.TestCase):
         self.assertIn('contiguous', unsupported_reason('embedding', 'student', 'fp32', 'forward', 'strided'))
         for phase in ('forward', 'backward'):
             for layout in ('contiguous', 'strided'):
+                self.assertIsNone(unsupported_reason('linear', 'student', 'fp32', phase, layout))
                 self.assertIsNone(unsupported_reason('rope', 'student', 'fp32', phase, layout))
                 self.assertIsNone(unsupported_reason('swiglu', 'student', 'fp32', phase, layout))
             for precision in ('fp16', 'bf16'):
+                self.assertIn('fp32', unsupported_reason('linear', 'student', precision, phase, 'strided'))
                 self.assertIn('fp32', unsupported_reason('rope', 'student', precision, phase, 'strided'))
                 self.assertIn('fp32', unsupported_reason('swiglu', 'student', precision, phase, 'strided'))
         self.assertIsNone(unsupported_reason('rms_norm', 'reference', 'bf16', 'backward', 'last-only'))

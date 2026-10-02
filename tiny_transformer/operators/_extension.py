@@ -203,3 +203,35 @@ def load_swiglu_extension():
         extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-lineinfo"],
         with_cuda=True,
     )
+
+
+@lru_cache(maxsize=1)
+def load_linear_extension():
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("student linear requires CUDA-enabled PyTorch and a CUDA device")
+
+    from torch.utils.cpp_extension import CUDA_HOME, load
+
+    if CUDA_HOME is None:
+        raise RuntimeError("student linear requires a CUDA toolkit with nvcc; set CUDA_HOME")
+
+    source_root = Path(__file__).resolve().parents[2] / "csrc" / "linear"
+    sources = [source_root / name for name in
+               ("bindings.cpp", "linear.cu")]
+    required = sources + [source_root / name for name in
+                          ("linear.h", "linear_common.cuh", "linear_kernel.cuh")]
+    if not all(path.is_file() for path in required):
+        raise RuntimeError(
+            "student CUDA sources are missing; run from the repository or an editable install"
+        )
+
+    return load(
+        name="tiny_transformer_linear_cuda",
+        sources=[str(path) for path in sources],
+        extra_include_paths=cutlass_include_paths(),
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-lineinfo"],
+        with_cuda=True,
+    )

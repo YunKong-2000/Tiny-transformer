@@ -1,5 +1,10 @@
 # 学生 CUDA / CuTe / CUTLASS 源码目录
 
+Linear 位于 `linear/`：CUTLASS FP32 SIMT 的前向、dX 和 dW，使用当前 CUDA stream。
+通过独立的 `bindings.cpp` 和 `load_linear_extension()` 延迟编译；Python wrapper 复制跨步输入、
+恢复前导维度并接入一阶 autograd。当前不支持 BF16/FP16、autocast 或 compile 自定义算子注册。
+测试与 GPU 验收命令见 [Linear 文档](../docs/operators/linear.md)。
+
 当前包含 embedding 的 FP32 CUDA 前向与一阶反向。前向每个 warp 搬运一个 ID 对应的行，
 256 线程的 block 同时处理 8 个 ID；按地址与行宽对齐选择 float4 或标量 kernel。
 反向每个 warp 对最多 32 个位置按 ID 分组，合并组内梯度后原子累加到全零梯度表。

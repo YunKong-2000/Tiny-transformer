@@ -1,0 +1,89 @@
+#include "linear.h"
+#include "linear_kernel.cuh"
+#include "linear_common.cuh"
+#include "c10/cuda/CUDAStream.h"
+#include "c10/cuda/CUDAGuard.h"
+
+torch::Tensor linear_forward(torch::Tensor x, torch::Tensor weight) {
+  check_inputs_forward(x, weight);
+  TORCH_CHECK(!c10::GradMode::is_enabled() || !(x.requires_grad() || weight.requires_grad()),
+              "use student.linear autograd binding for trainable inputs");
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  auto output = torch::empty({x.size(0), x.size(1), weight.size(0)}, x.options());
+  if (output.numel() == 0) return output;
+  if (weight.size(1) == 0) return output.zero_();
+  const auto stream = c10::cuda::getCurrentCUDAStream(x.get_device());
+
+  const int M = static_cast<int>(x.size(0) * x.size(1));
+  const int N = static_cast<int>(weight.size(0));
+  const int K = static_cast<int>(weight.size(1));
+
+  ForwardGemm gemm_op;
+  ForwardGemm::Arguments args({M, N, K},
+                              {x.data_ptr<float>(), K},
+                              {weight.data_ptr<float>(), K},
+                              {output.data_ptr<float>(), N},
+                              {output.data_ptr<float>(), N},
+                              {1.0f, 0.0f});
+  auto status = ForwardGemm::can_implement(args);
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "Forward GEMM arguments: ", cutlassGetStatusString(status));
+
+  status = gemm_op(args, nullptr, stream.stream());
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "Forward GEMM launch: ", cutlassGetStatusString(status));
+  return output;
+}
+
+std::tuple<torch::Tensor, torch::Tensor> linear_backward(torch::Tensor gradient, torch::Tensor x, torch::Tensor weight) {
+  check_inputs_backward(gradient, x, weight);
+  TORCH_CHECK(!c10::GradMode::is_enabled() ||
+              !(gradient.requires_grad() || x.requires_grad() || weight.requires_grad()),
+              "linear backward supports first-order gradients only");
+  const c10::cuda::CUDAGuard device_guard(gradient.device());
+  auto dX = torch::empty(x.sizes(), x.options());
+  auto dW = torch::empty(weight.sizes(), weight.options());
+  // Zero-size reductions can still have nonempty outputs. Normal GEMMs overwrite
+  // their complete outputs (beta=0), so do not pay for redundant zeroing there.
+  if (gradient.numel() == 0 || weight.size(1) == 0) {
+    dX.zero_();
+    dW.zero_();
+    return {dX, dW};
+  }
+  const auto stream = c10::cuda::getCurrentCUDAStream(gradient.get_device());
+
+  const int M = static_cast<int>(gradient.size(0) * gradient.size(1));
+  const int N = static_cast<int>(weight.size(0));
+  const int K = static_cast<int>(weight.size(1));
+
+  BackwardGemmX gemm_op_x;
+  BackwardGemmX::Arguments args_x({M, K, N},
+                                  {gradient.data_ptr<float>(), N},
+                                  {weight.data_ptr<float>(), K},
+                                  {dX.data_ptr<float>(), K},
+                                  {dX.data_ptr<float>(), K},
+                                  {1.0f, 0.0f});
+
+  auto status_x = BackwardGemmX::can_implement(args_x);
+  TORCH_CHECK(status_x == cutlass::Status::kSuccess,
+              "Backward GEMM for dX arguments: ", cutlassGetStatusString(status_x));
+  status_x = gemm_op_x(args_x, nullptr, stream.stream());
+  TORCH_CHECK(status_x == cutlass::Status::kSuccess,
+              "Backward GEMM for dX launch: ", cutlassGetStatusString(status_x));
+
+  BackwardGemmW gemm_op_w;
+  BackwardGemmW::Arguments args_w({N, K, M},
+                                  {gradient.data_ptr<float>(), N},
+                                  {x.data_ptr<float>(), K},
+                                  {dW.data_ptr<float>(), K},
+                                  {dW.data_ptr<float>(), K},
+                                  {1.0f, 0.0f});
+  auto status_w = BackwardGemmW::can_implement(args_w);
+  TORCH_CHECK(status_w == cutlass::Status::kSuccess,
+              "Backward GEMM for dW arguments: ", cutlassGetStatusString(status_w));
+  status_w = gemm_op_w(args_w, nullptr, stream.stream());
+  TORCH_CHECK(status_w == cutlass::Status::kSuccess,
+              "Backward GEMM for dW launch: ", cutlassGetStatusString(status_w));
+
+  return {dX, dW};
+}

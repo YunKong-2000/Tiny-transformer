@@ -5,17 +5,20 @@ Residual supports same-shape FP32/FP16/BF16 inputs via FP32 kernels and explicit
 Cross entropy supports FP32/FP16/BF16 logits, ignored labels and first-order autograd.
 RoPE supports strided CUDA FP32 inputs and first-order gradients with constant cos/sin.
 SwiGLU supports strided CUDA FP32 gate/up inputs and first-order gradients.
+Linear supports CUDA FP32 inputs and first-order gradients, with explicit view copies; no AMP.
 There is no silent reference fallback.
 Match reference.py semantics, device, shape, dtype, strides and gradients.
 Use --op NAME=student to enable only a completed operator.
 See docs/development.md before registering a compiled/custom operator.
 """
 
+import math
+
 import torch
 from torch.autograd.function import once_differentiable
 
 from ._extension import (
-    load_cross_entropy_extension, load_embedding_extension,
+    load_cross_entropy_extension, load_embedding_extension, load_linear_extension,
     load_residual_extension, load_rms_norm_extension, load_rope_extension, load_swiglu_extension,
 )
 
@@ -61,8 +64,55 @@ def embedding(ids, weight, *, backward_impl="grouped"):
     return load_embedding_extension().embedding_forward(ids, weight)
 
 
+class _Linear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight):
+        output = load_linear_extension().linear_forward(x, weight)
+        ctx.save_for_backward(x, weight)
+        return output
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        x, weight = ctx.saved_tensors
+        dx, dweight = load_linear_extension().linear_backward(
+            grad_output.contiguous(), x, weight
+        )
+        return (dx if ctx.needs_input_grad[0] else None,
+                dweight if ctx.needs_input_grad[1] else None)
+
+
 def linear(x, weight):
-    return _todo("linear")
+    """FP32 CUDA [..., K] x [N, K]^T; copies views and preserves first-order gradients.
+
+    Uses full FP32 SIMT math. BF16/FP16 and CUDA autocast are not implemented.
+    """
+    if not x.is_cuda or not weight.is_cuda:
+        raise RuntimeError("student linear requires x and weight to be CUDA tensors")
+    if x.device != weight.device:
+        raise RuntimeError("student linear inputs must be on the same device")
+    if x.layout != torch.strided or weight.layout != torch.strided:
+        raise RuntimeError("student linear requires strided layout")
+    if torch.is_autocast_enabled("cuda"):
+        raise RuntimeError("student linear does not support CUDA autocast yet")
+    if x.dtype != torch.float32 or weight.dtype != torch.float32:
+        raise RuntimeError("student linear supports only float32")
+    if x.ndim < 1 or weight.ndim != 2:
+        raise RuntimeError("student linear requires x with at least 1 dimension and weight 2D")
+    if x.shape[-1] != weight.shape[1]:
+        raise RuntimeError("linear input last dimension must match weight.shape[1]")
+    rows = math.prod(x.shape[:-1])
+    if max(rows, x.shape[-1], weight.shape[0]) > 2**31 - 1:
+        raise RuntimeError("linear GEMM dimensions must fit in int32")
+    # Explicit sizes handle zero K; reshape(-1, K) would be ambiguous there.
+    # Keep copies/reshapes outside Function.forward so their gradients reach views.
+    xc = x.contiguous().reshape(1, rows, x.shape[-1])
+    wc = weight.contiguous()
+    if torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad):
+        output = _Linear.apply(xc, wc)
+    else:
+        output = load_linear_extension().linear_forward(xc, wc)
+    return output.reshape(*x.shape[:-1], weight.shape[0])
 
 
 class _RMSNorm(torch.autograd.Function):

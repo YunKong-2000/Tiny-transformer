@@ -2,6 +2,23 @@
 
 [返回算子总契约](README.md) · [参考实现](../../tiny_transformer/operators/reference.py) · [调用位置](../../tiny_transformer/model.py)
 
+当前 student 实现为 **CUDA FP32 SIMT 前向和一阶反向**，权重仍为 `[N,K]`。
+Python 入口支持 `[...,K]`，显式复制非连续输入并恢复输出形状，复制保留梯度链；
+原生入口接收连续三维 FP32 输入。支持零 M/N/K，使用当前 CUDA stream，检查 int32 GEMM 维度范围。
+BF16/FP16 和 CUDA autocast 目前明确拒绝，尚未实现 `torch.compile` 自定义算子注册。
+下面的 AMP/BF16 要求描述完整目标契约，不代表当前已支持。
+
+正确性测试（有 CUDA 时会真实编译扩展；无 CUDA 时只执行 CPU 接线测试）：
+
+```bash
+python -m unittest discover -s tests -p 'test_student_linear.py' -v
+python -m unittest discover -s tests -p 'test_student_integration.py' -v
+```
+
+Linear 测试覆盖五种默认训练投影、batch=8/1 的 decode、非方形和尾块、
+输入/上游梯度的 stride、空维度、非法输入和非默认 stream。
+GPU 编译、数值和性能仍需在目标 CUDA 主机验收；CPU 测试替身不验证 CUTLASS。
+
 ## 1. 接口与职责
 
 ```python
@@ -101,10 +118,10 @@ forward、dx、dweight 是三类不同 shape 的 GEMM，通常需要分别选 ke
 
 ```bash
 python -m tiny_transformer.check_ops --operator linear --backend student \
-  --device cuda --precision bf16 --backward --output runs/linear-bf16.json
+  --device cuda --precision fp32 --backward --output runs/linear-fp32.json
 ```
 
-该命令只检查小尺寸、同 dtype 输入。必须补充上表五种真实 shape、FP32/BF16 混合输入的 autocast、
+该命令只检查小尺寸、同 dtype 输入。BF16 支持实现后，还必须检查 FP32/BF16 混合输入的 autocast、
 较小 $M$、不整除 tile 的尾部、LM head 的共享权重梯度，以及训练与缓存生成。
 接口目前不包含 fused epilogue 的额外输出；跨 Linear/SwiGLU/Residual 融合应另行定义明确的新契约。
 

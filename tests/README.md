@@ -18,17 +18,18 @@ python -m unittest discover -s tests -p 'test_student_*.py' -v
 首次运行 GPU 测试会 JIT 编译真实扩展，需要 CUDA 版 PyTorch、nvcc、C++ 编译器和 Ninja。
 有 GPU 但缺少构建工具时会报错，不当成测试通过。A100 可设置 `TORCH_CUDA_ARCH_LIST=8.0`。
 单独迭代一个 kernel，也可将 pattern 改成 `test_student_embedding.py`、`test_student_rms_norm.py`、
-`test_student_residual.py`、`test_student_cross_entropy.py` 或 `test_student_rope.py`；
+`test_student_residual.py`、`test_student_cross_entropy.py`、`test_student_rope.py` 或 `test_student_linear.py`；
 提交前仍运行包含 integration 的命令。
 
 | 文件 | 唯一职责 |
 |---|---|
 | `test_student_embedding.py` | embedding 的精确前向、grouped/baseline 梯度、行/通道边界、地址对齐、空输入、非法 ID、stream |
+| `test_student_linear.py` | FP32 CUTLASS 的五种训练/decode 投影、非方形/尾块、各输入 rank、stride/offset、空 M/N/K、输入检查、当前 stream；CPU 仅验证 autograd 接线 |
 | `test_student_rms_norm.py` | 一组用例检查 Y/R/dX/dgamma；H=1024/1025、非连续输入、缓存 R、清零、行循环与 stream |
 | `test_student_residual.py` | 残差前向和双路梯度、dtype promotion、FP32/低精度混合输入、视图与别名、对齐/尾部/空输入、grid 循环与 stream |
 | `test_student_cross_entropy.py` | loss/梯度与 PyTorch 对照、ignore/空输入、稳定性、低精度/GradScaler、缓存、非连续输入、非法标签、grid 循环与 stream |
 | `test_student_rope.py` | 真实 Q/K stride/offset、相邻 pair、head/pair 尾块、系数广播、FP32 一阶梯度、空输入、grid 循环与 stream |
-| `test_student_integration.py` | 五个算子的共用接入：CPU 拒绝/延迟加载、native grad guard、deterministic 模式、FP32/AMP 模型梯度、prefill/decode；RoPE 仅测 FP32 并覆盖 isolated 位置 |
+| `test_student_integration.py` | 已接入算子的 CPU 拒绝/延迟加载、native grad guard、deterministic 模式、模型梯度、prefill/decode；包含 Linear 的共享权重梯度和缓存推理，Linear/RoPE/SwiGLU 仅测 FP32 |
 | `test_operators.py` | reference 数学定义、double gradcheck、SDPA、算子分发契约 |
 | `test_model.py` | 模型结构、因果性、文档隔离、reference KV cache、训练和 compile 基础行为 |
 | `test_benchmarks.py` | 公共测量框架自身：输入分布、校验后计时、反向不重跑前向、采样顺序、统计与跳过规则 |

@@ -32,6 +32,10 @@ python -m tiny_transformer.benchmarks --operator embedding \
   --backward-impl all --patterns random same unique hot \
   --output runs/embedding-performance.json
 
+# Linear：FP32 SIMT 前向/反向，包含连续和跨步输入。
+python -m tiny_transformer.benchmarks --operator linear --precision fp32 \
+  --layouts contiguous strided --output runs/linear-performance.json
+
 # 所有 student 算子：未实现的算子/阶段/dtype 明确记录 skipped，无 fallback。
 python -m tiny_transformer.benchmarks --operator all \
   --output runs/all-operators-performance.json
@@ -59,7 +63,7 @@ python -m tiny_transformer.benchmarks.model --config configs/smoke.json \
 | 算子 | 输入/测试维度 | 反向需要的输入 | 当前 student |
 |---|---|---|---|
 | embedding | `[B,T]` IDs、`[V,H]` weight；random/same/unique/hot；grouped/baseline | weight | FP32 前向、反向，连续输入 |
-| linear | `[B,T,H]`、`[out_features,H]` | x、weight | 未实现 |
+| linear | `[B,T,H]`、`[out_features,H]` | x、weight | FP32 SIMT 前向/反向；wrapper 复制跨步输入；尚不支持 AMP/BF16/FP16 |
 | rms_norm | `[B,T,H]`、`[H]`、eps；可测 last-only `[B,1,H]` | x、weight | FP32 前向/反向（H <= 1024）；wrapper 复制跨步输入 |
 | rope | `[B,heads,T,H/heads]` 与共享 cos/sin | x；cos/sin 是常量 | FP32 CuTe 前向/反向；直接消费输入及梯度的 stride |
 | attention | prefill `Q=K=T`；decode `Q=1,K=seq_length`，携带 past_len | q、k、v | 未实现；可用 SDPA 比较 |

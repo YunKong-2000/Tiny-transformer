@@ -66,7 +66,7 @@ class OperatorTests(unittest.TestCase):
         ops = Operators({"rms_norm": "student"})
         with self.assertRaisesRegex(RuntimeError, "CUDA"):
             ops.rms_norm(torch.ones(1, 4), torch.ones(4), 1e-6)
-        with self.assertRaisesRegex(NotImplementedError, "linear"):
+        with self.assertRaisesRegex(RuntimeError, "CUDA"):
             Operators({"linear": "student"}).linear(torch.ones(1, 4), torch.ones(4, 4))
         self.assertIs(ops.linear, reference.linear)
 
