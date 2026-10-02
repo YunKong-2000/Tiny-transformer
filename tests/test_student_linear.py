@@ -6,6 +6,7 @@ import torch
 
 from tiny_transformer.operators import reference, student
 from tiny_transformer.operators._extension import load_linear_extension
+from tiny_transformer.benchmarks.linear import LinearFp32Validator
 
 
 class StudentLinearHostTests(unittest.TestCase):
@@ -67,31 +68,34 @@ class StudentLinearCudaTests(unittest.TestCase):
         rx = x.detach().clone().requires_grad_(needs[0])
         rw = weight.detach().clone().requires_grad_(needs[1])
         actual, expected = student.linear(x, weight), reference.linear(rx, rw)
+        validator = LinearFp32Validator(x, weight)
         self.assertEqual(actual.shape, (*x.shape[:-1], weight.shape[0]))
         self.assertEqual(actual.dtype, torch.float32)
         self.assertTrue(actual.is_contiguous())
-        torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-4)
+        validator.forward(actual, expected)
         if use_sum:
+            upstream = torch.ones_like(actual)
             actual.sum().backward()
             expected.sum().backward()
         else:
             # A noncontiguous upstream also exercises the public autograd bridge.
-            upstream = torch.randn(*actual.shape[:-1], actual.shape[-1] * 2,
-                                   device='cuda')[..., ::2] * 0.1
+            upstream = (torch.randn(*actual.shape[:-1], actual.shape[-1] * 2,
+                                    device='cuda') * 0.1)[..., ::2]
             actual.backward(upstream)
             expected.backward(upstream)
+        indices = tuple(i for i, needed in enumerate(needs) if needed)
+        validator.backward(tuple(v.grad for v in (x, weight) if v.requires_grad),
+                           tuple(v.grad for v in (rx, rw) if v.requires_grad), upstream, indices)
         for value, target in ((x, rx), (weight, rw)):
             torch.testing.assert_close(value, target, atol=0, rtol=0)
-            if value.requires_grad:
-                torch.testing.assert_close(value.grad, target.grad, atol=3e-5, rtol=3e-4)
-            else:
+            if not value.requires_grad:
                 self.assertIsNone(value.grad)
         if check_inference:
             for context in (torch.no_grad, torch.inference_mode):
                 with context():
                     output = student.linear(x, weight)
                     self.assertFalse(output.requires_grad)
-                    torch.testing.assert_close(output, expected, atol=1e-5, rtol=1e-4)
+                    validator.forward(output, expected)
 
     def test_rectangular_tail_shapes_and_all_input_ranks(self):
         for shape, n in (((5,), 7), ((3, 17), 9), ((2, 17, 65), 97),
@@ -107,8 +111,8 @@ class StudentLinearCudaTests(unittest.TestCase):
             for batch, time in ((8, 512), (8, 1), (1, 1)):
                 with self.subTest(n=n, k=k, batch=batch, time=time):
                     self.check_values_and_gradients(
-                        torch.randn(batch, time, k, device='cuda') * 0.1,
-                        torch.randn(n, k, device='cuda') * 0.1)
+                        torch.randn(batch, time, k, device='cuda'),
+                        torch.randn(n, k, device='cuda'))
 
     def test_strides_offsets_last_only_and_single_trainable_input(self):
         xstore = torch.randn(2 * 5 * 17 + 3, device='cuda') * 0.1

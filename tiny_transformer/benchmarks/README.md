@@ -9,6 +9,7 @@
 | `cases.py` | 八个算子的形状、stride、常量参数、上游梯度缩放 |
 | `operators.py` / `__main__.py` | 统一 CLI、已实现阶段判断、结果输出 |
 | `embedding.py` | 四种 ID 分布和 embedding 专用 CLI；调用统一 runner |
+| `linear.py` | FP32 Linear 的独立 FP64 对照、逐元素舍入误差界和 RMS 校验；不参与计时 |
 | `model.py` | 完整模型请求的冷启动、稳态 TTFT/TPOT、吞吐与显存 |
 
 原 `tiny_transformer.benchmark_embedding` 和 `tiny_transformer.benchmark` 仅保留转发，
@@ -87,6 +88,14 @@ JSON 逐项记录实际 shape、stride、storage offset 和 dtype，last-only �
 
 1. 在计时前完成 JIT 编译和与 reference 的前向比较。需要测 backward 时，还检查每个可微输入的梯度。
    Embedding 前向要求精确相等；其他算子按 dtype 使用公用阈值，JSON 保存实际阈值与误差。
+   FP32 Linear 例外：cuBLAS 与 CUTLASS 的累加顺序不同，接近零的点积可能不满足统一的逐元素绝对容差。
+   两者分别与完整的 FP64 GEMM 对照，所有元素都须满足
+   `abs(result - fp64) <= gamma_L * (abs(A) @ abs(B)) + L * float32.tiny`，
+   其中 `u=2^-24`、`gamma_L=L*u/(1-L*u)`，L 是本次 GEMM 的归约长度。
+   同时要求 `RMS(result-fp64) <= 1e-5 + 1e-4 * RMS(fp64)`，防止长归约的最坏误差界过于宽松。
+   FP64 按输出行分块计算；前向、dX、dW 的 L 分别是 K、N、M。错误布局、非有限结果和超界误差直接失败。
+   JSON 的 `validation_policy=fp64_dot_product_bound_and_rms`、`forward_fp64`、`backward_fp64`
+   记录 candidate/reference 各自的最大绝对误差、最大误差/界限比和 RMS；这些检查不计入性能数据。
    RMSNorm 前向验证/计时使用 `no_grad`；反向计时保存每图的 R 并直接复用。H > 1024 时跳过反向。
 2. 两个后端都先预热；CUDA events 在计时区间外完成首次初始化。
    每轮用当前设备/stream 的 events 包围 repeats 次调用，得到每次调用的平均微秒数；

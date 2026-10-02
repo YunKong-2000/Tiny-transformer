@@ -29,7 +29,7 @@ def max_error(actual, expected):
 
 
 def prepare_calls(reference, candidate, inputs, grad_indices, *, phases=("forward", "backward"),
-                  upstream=None, upstream_scale=1.0, exact_forward=False):
+                  upstream=None, upstream_scale=1.0, exact_forward=False, validator=None):
     """Validate requested phases before timing; preserve input strides and constant args.
 
     Each backend gets separate detached leaves with the original storage layout.
@@ -50,9 +50,14 @@ def prepare_calls(reference, candidate, inputs, grad_indices, *, phases=("forwar
     # Output dtype can differ from input dtype (cross entropy accumulates FP32).
     dtype = next(x.dtype for x in inputs if torch.is_tensor(x) and x.is_floating_point())
     forward_tol, backward_tol = tolerances(dtype, exact_forward)
-    torch.testing.assert_close(actual, expected, atol=forward_tol[0], rtol=forward_tol[1])
-    errors = {"forward_max_abs_error": max_error(actual, expected),
-              "forward_atol": forward_tol[0], "forward_rtol": forward_tol[1]}
+    errors = {"forward_max_abs_error": max_error(actual, expected)}
+    if validator is None:
+        torch.testing.assert_close(actual, expected, atol=forward_tol[0], rtol=forward_tol[1])
+        errors.update(forward_atol=forward_tol[0], forward_rtol=forward_tol[1])
+    else:
+        errors.update(validation_policy=validator.policy,
+                      rms_atol=validator.rms_atol, rms_rtol=validator.rms_rtol,
+                      forward_fp64=validator.forward(actual, expected))
     calls = {}
     if "forward" in phases:
         calls["forward"] = (reference_forward, candidate_forward)
@@ -70,8 +75,11 @@ def prepare_calls(reference, candidate, inputs, grad_indices, *, phases=("forwar
 
         expected_graph, expected_leaves = graph(reference)
         actual_graph, actual_leaves = graph(candidate)
-        torch.testing.assert_close(actual_graph, expected_graph,
-                                   atol=forward_tol[0], rtol=forward_tol[1])
+        if validator is None:
+            torch.testing.assert_close(actual_graph, expected_graph,
+                                       atol=forward_tol[0], rtol=forward_tol[1])
+        else:
+            errors["grad_enabled_forward_fp64"] = validator.forward(actual_graph, expected_graph)
         if upstream is None:
             upstream = torch.randn_like(expected_graph) * upstream_scale
 
@@ -82,14 +90,18 @@ def prepare_calls(reference, candidate, inputs, grad_indices, *, phases=("forwar
             return torch.autograd.grad(actual_graph, actual_leaves, upstream, retain_graph=True)
 
         expected_grads, actual_grads = reference_backward(), candidate_backward()
+        if validator is not None:
+            errors["backward_fp64"] = validator.backward(actual_grads, expected_grads, upstream, grad_indices)
         gradient_errors = []
         for expected_grad, actual_grad in zip(expected_grads, actual_grads):
-            torch.testing.assert_close(actual_grad, expected_grad,
-                                       atol=backward_tol[0], rtol=backward_tol[1])
+            if validator is None:
+                torch.testing.assert_close(actual_grad, expected_grad,
+                                           atol=backward_tol[0], rtol=backward_tol[1])
             gradient_errors.append(max_error(actual_grad, expected_grad))
         errors.update(backward_max_abs_error=max(gradient_errors),
-                      backward_errors_by_input=dict(zip(grad_indices, gradient_errors)),
-                      backward_atol=backward_tol[0], backward_rtol=backward_tol[1])
+                      backward_errors_by_input=dict(zip(grad_indices, gradient_errors)))
+        if validator is None:
+            errors.update(backward_atol=backward_tol[0], backward_rtol=backward_tol[1])
         calls["backward"] = (reference_backward, candidate_backward)
     return calls, errors
 

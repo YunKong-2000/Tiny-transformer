@@ -11,6 +11,7 @@ from ..operators.dispatch import NAMES
 from ..runtime import DTYPES, device_for, environment, seed_all, validate_precision, write_json
 from .cases import make_case
 from .common import MEASUREMENT, measure_pair, prepare_calls
+from .linear import LinearFp32Validator
 from .embedding import PATTERNS
 
 
@@ -104,7 +105,9 @@ def run_case(operator, args, case, phases, implementation):
             torch.cuda.manual_seed(args.seed)
         calls, errors = prepare_calls(
             expected_function, candidate, case.inputs, case.grad_indices, phases=phases,
-            upstream_scale=case.upstream_scale, exact_forward=operator == "embedding")
+            upstream_scale=case.upstream_scale, exact_forward=operator == "embedding",
+            validator=LinearFp32Validator(*case.inputs)
+            if operator == "linear" and case.inputs[0].dtype == torch.float32 else None)
     result = {"validation": errors}
     for phase, functions in calls.items():
         result[phase] = {"status": "passed", **measure_pair(

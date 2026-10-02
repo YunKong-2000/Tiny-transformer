@@ -19,6 +19,12 @@ Linear 测试覆盖五种默认训练投影、batch=8/1 的 decode、非方形�
 输入/上游梯度的 stride、空维度、非法输入和非默认 stream。
 GPU 编译、数值和性能仍需在目标 CUDA 主机验收；CPU 测试替身不验证 CUTLASS。
 
+FP32 性能基准和 Linear CUDA 测试使用独立 FP64 结果校验 reference 和 student。
+由于累加顺序不同，不能仅凭接近零的元素相对误差很大就认定布局错误。
+每个结果须同时满足逐元素点积舍入界和 RMS 限制；性能 JSON 保留两种实现各自的误差。
+完整公式见 [性能测量说明](../../tiny_transformer/benchmarks/README.md#测量边界)。
+五种投影的测试输入使用未缩小的标准正态分布，与性能基准一致，避免小幅值输入掩盖舍入问题。
+
 ## 1. 接口与职责
 
 ```python

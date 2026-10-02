@@ -32,7 +32,7 @@ python -m unittest discover -s tests -p 'test_student_*.py' -v
 | `test_student_integration.py` | 已接入算子的 CPU 拒绝/延迟加载、native grad guard、deterministic 模式、模型梯度、prefill/decode；包含 Linear 的共享权重梯度和缓存推理，Linear/RoPE/SwiGLU 仅测 FP32 |
 | `test_operators.py` | reference 数学定义、double gradcheck、SDPA、算子分发契约 |
 | `test_model.py` | 模型结构、因果性、文档隔离、reference KV cache、训练和 compile 基础行为 |
-| `test_benchmarks.py` | 公共测量框架自身：输入分布、校验后计时、反向不重跑前向、采样顺序、统计与跳过规则 |
+| `test_benchmarks.py` | 公共测量框架自身：输入分布、校验后计时、反向不重跑前向、采样顺序、统计与跳过规则；Linear FP64 判据接受舍入差异并拒绝错误结果 |
 | `test_data_training.py` | 数据准备、packing、tokenizer、续训一致性 |
 | `test_offline_bundle.py` | 离线文件校验与路径合法性 |
 | `test_cutlass.py` | CUTLASS/CuTe 路径、离线依赖及真实 CUDA 编译/执行（无 GPU 时跳过后者） |

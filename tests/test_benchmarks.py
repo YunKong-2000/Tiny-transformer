@@ -8,6 +8,7 @@ import torch
 
 from tiny_transformer.benchmarks import common
 from tiny_transformer.benchmarks.cases import make_case
+from tiny_transformer.benchmarks.linear import LinearFp32Validator
 from tiny_transformer.benchmarks.embedding import PATTERNS, make_ids
 from tiny_transformer.benchmarks.operators import build_parser, run, run_case, unsupported_reason, validate_args
 from tiny_transformer.operators import reference, student
@@ -127,6 +128,76 @@ class BenchmarkHostTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             common.prepare_calls(reference.residual, WrongSecondGradient.apply, inputs, (0, 1),
                                  upstream=torch.ones_like(inputs[0]))
+
+    def test_linear_fp64_validator_accepts_fp32_accumulation_order_differences(self):
+        # A deterministic cancellation example: the tiny terms are lost when
+        # accumulated after 1.0, but retained by FP64. A second output remains 1.
+        # This checks validation arithmetic, not a replacement CUDA kernel.
+        x = torch.ones(1, 1, 768)
+        weight = torch.zeros(2, 768)
+        weight[0, 0], weight[0, -1] = 1, -1
+        weight[0, 1:-1] = 2**-25
+        weight[1, 0] = 1
+        sequential = torch.zeros(1, 1, 2)
+        for k in range(768):
+            sequential.addcmul_(x[..., k:k+1], weight[:, k])
+        oracle = reference.linear(x.double(), weight.double()).float()
+        with self.assertRaises(AssertionError):
+            torch.testing.assert_close(sequential, oracle, atol=1e-5, rtol=1e-4)
+        report = LinearFp32Validator(x, weight).forward(sequential, oracle)
+        self.assertGreater(report['candidate']['max_abs_error'], 1e-5)
+        self.assertLess(report['candidate']['max_roundoff_ratio'], 1)
+
+    def test_linear_fp64_validator_rejects_layout_errors_nan_and_bad_gradients(self):
+        x, weight = torch.randn(2, 3, 65), torch.randn(17, 65)
+        expected = reference.linear(x.double(), weight.double()).float()
+        validator = LinearFp32Validator(x, weight)
+        wrong_layout = expected.flip(-1)
+        corrupted = expected.clone()
+        corrupted[0, 0, 0] += 0.1
+        nonfinite = expected.clone()
+        nonfinite[0, 0, 0] = float('nan')
+        for actual in (wrong_layout, corrupted, nonfinite, expected.double()):
+            with self.subTest(kind=actual.dtype), self.assertRaises(AssertionError):
+                validator.forward(actual, expected)
+        # The reference is independently checked, too.
+        with self.assertRaises(AssertionError):
+            validator.forward(expected, corrupted)
+        upstream = torch.randn_like(expected)
+        dx = (upstream.double() @ weight.double()).float()
+        dw = (upstream.flatten(0, 1).double().T @ x.flatten(0, 1).double()).float()
+        report = validator.backward((dx, dw), (dx, dw), upstream, (0, 1))
+        self.assertEqual(report['0']['reduction_length'], 17)
+        self.assertEqual(report['1']['reduction_length'], 6)
+        for grads in ((dx + 1, dw), (dx, dw + 1)):
+            with self.assertRaises(AssertionError):
+                validator.backward(grads, (dx, dw), upstream, (0, 1))
+
+    def test_linear_fp64_rms_gate_rejects_errors_within_loose_roundoff_bound(self):
+        # For a long reduction the worst-case bound alone is too permissive.
+        x, weight = torch.ones(1, 1, 4096), torch.ones(1, 4096)
+        expected = torch.full((1, 1, 1), 4096.)
+        with self.assertRaisesRegex(AssertionError, 'RMS limit'):
+            LinearFp32Validator(x, weight).forward(expected + 0.75, expected)
+
+    def test_linear_fp64_validation_is_outside_retained_timing_calls(self):
+        x, weight = torch.randn(2, 3, 17), torch.randn(9, 17)
+        validator = LinearFp32Validator(x, weight)
+        with patch.object(validator, 'forward', wraps=validator.forward) as forward, \
+                patch.object(validator, 'backward', wraps=validator.backward) as backward:
+            calls, errors = common.prepare_calls(reference.linear, reference.linear, (x, weight),
+                                                 (0, 1), validator=validator)
+            self.assertEqual(forward.call_count, 2)
+            self.assertEqual(backward.call_count, 1)
+            forward.reset_mock()
+            backward.reset_mock()
+            for phase in ('forward', 'backward'):
+                for function in calls[phase]:
+                    function()
+            forward.assert_not_called()
+            backward.assert_not_called()
+        self.assertEqual(errors['validation_policy'], validator.policy)
+        self.assertIn('candidate', errors['forward_fp64'])
 
     def test_event_measurement_alternates_order_and_reports_trials(self):
         order = []
