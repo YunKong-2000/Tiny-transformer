@@ -115,6 +115,19 @@ class StudentLinearCudaTests(unittest.TestCase):
                     torch.randn(1, m, 65, device='cuda'),
                     torch.randn(97, 65, device='cuda'), check_inference=True)
 
+    @torch.no_grad()
+    def test_small_m_shared_memory_mapping_with_exact_integer_products(self):
+        # These small integers make all FP32 partial sums exact, so a mismatch
+        # cannot be explained by accumulation order. Exercise K-stage reuse,
+        # M/N tails and the reported LM-head failure without tolerance relaxation.
+        for m, n, k in ((8, 33, 8), (9, 65, 17), (8, 8192, 768)):
+            with self.subTest(m=m, n=n, k=k):
+                x = ((torch.arange(m * k, device='cuda') % 7) - 3).float().view(1, m, k)
+                weight = ((torch.arange(n * k, device='cuda') % 5) - 2).float().view(n, k)
+                expected = reference.linear(x.double(), weight.double()).float()
+                for _ in range(3):
+                    torch.testing.assert_close(student.linear(x, weight), expected, atol=0, rtol=0)
+
     def test_five_model_projections_training_and_decode(self):
         for n, k in ((2304, 768), (768, 768), (4096, 768), (768, 2048), (8192, 768)):
             for batch, time in ((8, 512), (8, 1), (1, 1)):

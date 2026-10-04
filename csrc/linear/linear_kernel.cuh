@@ -12,8 +12,23 @@ using BackwardWarpShape = cutlass::gemm::GemmShape<32, 64, 8>;
 using BackwardInstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
 
 using InferenceCTAShape = cutlass::gemm::GemmShape<8, 32, 8>;
-using InferenceWarpShape = cutlass::gemm::GemmShape<4, 16, 8>;
+using InferenceWarpShape = cutlass::gemm::GemmShape<8, 32, 8>;
 using InferenceInstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
+
+// This two-stage scalar SIMT path stores shared-memory fragments without a
+// tile predicate. Each operand tile must distribute evenly over the CTA threads.
+// CTA<8,32,8> / Warp<4,16,8> gives 128 threads for only 64 A elements,
+// causing excess shared-memory stores to overlap valid A data.
+static_assert(InferenceCTAShape::kM % InferenceWarpShape::kM == 0 &&
+              InferenceCTAShape::kN % InferenceWarpShape::kN == 0 &&
+              InferenceCTAShape::kK == InferenceWarpShape::kK,
+              "Small-M SIMT tiles must divide evenly with no warp partition along K");
+constexpr int kInferenceThreads = 32 *
+    (InferenceCTAShape::kM / InferenceWarpShape::kM) *
+    (InferenceCTAShape::kN / InferenceWarpShape::kN);
+static_assert((InferenceCTAShape::kM * InferenceCTAShape::kK) % kInferenceThreads == 0 &&
+              (InferenceCTAShape::kN * InferenceCTAShape::kK) % kInferenceThreads == 0,
+              "Small-M SIMT operand tiles must contain a whole number of elements per CTA thread");
 
 using OpClass = cutlass::arch::OpClassSimt;
 using SmArch = cutlass::arch::Sm80;
