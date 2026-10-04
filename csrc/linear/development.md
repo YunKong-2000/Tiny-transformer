@@ -62,3 +62,28 @@ linear decode down contiguous forward M,N,K=[8, 768, 2048]: reference=32.50 us, 
 linear decode lm_head contiguous forward M,N,K=[8, 8192, 768]: reference=30.46 us, student=55.51 us, speedup=0.55x
 saved runs/linear-performance.json
 测试结果显示，对于小M场景的矩阵乘法的性能下降程度明显缓解，但是还是较差。
+## 修改了small-M kernle的CTAShape和WarpShape，减小tile_N来增加CTA数量，增加tile_K减小循环次数
+设定CTAShape为<8, 32, 16>，WarpShape为<8, 16, 16>,测试结果如下  
+root@8cfa9e1a2f81:/workspace/tiny-transformer# python -m tiny_transformer.benchmarks --operator linear --output runs/linear-performance-CTA8-32-16.json --device cuda:1
+linear train qkv contiguous forward M,N,K=[4096, 2304, 768]: reference=809.52 us, student=887.48 us, speedup=0.91x
+linear train qkv contiguous backward dX=[4096, 768, 2304], dW=[2304, 768, 4096]: reference=1688.90 us, student=2221.29 us, speedup=0.76x
+linear train o contiguous forward M,N,K=[4096, 768, 768]: reference=292.58 us, student=299.95 us, speedup=0.98x
+linear train o contiguous backward dX=[4096, 768, 768], dW=[768, 768, 4096]: reference=616.86 us, student=832.62 us, speedup=0.74x
+linear train gate_up contiguous forward M,N,K=[4096, 4096, 768]: reference=1409.16 us, student=1476.45 us, speedup=0.95x
+linear train gate_up contiguous backward dX=[4096, 768, 4096], dW=[4096, 768, 4096]: reference=3162.50 us, student=3712.97 us, speedup=0.85x
+linear train down contiguous forward M,N,K=[4096, 768, 2048]: reference=724.64 us, student=782.18 us, speedup=0.93x
+linear train down contiguous backward dX=[4096, 2048, 768], dW=[768, 2048, 4096]: reference=1505.30 us, student=1966.99 us, speedup=0.77x
+linear train lm_head contiguous forward M,N,K=[4096, 8192, 768]: reference=2879.33 us, student=2850.28 us, speedup=1.01x
+linear train lm_head contiguous backward dX=[4096, 768, 8192], dW=[8192, 768, 4096]: reference=5920.91 us, student=6946.37 us, speedup=0.85x
+linear prefill qkv contiguous forward M,N,K=[4096, 2304, 768]: reference=822.84 us, student=896.27 us, speedup=0.92x
+linear prefill o contiguous forward M,N,K=[4096, 768, 768]: reference=292.73 us, student=300.40 us, speedup=0.97x
+linear prefill gate_up contiguous forward M,N,K=[4096, 4096, 768]: reference=1429.17 us, student=1496.55 us, speedup=0.95x
+linear prefill down contiguous forward M,N,K=[4096, 768, 2048]: reference=731.84 us, student=787.18 us, speedup=0.93x
+linear prefill lm_head contiguous forward M,N,K=[8, 8192, 768]: reference=30.60 us, student=33.30 us, speedup=0.92x
+linear decode qkv contiguous forward M,N,K=[8, 2304, 768]: reference=30.74 us, student=31.38 us, speedup=0.98x
+linear decode o contiguous forward M,N,K=[8, 768, 768]: reference=30.39 us, student=31.60 us, speedup=0.96x
+linear decode gate_up contiguous forward M,N,K=[8, 4096, 768]: reference=30.96 us, student=31.84 us, speedup=0.97x
+linear decode down contiguous forward M,N,K=[8, 768, 2048]: reference=31.61 us, student=60.09 us, speedup=0.53x
+linear decode lm_head contiguous forward M,N,K=[8, 8192, 768]: reference=30.31 us, student=33.09 us, speedup=0.92x
+saved runs/linear-performance-CTA8-32-16.json
+推理阶段已经十分接近参考实现的性能，但是Down阶段的性能还是较差
