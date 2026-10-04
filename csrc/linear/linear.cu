@@ -13,8 +13,12 @@ constexpr int kSplitKSlices = 8;
 
 enum class ForwardKind { Large, Small, SplitK };
 ForwardKind forward_kind(int M, int K) {
-  return M >= kSmallMThreshold ? ForwardKind::Large :
-      (K >= kSplitKThreshold ? ForwardKind::SplitK : ForwardKind::Small);
+  if (M >= kSmallMThreshold) return ForwardKind::Large;
+  // A tuning threshold of zero must still respect the split-K tile minimum.
+  const bool has_full_partitions =
+      K / InferenceSplitKGemm::ThreadblockShape::kK >= kSplitKSlices;
+  return K >= kSplitKThreshold && has_full_partitions
+      ? ForwardKind::SplitK : ForwardKind::Small;
 }
 
 // Both forward kernels use the same layouts; only the GEMM type changes.

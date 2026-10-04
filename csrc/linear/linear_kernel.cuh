@@ -42,7 +42,7 @@ using EpilogueOp = cutlass::epilogue::thread::LinearCombination< float, 1, float
 using SwizzleOp = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
 
 using SplitKConvertOp = cutlass::epilogue::thread::Convert< float, 1, float>;
-using SplitKReduction = cutlass::reduciton::thread::ReduceAdd<float, float, 1>;
+using SplitKReduction = cutlass::reduction::thread::ReduceAdd<float, float, 1>;
 
 constexpr int kAlignmentA = 1;
 constexpr int kAlignmentB = 1;

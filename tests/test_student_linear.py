@@ -139,6 +139,8 @@ class StudentLinearCudaTests(unittest.TestCase):
     @torch.no_grad()
     def test_prepared_kernel_outputs_match_production_and_graph_replay(self):
         for m, n, k, kind in ((8, 33, 17, 'small_m'), (128, 33, 17, 'large_m'),
+                              (8, 65, 127, 'small_m'), (8, 65, 128, 'split_k'),
+                              (8, 65, 129, 'split_k'), (128, 65, 128, 'large_m'),
                               (8, 65, 2049, 'split_k')):
             with self.subTest(kind=kind):
                 x = torch.randn(1, m, k, device='cuda')
@@ -197,10 +199,10 @@ class StudentLinearCudaTests(unittest.TestCase):
         self.assertIn('dweight', reference_result)
 
     def test_split_k_dispatch_boundaries_and_reduction_tail(self):
-        # K=2047 selects ordinary small-M GEMM; 2048/2049 select split-K.
+        # Eight K tiles require K>=128; smaller K must use ordinary GEMM.
         # M=128 switches back to the large-M kernel. Odd N tests reduction tails.
         for m in (1, 8, 127, 128):
-            for k in (2047, 2048, 2049):
+            for k in (127, 128, 129, 2047, 2048, 2049):
                 with self.subTest(m=m, k=k):
                     self.check_values_and_gradients(
                         torch.randn(1, m, k, device='cuda'),
@@ -215,7 +217,7 @@ class StudentLinearCudaTests(unittest.TestCase):
         # non-tile-aligned element. Small integer products sum exactly in FP32.
         rows = torch.arange(1, m + 1, device='cuda').float()
         columns = torch.arange(1, n + 1, device='cuda').float()
-        for coordinate, coefficient in ((0, 1), (1024, 2), (2048, 4)):
+        for coordinate, coefficient in ((0, 1), (256, 2), (2048, 4)):
             x[0, :, coordinate] = rows
             weight[:, coordinate] = coefficient * columns
         expected = (7 * rows[:, None] * columns[None, :]).unsqueeze(0)
