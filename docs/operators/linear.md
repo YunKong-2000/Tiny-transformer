@@ -25,7 +25,10 @@ FP32 性能基准和 Linear CUDA 测试使用独立 FP64 结果校验 reference 
 完整公式见 [性能测量说明](../../tiny_transformer/benchmarks/README.md#测量边界)。
 五种投影的测试输入使用未缩小的标准正态分布，与性能基准一致，避免小幅值输入掩盖舍入问题。
 
-小 M 配置使用 `CTA<8,32,8>`、`Warp<8,32,8>`（每 CTA 一个 warp）。
+小 M 的 K_tile=8 基线使用 `CTA<8,32,8>`、`Warp<8,32,8>`（每 CTA 一个 warp）。
+当前 K_tile=16 调优配置使用 `CTA<8,32,16>`、`Warp<8,16,16>`（每 CTA 两个 warp），
+尚需 GPU 编译、正确性及性能验证。K_tile=16 时共享内存 padding 为 2，必须同时能被 LaneM/LaneN 整除；
+`Warp<8,32,16>` 的 LaneN=4 不满足约束，不能只增大原配置的 K。
 当前两级、标量访问的 SIMT 路径需要操作数 tile 的元素数能被 CTA 线程数整除，头文件已增加检查。
 例如 `Warp<4,16,8>` 会产生 128 个线程，但 A tile 只有 64 个元素；这版共享内存写入
 不屏蔽多余线程，会覆盖有效 A 数据。`can_implement` 不会检查这种内部线程映射问题。
