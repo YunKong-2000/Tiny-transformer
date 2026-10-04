@@ -2,6 +2,7 @@
 
 #include "linear.h"
 #include "cutlass/gemm/device/gemm.h"
+#include "cutlass/gemm/device/gemm_splitk_parallel.h"
 
 using TrainingForwardCTAShape = cutlass::gemm::GemmShape<128, 128, 8>;
 using TrainingForwardWarpShape = cutlass::gemm::GemmShape<32, 64, 8>;
@@ -39,6 +40,10 @@ using Operator = cutlass::arch::OpMultiplyAdd;
 
 using EpilogueOp = cutlass::epilogue::thread::LinearCombination< float, 1, float, float>;
 using SwizzleOp = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
+
+// Preserve FP32 partial sums until the final reduction/epilogue.
+using SplitKConvertOp = cutlass::epilogue::thread::Convert<float, 1, float>;
+using SplitKReduction = cutlass::reduction::thread::ReduceAdd<float, float, 1>;
 
 constexpr int kAlignmentA = 1;
 constexpr int kAlignmentB = 1;
@@ -117,5 +122,25 @@ using InferenceGemm = cutlass::gemm::device::Gemm<
     kAlignmentA,
     kAlignmentB,
     false,
+    Operator
+    >;
+
+using InferenceSplitKGemm = cutlass::gemm::device::GemmSplitKParallel<
+    float, cutlass::layout::RowMajor,
+    float, cutlass::layout::ColumnMajor,
+    float, cutlass::layout::RowMajor,
+    float,
+    OpClass,
+    SmArch,
+    InferenceCTAShape,
+    InferenceWarpShape,
+    InferenceInstructionShape,
+    EpilogueOp,
+    SplitKConvertOp,
+    SplitKReduction,
+    SwizzleOp,
+    kStages,
+    1,
+    1,
     Operator
     >;

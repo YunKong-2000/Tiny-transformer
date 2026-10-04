@@ -6,6 +6,8 @@
 
 namespace {
 constexpr int kSmallMThreshold = 128;
+constexpr int kSplitKThreshold = 2048;
+constexpr int kSplitKSlices = 2;
 
 // Both forward kernels use the same layouts; only the GEMM type changes.
 // Gemm::Arguments is a dependent type, so it requires typename here.
@@ -28,6 +30,40 @@ void launch_linear_forward(const torch::Tensor& x, const torch::Tensor& weight,
   TORCH_CHECK(status == cutlass::Status::kSuccess,
               "Forward GEMM launch: ", cutlassGetStatusString(status));
 }
+
+void launch_linear_split_k(const torch::Tensor& x, const torch::Tensor& weight,
+                           const torch::Tensor& output, int M, int N, int K,
+                           cudaStream_t stream) {
+  using Gemm = InferenceSplitKGemm;
+  static_assert(kSplitKSlices > 1, "Use ordinary GEMM for a single K partition");
+  // This CUTLASS version's can_implement() unconditionally returns success.
+  // Ensure each partition receives at least one full K tile ourselves.
+  TORCH_CHECK(K / Gemm::ThreadblockShape::kK >= kSplitKSlices,
+              "Split-K requires at least one full K tile per partition");
+  Gemm::Arguments args{
+    {M, N, K},
+    {x.data_ptr<float>(), K},
+    {weight.data_ptr<float>(), K},
+    {output.data_ptr<float>(), N},
+    {output.data_ptr<float>(), N},
+    {1.0f, 0.0f},
+    kSplitKSlices
+  };
+  const size_t workspace_size = Gemm::get_workspace_size(args);
+  TORCH_CHECK(workspace_size <= static_cast<size_t>(std::numeric_limits<int64_t>::max()),
+              "Split-K workspace size exceeds int64 range");
+  // The caller supplies PyTorch's current stream under the input device guard.
+  // Same-stream allocation/use lets the caching allocator manage async lifetime;
+  // all partials are overwritten, so no workspace zeroing or synchronization.
+  auto workspace = torch::empty(
+      {static_cast<int64_t>(workspace_size)}, x.options().dtype(torch::kUInt8));
+  Gemm gemm_op;
+  auto status = gemm_op(args, workspace.data_ptr<uint8_t>(), stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "Split-K GEMM launch: ", cutlassGetStatusString(status));
+}
+
+
 } // namespace
 
 
@@ -45,7 +81,11 @@ torch::Tensor linear_forward(torch::Tensor x, torch::Tensor weight) {
   const int K = static_cast<int>(weight.size(1));
 
   if (M < kSmallMThreshold) {
-    launch_linear_forward<InferenceGemm>(x, weight, output, M, N, K, stream.stream());
+    if (K >= kSplitKThreshold) {
+      launch_linear_split_k(x, weight, output, M, N, K, stream.stream());
+    } else {
+      launch_linear_forward<InferenceGemm>(x, weight, output, M, N, K, stream.stream());
+    }
   } else {
     launch_linear_forward<ForwardGemm>(x, weight, output, M, N, K, stream.stream());
   }

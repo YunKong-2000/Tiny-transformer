@@ -34,6 +34,12 @@ FP32 性能基准和 Linear CUDA 测试使用独立 FP64 结果校验 reference 
 不屏蔽多余线程，会覆盖有效 A 数据。`can_implement` 不会检查这种内部线程映射问题。
 新增小整数精确结果测试覆盖共享内存 stage 复用、尾块和 `[8,8192,768]` 的 LM head 场景。
 
+前向在 `M<128 && K>=2048` 时使用两路 `GemmSplitKParallel`，其余小 M 使用普通 GEMM，
+大 M 配置和反向不变。部分和与归约均为 FP32；workspace 通过 PyTorch allocator 在当前流分配，
+不额外清零或同步，分区 GEMM 和最终归约均在当前流执行。两路所需 workspace 为 `2*M*N*sizeof(float)`。
+测试覆盖 `K=2047/2048/2049`、`M=1/8/127/128`、奇数 N、两分区与最后一个 K 元素的精确贡献，
+以及非默认流和重复调用下的 workspace 生命周期。split-K 修改仍需在 CUDA 主机编译与验证。
+
 ## 1. 接口与职责
 
 ```python

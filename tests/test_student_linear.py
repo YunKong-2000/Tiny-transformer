@@ -136,6 +136,57 @@ class StudentLinearCudaTests(unittest.TestCase):
                         torch.randn(batch, time, k, device='cuda'),
                         torch.randn(n, k, device='cuda'))
 
+    def test_split_k_dispatch_boundaries_and_reduction_tail(self):
+        # K=2047 selects ordinary small-M GEMM; 2048/2049 select split-K.
+        # M=128 switches back to the large-M kernel. Odd N tests reduction tails.
+        for m in (1, 8, 127, 128):
+            for k in (2047, 2048, 2049):
+                with self.subTest(m=m, k=k):
+                    self.check_values_and_gradients(
+                        torch.randn(1, m, k, device='cuda'),
+                        torch.randn(65, k, device='cuda'), check_inference=True)
+
+    @torch.no_grad()
+    def test_split_k_exact_partitions_repeated_calls_and_last_k_element(self):
+        m, n, k = 8, 65, 2049
+        x = torch.zeros(1, m, k, device='cuda')
+        weight = torch.zeros(n, k, device='cuda')
+        # Exercise the first partition, the start of the second, and the final
+        # non-tile-aligned element. Small integer products sum exactly in FP32.
+        rows = torch.arange(1, m + 1, device='cuda').float()
+        columns = torch.arange(1, n + 1, device='cuda').float()
+        for coordinate, coefficient in ((0, 1), (1024, 2), (2048, 4)):
+            x[0, :, coordinate] = rows
+            weight[:, coordinate] = coefficient * columns
+        expected = (7 * rows[:, None] * columns[None, :]).unsqueeze(0)
+        for _ in range(3):
+            torch.testing.assert_close(student.linear(x, weight), expected, atol=0, rtol=0)
+        # All partial sums must be overwritten on subsequent calls, not reused.
+        x.zero_()
+        torch.testing.assert_close(student.linear(x, weight), torch.zeros_like(expected), atol=0, rtol=0)
+
+    @torch.no_grad()
+    def test_split_k_workspace_on_nondefault_stream(self):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            m, n, k = 8, 65, 2049
+            x = torch.empty(1, m, k, device='cuda')
+            weight = torch.empty(n, k, device='cuda')
+            torch.cuda._sleep(1_000_000)
+            weight.fill_(0.5)
+            outputs = []
+            for fill in (0.25, -0.5, 0.0):
+                x.fill_(fill)
+                outputs.append(student.linear(x, weight))
+                # Reuse-sized allocator activity after the local workspace is
+                # released must remain ordered after both split-K kernels.
+                torch.empty(2 * m * n, device='cuda').fill_(123.)
+            consumed = [output.clone() for output in outputs]
+        stream.synchronize()
+        for output, fill in zip(consumed, (0.25, -0.5, 0.0)):
+            torch.testing.assert_close(output, torch.full_like(output, k * fill * 0.5), atol=0, rtol=0)
+
     def test_strides_offsets_last_only_and_single_trainable_input(self):
         xstore = torch.randn(2 * 5 * 17 + 3, device='cuda') * 0.1
         wstore = torch.randn(23 * 17 + 5, device='cuda') * 0.1
