@@ -106,6 +106,15 @@ class StudentLinearCudaTests(unittest.TestCase):
                     torch.randn(n, shape[-1], device='cuda') * 0.1,
                     use_sum=True, check_inference=True)
 
+    def test_forward_dispatch_boundaries_and_tail_tiles(self):
+        # Cross both the small CTA's M tile and the runtime dispatch threshold.
+        # Odd N/K exercise masked columns and the final reduction tile.
+        for m in (7, 8, 9, 127, 128, 129):
+            with self.subTest(m=m):
+                self.check_values_and_gradients(
+                    torch.randn(1, m, 65, device='cuda'),
+                    torch.randn(97, 65, device='cuda'), check_inference=True)
+
     def test_five_model_projections_training_and_decode(self):
         for n, k in ((2304, 768), (768, 768), (4096, 768), (768, 2048), (8192, 768)):
             for batch, time in ((8, 512), (8, 1), (1, 1)):

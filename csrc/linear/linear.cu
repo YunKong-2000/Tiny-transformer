@@ -4,6 +4,33 @@
 #include "c10/cuda/CUDAStream.h"
 #include "c10/cuda/CUDAGuard.h"
 
+namespace {
+constexpr int kSmallMThreshold = 128;
+
+// Both forward kernels use the same layouts; only the GEMM type changes.
+// Gemm::Arguments is a dependent type, so it requires typename here.
+template <typename Gemm>
+void launch_linear_forward(const torch::Tensor& x, const torch::Tensor& weight,
+                           const torch::Tensor& output, int M, int N, int K,
+                           cudaStream_t stream) {
+  typename Gemm::Arguments args({M, N, K},
+                              {x.data_ptr<float>(), K},
+                              {weight.data_ptr<float>(), K},
+                              {output.data_ptr<float>(), N},
+                              {output.data_ptr<float>(), N},
+                              {1.0f, 0.0f});
+  auto status = Gemm::can_implement(args);
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "Forward GEMM arguments: ", cutlassGetStatusString(status));
+
+  Gemm gemm_op;
+  status = gemm_op(args, nullptr, stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "Forward GEMM launch: ", cutlassGetStatusString(status));
+}
+} // namespace
+
+
 torch::Tensor linear_forward(torch::Tensor x, torch::Tensor weight) {
   check_inputs_forward(x, weight);
   TORCH_CHECK(!c10::GradMode::is_enabled() || !(x.requires_grad() || weight.requires_grad()),
@@ -13,25 +40,15 @@ torch::Tensor linear_forward(torch::Tensor x, torch::Tensor weight) {
   if (output.numel() == 0) return output;
   if (weight.size(1) == 0) return output.zero_();
   const auto stream = c10::cuda::getCurrentCUDAStream(x.get_device());
-
   const int M = static_cast<int>(x.size(0) * x.size(1));
   const int N = static_cast<int>(weight.size(0));
   const int K = static_cast<int>(weight.size(1));
 
-  ForwardGemm gemm_op;
-  ForwardGemm::Arguments args({M, N, K},
-                              {x.data_ptr<float>(), K},
-                              {weight.data_ptr<float>(), K},
-                              {output.data_ptr<float>(), N},
-                              {output.data_ptr<float>(), N},
-                              {1.0f, 0.0f});
-  auto status = ForwardGemm::can_implement(args);
-  TORCH_CHECK(status == cutlass::Status::kSuccess,
-              "Forward GEMM arguments: ", cutlassGetStatusString(status));
-
-  status = gemm_op(args, nullptr, stream.stream());
-  TORCH_CHECK(status == cutlass::Status::kSuccess,
-              "Forward GEMM launch: ", cutlassGetStatusString(status));
+  if (M < kSmallMThreshold) {
+    launch_linear_forward<InferenceGemm>(x, weight, output, M, N, K, stream.stream());
+  } else {
+    launch_linear_forward<ForwardGemm>(x, weight, output, M, N, K, stream.stream());
+  }
   return output;
 }
 

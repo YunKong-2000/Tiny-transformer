@@ -11,6 +11,10 @@ using BackwardCTAShape = cutlass::gemm::GemmShape<64, 64, 8>;
 using BackwardWarpShape = cutlass::gemm::GemmShape<32, 64, 8>;
 using BackwardInstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
 
+using InferenceCTAShape = cutlass::gemm::GemmShape<8, 64, 8>;
+using InferenceWarpShape = cutlass::gemm::GemmShape<8, 32, 8>;
+using InferenceInstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
+
 using OpClass = cutlass::arch::OpClassSimt;
 using SmArch = cutlass::arch::Sm80;
 using Operator = cutlass::arch::OpMultiplyAdd;
@@ -75,6 +79,25 @@ using BackwardGemmW = cutlass::gemm::device::Gemm<
     kStages,
     kAlignmentB,
     kAlignmentA,
+    false,
+    Operator
+    >;
+
+using InferenceGemm = cutlass::gemm::device::Gemm<
+    float, cutlass::layout::RowMajor,
+    float, cutlass::layout::ColumnMajor,
+    float, cutlass::layout::RowMajor,
+    float,
+    OpClass,
+    SmArch,
+    InferenceCTAShape,
+    InferenceWarpShape,
+    InferenceInstructionShape,
+    EpilogueOp,
+    SwizzleOp,
+    kStages,
+    kAlignmentA,
+    kAlignmentB,
     false,
     Operator
     >;
