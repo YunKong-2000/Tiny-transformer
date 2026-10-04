@@ -156,8 +156,13 @@ python -m tiny_transformer.benchmarks --operator linear \
   --output runs/linear-performance.json
 ```
 
-默认按 QKV、O、Gate/Up、Down、LM head 五种投影展开，共 15 组 case、20 项计时：
-训练每种投影分别测 forward 和完整 backward（dX+dWeight），推理 prefill/decode 只测 forward。
+默认按 QKV、O、Gate/Up、Down、LM head 五种投影展开，共 15 组 case。
+默认 `--linear-timing kernel` 在预分配后用 CUDA Graph/Event 分别测 forward、dx、dweight，
+推理 prefill/decode 只测 forward，共 25 项成对计时。split-K 前向还报告分区 GEMM 和归约，
+默认 decode Down 因此增加两项 student 计时。所有 GEMM 报告微秒、FLOP/s、TFLOP/s；
+FMA 计 2 FLOPs，完整 GEMM 按 `2MNK` 计算，归约按从零累加 S 个部分和的 `SMN` 次加法计算。
+`--linear-timing operator` 保留原始完整调用模式，包含分配和 autograd 调度，仍为 20 项计时。
+两种模式的时间不能直接作为同口径加速比；CUDA Graph 时间也包含设备调度间隙。
 prefill 的 LM head 按 `last_only=True` 使用 M=B，其余 block 投影使用 M=B*T。
 终端与 JSON 均标明投影和问题规模；训练同时记录前向、dX、dWeight 三组 GEMM 尺寸。
 默认推理 batch 与训练相同，可用 `--inference-batch-size 1` 单独测试小 batch 推理。

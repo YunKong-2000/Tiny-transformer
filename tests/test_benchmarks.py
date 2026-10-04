@@ -9,6 +9,7 @@ import torch
 from tiny_transformer.benchmarks import common
 from tiny_transformer.benchmarks.cases import LINEAR_PROJECTIONS, linear_spec, make_case
 from tiny_transformer.benchmarks.linear import LinearFp32Validator
+from tiny_transformer.benchmarks.linear_kernels import measure_graph_calls, paired_report, throughput
 from tiny_transformer.benchmarks.embedding import PATTERNS, make_ids
 from tiny_transformer.benchmarks.operators import build_parser, run, run_case, unsupported_reason, validate_args
 from tiny_transformer.operators import reference, student
@@ -20,7 +21,7 @@ def small_args(*extra):
         '--operator', 'all', '--batch-size', '2', '--seq-length', '3',
         '--dim', '8', '--heads', '2', '--hidden-dim', '12', '--out-features', '10',
         '--vocab-size', '17', '--patterns', 'random', '--warmup', '2',
-        '--repeats', '2', '--trials', '3', *extra])
+        '--repeats', '2', '--trials', '3', '--linear-timing', 'operator', *extra])
 
 
 class BenchmarkHostTests(unittest.TestCase):
@@ -44,6 +45,69 @@ class BenchmarkHostTests(unittest.TestCase):
                     self.assertEqual(ids.unique().numel(), ids.numel())
                 elif pattern == "hot":
                     self.assertLess(ids.max().item(), 4)
+
+    def test_kernel_throughput_units_and_pair_report(self):
+        metrics = throughput(2_000_000, 10.)
+        self.assertEqual(metrics['flops_per_second'], 2e11)
+        self.assertEqual(metrics['tflops_per_second'], 0.2)
+        report = paired_report([{'us': 20., 'trials_us': [19., 20., 21.]},
+                                {'us': 10., 'trials_us': [9., 10., 11.]}], 2_000_000)
+        self.assertEqual(report['speedup'], 2.)
+        self.assertEqual(report['candidate_flops_per_second'], 2e11)
+        self.assertEqual(report['reference_tflops_per_second'], 0.1)
+        for invalid in (0, -1, float('nan'), float('inf')):
+            with self.assertRaises(ValueError):
+                throughput(1, invalid)
+
+    def test_graph_measurement_replays_without_reentering_host_callables(self):
+        order = []
+        functions = (Mock(), Mock())
+        graphs = [Mock(), Mock()]
+        graphs[0].replay.side_effect = lambda: order.append(0)
+        graphs[1].replay.side_effect = lambda: order.append(1)
+        start, end = Mock(), Mock()
+        start.elapsed_time.side_effect = [4, 2, 6, 8, 12, 10]
+        with patch('tiny_transformer.benchmarks.linear_kernels.capture_repeated', side_effect=graphs) as capture, \
+                patch.object(torch.cuda, 'Event', side_effect=(start, end)):
+            result = measure_graph_calls(functions, 'cuda:1', 3, 2, 3)
+        self.assertEqual(order, [0, 1, 1, 0, 0, 1])
+        self.assertEqual(result[0], {'us': 4000., 'trials_us': [2000., 4000., 6000.]})
+        self.assertEqual(result[1], {'us': 3000., 'trials_us': [1000., 3000., 5000.]})
+        self.assertEqual(capture.call_count, 2)
+        for fn in functions:
+            fn.assert_not_called()
+
+    def test_linear_kernel_mode_reports_individual_gradients_and_split_stages(self):
+        self.assertEqual(build_parser().parse_args(['--operator', 'linear']).linear_timing, 'kernel')
+        args = small_args('--operator', 'linear', '--linear-timing', 'kernel',
+                          '--linear-projections', 'down')
+        measurement = paired_report([{'us': 2., 'trials_us': [2.]},
+                                     {'us': 1., 'trials_us': [1.]}], 100)
+        def measured(args, case, phases):
+            result = {'validation': {}}
+            if 'forward' in phases:
+                result['forward'] = measurement
+                if case.metadata['workload'] != 'train':
+                    result['split_k_partials'] = {'status': 'passed', 'candidate_us': 0.5,
+                                                  'tflops_per_second': 0.1}
+                    result['split_k_reduce'] = {'status': 'passed', 'candidate_us': 0.2,
+                                                'tflops_per_second': 0.01}
+            if 'backward' in phases:
+                result.update(dx=measurement, dweight=measurement)
+            return result
+        with patch('tiny_transformer.benchmarks.operators.run_kernel_case', side_effect=measured) as runner, \
+                patch('tiny_transformer.benchmarks.operators.run_case') as operator_runner, \
+                redirect_stdout(io.StringIO()) as output:
+            result = run(args, torch.device('cpu'))
+        operator_runner.assert_not_called()
+        self.assertEqual(runner.call_count, 3)
+        self.assertEqual(result[0]['timing_mode'], 'kernel')
+        self.assertIn('dx', result[0])
+        self.assertIn('dweight', result[0])
+        self.assertNotIn('backward', result[0])
+        self.assertNotIn('dx', result[1])
+        self.assertIn('split_k_reduce', result[1])
+        self.assertIn('TFLOP/s', output.getvalue())
 
     def test_unique_does_not_silently_wrap_and_hot_ids_stay_in_vocab(self):
         with self.assertRaisesRegex(ValueError, "unique IDs require"):

@@ -1,6 +1,8 @@
 #include "linear.h"
 #include "linear_kernel.cuh"
 #include "linear_common.cuh"
+#include "linear_benchmark.h"
+#include <c10/cuda/CUDAException.h>
 #include "c10/cuda/CUDAStream.h"
 #include "c10/cuda/CUDAGuard.h"
 
@@ -8,6 +10,12 @@ namespace {
 constexpr int kSmallMThreshold = 128;
 constexpr int kSplitKThreshold = 2048;
 constexpr int kSplitKSlices = 2;
+
+enum class ForwardKind { Large, Small, SplitK };
+ForwardKind forward_kind(int M, int K) {
+  return M >= kSmallMThreshold ? ForwardKind::Large :
+      (K >= kSplitKThreshold ? ForwardKind::SplitK : ForwardKind::Small);
+}
 
 // Both forward kernels use the same layouts; only the GEMM type changes.
 // Gemm::Arguments is a dependent type, so it requires typename here.
@@ -80,14 +88,16 @@ torch::Tensor linear_forward(torch::Tensor x, torch::Tensor weight) {
   const int N = static_cast<int>(weight.size(0));
   const int K = static_cast<int>(weight.size(1));
 
-  if (M < kSmallMThreshold) {
-    if (K >= kSplitKThreshold) {
+  switch (forward_kind(M, K)) {
+    case ForwardKind::SplitK:
       launch_linear_split_k(x, weight, output, M, N, K, stream.stream());
-    } else {
+      break;
+    case ForwardKind::Small:
       launch_linear_forward<InferenceGemm>(x, weight, output, M, N, K, stream.stream());
-    }
-  } else {
-    launch_linear_forward<ForwardGemm>(x, weight, output, M, N, K, stream.stream());
+      break;
+    case ForwardKind::Large:
+      launch_linear_forward<ForwardGemm>(x, weight, output, M, N, K, stream.stream());
+      break;
   }
   return output;
 }
@@ -143,4 +153,136 @@ std::tuple<torch::Tensor, torch::Tensor> linear_backward(torch::Tensor gradient,
               "Backward GEMM for dW launch: ", cutlassGetStatusString(status_w));
 
   return {dX, dW};
+}
+
+namespace {
+template <typename Gemm>
+void benchmark_tiles(LinearBenchmark& bench, const std::string& name) {
+  bench.tiles[name + "_cta"] = {Gemm::ThreadblockShape::kM, Gemm::ThreadblockShape::kN,
+                                 Gemm::ThreadblockShape::kK};
+  bench.tiles[name + "_warp"] = {Gemm::WarpShape::kM, Gemm::WarpShape::kN, Gemm::WarpShape::kK};
+}
+
+template <typename Gemm>
+void prepare_benchmark_gemm(LinearBenchmark& bench, const std::string& name,
+                            cutlass::gemm::GemmCoord problem,
+                            const torch::Tensor& a, int lda,
+                            const torch::Tensor& b, int ldb,
+                            const torch::Tensor& output, int ldd) {
+  typename Gemm::Arguments args(problem, {a.data_ptr<float>(), lda},
+      {b.data_ptr<float>(), ldb}, {output.data_ptr<float>(), ldd},
+      {output.data_ptr<float>(), ldd}, {1.0f, 0.0f});
+  auto status = Gemm::can_implement(args);
+  TORCH_CHECK(status == cutlass::Status::kSuccess, name, ": ", cutlassGetStatusString(status));
+  auto gemm = std::make_shared<Gemm>();
+  status = gemm->initialize(args);
+  TORCH_CHECK(status == cutlass::Status::kSuccess, name, ": ", cutlassGetStatusString(status));
+  bench.calls[name] = [gemm, name](cudaStream_t stream) {
+    auto status = gemm->run(stream);
+    TORCH_CHECK(status == cutlass::Status::kSuccess, name, ": ", cutlassGetStatusString(status));
+  };
+  benchmark_tiles<Gemm>(bench, name);
+}
+
+void prepare_benchmark_split_k(LinearBenchmark& bench, int M, int N, int K) {
+  using Gemm = InferenceSplitKGemm;
+  using Partial = Gemm::GemmKernel;
+  using Reduction = Gemm::ReductionKernel;
+  bench.split_k_slices = kSplitKSlices;
+  TORCH_CHECK(K / Gemm::ThreadblockShape::kK >= kSplitKSlices,
+              "Split-K requires at least one full K tile per partition");
+  Gemm::Arguments args({M, N, K}, {bench.x.data_ptr<float>(), K},
+      {bench.weight.data_ptr<float>(), K}, {bench.output.data_ptr<float>(), N},
+      {bench.output.data_ptr<float>(), N}, {1.0f, 0.0f}, kSplitKSlices);
+  const size_t bytes = Gemm::get_workspace_size(args);
+  TORCH_CHECK(bytes <= static_cast<size_t>(std::numeric_limits<int64_t>::max()),
+              "Split-K workspace exceeds int64 range");
+  bench.workspace = torch::empty({static_cast<int64_t>(bytes)}, bench.x.options().dtype(torch::kUInt8));
+  auto gemm = std::make_shared<Gemm>();
+  auto status = gemm->initialize(args, bench.workspace.data_ptr<uint8_t>());
+  TORCH_CHECK(status == cutlass::Status::kSuccess, cutlassGetStatusString(status));
+  // Keep the production device operator for the full two-kernel pipeline.
+  bench.calls["forward"] = [gemm](cudaStream_t stream) {
+    auto status = gemm->run(stream);
+    TORCH_CHECK(status == cutlass::Status::kSuccess, cutlassGetStatusString(status));
+  };
+
+  // Device::GemmSplitKParallel keeps params private. Reproduce initialize()'s
+  // public kernel Params to expose its SAME partial/reduction kernels separately.
+  // The benchmark verifies these stages against both production output and FP64.
+  Gemm::ThreadblockSwizzle swizzle;
+  auto grid_shape = swizzle.get_tiled_shape(args.problem_size,
+      {Gemm::ThreadblockShape::kM, Gemm::ThreadblockShape::kN, Gemm::ThreadblockShape::kK},
+      args.split_k_slices);
+  cutlass::TensorRef<float, cutlass::layout::RowMajor> workspace(
+      reinterpret_cast<float*>(bench.workspace.data_ptr<uint8_t>()), N);
+  const int64_t stride = int64_t(M) * N;
+  Partial::Params partial_params(args.problem_size, grid_shape, args.ref_A.non_const_ref(),
+      args.ref_B.non_const_ref(), workspace, args.convert, stride);
+  Reduction::Params reduction_params(args.problem_size.mn(), grid_shape.k(), stride,
+      workspace, args.ref_D, args.ref_C.non_const_ref(), args.epilogue);
+  const dim3 partial_grid = swizzle.get_grid_shape(grid_shape);
+  const int smem = sizeof(Partial::SharedStorage);
+  if (smem >= (48 << 10)) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(cutlass::Kernel<Partial>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+  }
+  bench.calls["split_k_partials"] = [partial_params, partial_grid, smem](cudaStream_t stream) {
+    cutlass::Kernel<Partial><<<partial_grid, Partial::kThreadCount, smem, stream>>>(partial_params);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  };
+  const dim3 reduction_grid = Reduction::grid_shape(args.problem_size.mn());
+  const dim3 reduction_block = Reduction::block_shape();
+  bench.calls["split_k_reduce"] = [reduction_params, reduction_grid, reduction_block](cudaStream_t stream) {
+    cutlass::Kernel<Reduction><<<reduction_grid, reduction_block, 0, stream>>>(reduction_params);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  };
+  benchmark_tiles<Gemm>(bench, "forward");
+}
+} // namespace
+
+void LinearBenchmark::run(const std::string& name) {
+  TORCH_CHECK(!c10::GradMode::is_enabled(), "Linear benchmark requires no_grad");
+  auto call = calls.find(name);
+  TORCH_CHECK(call != calls.end(), "Unprepared Linear benchmark kernel: ", name);
+  const c10::cuda::CUDAGuard guard(x.device());
+  call->second(c10::cuda::getCurrentCUDAStream(x.get_device()).stream());
+}
+
+std::shared_ptr<LinearBenchmark> prepare_linear_benchmark(
+    torch::Tensor x, torch::Tensor weight, torch::Tensor gradient, bool backward) {
+  TORCH_CHECK(!c10::GradMode::is_enabled(), "Linear benchmark requires no_grad");
+  check_inputs_forward(x, weight);
+  if (backward) check_inputs_backward(gradient, x, weight);
+  TORCH_CHECK(x.numel() > 0 && weight.size(0) > 0, "Linear benchmark requires nonempty GEMMs");
+  const c10::cuda::CUDAGuard guard(x.device());
+  const int M = static_cast<int>(x.size(0) * x.size(1));
+  const int N = static_cast<int>(weight.size(0));
+  const int K = static_cast<int>(weight.size(1));
+  auto bench = std::make_shared<LinearBenchmark>();
+  bench->x = x;
+  bench->weight = weight;
+  bench->gradient = gradient;
+  bench->output = torch::empty({x.size(0), x.size(1), N}, x.options());
+  switch (forward_kind(M, K)) {
+    case ForwardKind::SplitK:
+      bench->forward_kind = "split_k";
+      prepare_benchmark_split_k(*bench, M, N, K);
+      break;
+    case ForwardKind::Small:
+      bench->forward_kind = "small_m";
+      prepare_benchmark_gemm<InferenceGemm>(*bench, "forward", {M, N, K}, x, K, weight, K, bench->output, N);
+      break;
+    case ForwardKind::Large:
+      bench->forward_kind = "large_m";
+      prepare_benchmark_gemm<ForwardGemm>(*bench, "forward", {M, N, K}, x, K, weight, K, bench->output, N);
+      break;
+  }
+  if (backward) {
+    bench->dx = torch::empty_like(x);
+    bench->dweight = torch::empty_like(weight);
+    prepare_benchmark_gemm<BackwardGemmX>(*bench, "dx", {M, K, N}, gradient, N, weight, K, bench->dx, K);
+    prepare_benchmark_gemm<BackwardGemmW>(*bench, "dweight", {N, K, M}, gradient, N, x, K, bench->dweight, K);
+  }
+  return bench;
 }

@@ -12,6 +12,7 @@ from ..runtime import DTYPES, device_for, environment, seed_all, validate_precis
 from .cases import LINEAR_PROJECTIONS, linear_spec, make_case
 from .common import MEASUREMENT, measure_pair, prepare_calls
 from .linear import LinearFp32Validator
+from .linear_kernels import KERNEL_MEASUREMENT, run_kernel_case
 from .embedding import PATTERNS
 
 
@@ -49,6 +50,8 @@ def build_parser():
                         default=None, help="Linear defaults to train/prefill/decode; other operators to prefill/decode")
     parser.add_argument("--linear-projections", nargs="+", choices=(*LINEAR_PROJECTIONS, "custom"),
                         default=list(LINEAR_PROJECTIONS))
+    parser.add_argument("--linear-timing", choices=("kernel", "operator"), default="kernel",
+                        help="Linear: prepared CUDA Graph kernel timing (default), or full operator calls")
     parser.add_argument("--inference-batch-size", type=int,
                         help="Linear inference batch size; defaults to --batch-size")
     parser.add_argument("--layouts", nargs="+", choices=("contiguous", "strided", "last-only"),
@@ -174,7 +177,7 @@ def run(args, device):
 
 
 def run_linear(args, device):
-    """Measure each distinct projection once; backward includes both dX and dW."""
+    """Measure each projection; kernel mode separates dX, dW and split-K stages."""
     results = []
     for workload, projection, layout in product(
             dict.fromkeys(args.workloads or ("train", "prefill", "decode")),
@@ -191,9 +194,12 @@ def run_linear(args, device):
                    for phase in requested}
         phases = tuple(phase for phase, reason in reasons.items() if reason is None)
         result = {"operator": "linear", "backend": args.backend, "workload": workload,
-                  "layout": layout, "status": "passed" if phases else "skipped", **spec}
+                  "layout": layout, "status": "passed" if phases else "skipped",
+                  "timing_mode": args.linear_timing, **spec}
         if workload == "train":
-            result["backward_scope"] = "combined autograd dX and dWeight; not separate kernel timings"
+            result["backward_scope"] = ("separate prepared dX and dWeight GEMMs; no autograd in timing"
+                                        if args.linear_timing == "kernel" else
+                                        "combined autograd dX and dWeight; not separate kernel timings")
         for phase, reason in reasons.items():
             if reason is not None:
                 result[phase] = {"status": "skipped", "reason": reason}
@@ -201,20 +207,32 @@ def run_linear(args, device):
             case = make_case("linear", args, device, DTYPES[args.precision], workload, layout,
                              projection=projection)
             result["inputs"] = case.metadata
-            result.update(run_case("linear", args, case, phases, None))
+            if args.linear_timing == "kernel":
+                result.update(run_kernel_case(args, case, phases))
+            else:
+                result.update(run_case("linear", args, case, phases, None))
             del case
         results.append(result)
-        for phase in requested:
+        reported = [phase for phase in ("forward", "backward", "dx", "dweight", "split_k_partials", "split_k_reduce")
+                    if phase in result]
+        for phase in reported:
             value = result[phase]
-            shapes = (f"M,N,K={spec['gemm_shapes']['forward']}" if phase == "forward" else
+            shapes = (f"M,N,K={spec['gemm_shapes']['forward']}" if phase in ("forward", "split_k_partials", "split_k_reduce") else
+                      f"M,N,K={spec['gemm_shapes'][phase]}" if phase in ("dx", "dweight") else
                       f"dX={spec['gemm_shapes'].get('dx')}, dW={spec['gemm_shapes'].get('dweight')}")
             label = f"linear {workload} {projection} {layout} {phase} {shapes}"
             if value["status"] == "skipped":
                 print(f"{label}: skipped ({value['reason']})")
+            elif phase in ("split_k_partials", "split_k_reduce"):
+                print(f"{label}: student={value['candidate_us']:.2f} us, "
+                      f"performance={value['tflops_per_second']:.4f} TFLOP/s")
             else:
                 ratio = f"{value['speedup']:.2f}x" if value["speedup"] is not None else "n/a"
+                performance = (f", reference={value['reference_tflops_per_second']:.4f} TFLOP/s, "
+                               f"{args.backend}={value['candidate_tflops_per_second']:.4f} TFLOP/s"
+                               if 'candidate_tflops_per_second' in value else "")
                 print(f"{label}: reference={value['reference_us']:.2f} us, "
-                      f"{args.backend}={value['candidate_us']:.2f} us, speedup={ratio}")
+                      f"{args.backend}={value['candidate_us']:.2f} us, speedup={ratio}{performance}")
     return results
 
 
@@ -232,8 +250,9 @@ def main(argv=None):
             seed_all(args.seed)
             results = run(args, device)
             write_json(args.output, {
-                "schema_version": 1, "environment": environment(device), "arguments": vars(args),
-                "measurement": MEASUREMENT,
+                "schema_version": 2, "environment": environment(device), "arguments": vars(args),
+                "measurement": KERNEL_MEASUREMENT if args.operator == "linear" and args.linear_timing == "kernel" else MEASUREMENT,
+                "linear_kernel_measurement": KERNEL_MEASUREMENT if args.linear_timing == "kernel" else None,
                 "notice": "reference backend is a harness baseline; skipped phases have no timings; "
                           "representative cases do not certify the full operator contract",
                 "cases": results,

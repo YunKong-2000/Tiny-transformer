@@ -5,6 +5,11 @@ Linear 位于 `linear/`：CUTLASS FP32 SIMT 的前向、dX 和 dW，使用当前
 恢复前导维度并接入一阶 autograd。当前不支持 BF16/FP16、autocast 或 compile 自定义算子注册。
 测试与 GPU 验收命令见 [Linear 文档](../docs/operators/linear.md)。
 
+Linear 另提供仅用于测量的 `prepare_linear_benchmark()`：预分配并保有 tensor/workspace，
+初始化与生产路径相同的 GEMM，暴露 forward、dx、dweight 和 split-K 两阶段。
+Python 性能入口用 CUDA Graph 捕获固定指针调用，计时期间不做分配、初始化或 autograd。
+该接口不改变训练模型调用，也不等于支持模型 `torch.compile`；计时口径见性能文档。
+
 当前包含 embedding 的 FP32 CUDA 前向与一阶反向。前向每个 warp 搬运一个 ID 对应的行，
 256 线程的 block 同时处理 8 个 ID；按地址与行宽对齐选择 float4 或标量 kernel。
 反向每个 warp 对最多 32 个位置按 ID 分组，合并组内梯度后原子累加到全零梯度表。

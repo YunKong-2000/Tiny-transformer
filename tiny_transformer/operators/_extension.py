@@ -221,7 +221,7 @@ def load_linear_extension():
     sources = [source_root / name for name in
                ("bindings.cpp", "linear.cu")]
     required = sources + [source_root / name for name in
-                          ("linear.h", "linear_common.cuh", "linear_kernel.cuh")]
+                          ("linear.h", "linear_common.cuh", "linear_kernel.cuh", "linear_benchmark.h")]
     if not all(path.is_file() for path in required):
         raise RuntimeError(
             "student CUDA sources are missing; run from the repository or an editable install"

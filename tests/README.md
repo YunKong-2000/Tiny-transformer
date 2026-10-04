@@ -24,7 +24,7 @@ python -m unittest discover -s tests -p 'test_student_*.py' -v
 | 文件 | 唯一职责 |
 |---|---|
 | `test_student_embedding.py` | embedding 的精确前向、grouped/baseline 梯度、行/通道边界、地址对齐、空输入、非法 ID、stream |
-| `test_student_linear.py` | FP32 CUTLASS 的五种训练/decode 投影、非方形/尾块、各输入 rank、stride/offset、空 M/N/K、输入检查、当前 stream；CPU 仅验证 autograd 接线 |
+| `test_student_linear.py` | FP32 CUTLASS 的五种训练/decode 投影、非方形/尾块、各输入 rank、stride/offset、空 M/N/K、输入检查、当前 stream；prepared kernel 与生产路径一致性、CUDA Graph 重放、split-K 分项；CPU 仅验证 autograd 接线 |
 | `test_student_rms_norm.py` | 一组用例检查 Y/R/dX/dgamma；H=1024/1025、非连续输入、缓存 R、清零、行循环与 stream |
 | `test_student_residual.py` | 残差前向和双路梯度、dtype promotion、FP32/低精度混合输入、视图与别名、对齐/尾部/空输入、grid 循环与 stream |
 | `test_student_cross_entropy.py` | loss/梯度与 PyTorch 对照、ignore/空输入、稳定性、低精度/GradScaler、缓存、非连续输入、非法标签、grid 循环与 stream |

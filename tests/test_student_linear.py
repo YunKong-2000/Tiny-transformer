@@ -136,6 +136,66 @@ class StudentLinearCudaTests(unittest.TestCase):
                         torch.randn(batch, time, k, device='cuda'),
                         torch.randn(n, k, device='cuda'))
 
+    @torch.no_grad()
+    def test_prepared_kernel_outputs_match_production_and_graph_replay(self):
+        for m, n, k, kind in ((8, 33, 17, 'small_m'), (128, 33, 17, 'large_m'),
+                              (8, 65, 2049, 'split_k')):
+            with self.subTest(kind=kind):
+                x = torch.randn(1, m, k, device='cuda')
+                weight = torch.randn(n, k, device='cuda')
+                dy = torch.randn(1, m, n, device='cuda')
+                bench = self.extension.prepare_linear_benchmark(x, weight, dy, True)
+                self.assertEqual(bench.forward_kind, kind)
+                production = student.linear(x, weight)
+                dx, dw = self.extension.linear_backward(dy, x, weight)
+                for name in ('forward', 'dx', 'dweight'):
+                    bench.run(name)
+                for actual, expected in ((bench.output, production), (bench.dx, dx), (bench.dweight, dw)):
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                with self.assertRaisesRegex(RuntimeError, 'Unprepared'):
+                    bench.run('unknown')
+                if kind == 'split_k':
+                    self.assertEqual(bench.workspace.numel(), bench.split_k_slices * m * n * 4)
+                    bench.run('split_k_partials')
+                    bench.output.fill_(float('nan'))
+                    bench.run('split_k_reduce')
+                    torch.testing.assert_close(bench.output, production, atol=0, rtol=0)
+                from tiny_transformer.benchmarks.linear_kernels import capture_repeated
+                for name, output, expected in (('forward', bench.output, production),
+                                               ('dx', bench.dx, dx), ('dweight', bench.dweight, dw)):
+                    graph = capture_repeated(lambda: bench.run(name), x.device, 2, 3)
+                    output.fill_(float('nan'))
+                    graph.replay()
+                    torch.cuda.current_stream().synchronize()
+                    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+    def test_kernel_benchmark_validates_all_components_before_reporting_flops(self):
+        from tiny_transformer.benchmarks.cases import make_case
+        from tiny_transformer.benchmarks.operators import build_parser
+        from tiny_transformer.benchmarks.linear_kernels import run_kernel_case
+        args = build_parser().parse_args([
+            '--operator', 'linear', '--linear-projections', 'custom',
+            '--batch-size', '1', '--seq-length', '8', '--dim', '2049', '--out-features', '65',
+            '--warmup', '2', '--repeats', '2', '--trials', '2'])
+        case = make_case('linear', args, 'cuda', torch.float32, 'train', projection='custom')
+        result = run_kernel_case(args, case, ('forward', 'backward'))
+        self.assertTrue(result['validation']['split_k_stages_match_production'])
+        self.assertEqual(result['kernel_config']['forward_kind'], 'split_k')
+        for name in ('forward', 'dx', 'dweight'):
+            self.assertEqual(result[name]['flops'], 2 * 8 * 65 * 2049)
+            self.assertEqual(len(result[name]['candidate_trials_us']), 2)
+            self.assertAlmostEqual(result[name]['candidate_flops_per_second'],
+                                   result[name]['flops'] * 1e6 / result[name]['candidate_us'])
+        self.assertEqual(result['split_k_reduce']['flops'],
+                         result['kernel_config']['split_k_slices'] * 8 * 65)
+        # Reference-only mode must use its own preallocated outputs, without JIT.
+        args.backend = 'reference'
+        reference_result = run_kernel_case(args, case, ('backward',))
+        self.assertEqual(reference_result['kernel_config']['forward_kind'], 'reference')
+        self.assertNotIn('forward', reference_result)
+        self.assertIn('dx', reference_result)
+        self.assertIn('dweight', reference_result)
+
     def test_split_k_dispatch_boundaries_and_reduction_tail(self):
         # K=2047 selects ordinary small-M GEMM; 2048/2049 select split-K.
         # M=128 switches back to the large-M kernel. Odd N tests reduction tails.
