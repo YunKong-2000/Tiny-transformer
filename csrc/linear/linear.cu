@@ -8,7 +8,7 @@
 
 namespace {
 constexpr int kSmallMThreshold = 128;
-constexpr int kSplitKThreshold = 2048;
+constexpr int kSplitKThreshold = 0;
 constexpr int kSplitKSlices = 8;
 
 enum class ForwardKind { Large, Small, SplitK };
