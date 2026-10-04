@@ -9,7 +9,7 @@
 namespace {
 constexpr int kSmallMThreshold = 128;
 constexpr int kSplitKThreshold = 2048;
-constexpr int kSplitKSlices = 4;
+constexpr int kSplitKSlices = 8;
 
 enum class ForwardKind { Large, Small, SplitK };
 ForwardKind forward_kind(int M, int K) {

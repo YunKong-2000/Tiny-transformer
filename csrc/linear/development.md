@@ -134,3 +134,33 @@ linear decode down contiguous split_k_reduce M,N,K=[8, 768, 2048]: student=1.69 
 
 linear decode lm_head contiguous forward M,N,K=[8, 8192, 768]: reference=28.82 us, student=31.41 us, speedup=0.92x, reference=3.4934 TFLOP/s, student=3.2052 TFLOP/s
 saved runs/linear-kernel-performance.json
+
+## 增加split-k slices到4
+root@8cfa9e1a2f81:/workspace/tiny-transformer# python -m tiny_transformer.benchmarks --operator linear --device cuda:1 --output runs/linear-kernel-performance.json
+linear train qkv contiguous forward M,N,K=[4096, 2304, 768]: reference=807.38 us, student=885.53 us, speedup=0.91x, reference=17.9537 TFLOP/s, student=16.3692 TFLOP/s
+linear train qkv contiguous dx M,N,K=[4096, 768, 2304]: reference=923.12 us, student=1064.41 us, speedup=0.87x, reference=15.7028 TFLOP/s, student=13.6184 TFLOP/s
+linear train qkv contiguous dweight M,N,K=[2304, 768, 4096]: reference=766.19 us, student=1163.12 us, speedup=0.66x, reference=18.9190 TFLOP/s, student=12.4626 TFLOP/s
+linear train o contiguous forward M,N,K=[4096, 768, 768]: reference=291.47 us, student=298.02 us, speedup=0.98x, reference=16.5774 TFLOP/s, student=16.2129 TFLOP/s
+linear train o contiguous dx M,N,K=[4096, 768, 768]: reference=295.95 us, student=372.00 us, speedup=0.80x, reference=16.3267 TFLOP/s, student=12.9889 TFLOP/s
+linear train o contiguous dweight M,N,K=[768, 768, 4096]: reference=313.59 us, student=448.05 us, speedup=0.70x, reference=15.4082 TFLOP/s, student=10.7841 TFLOP/s
+linear train gate_up contiguous forward M,N,K=[4096, 4096, 768]: reference=1415.50 us, student=1479.56 us, speedup=0.96x, reference=18.2055 TFLOP/s, student=17.4172 TFLOP/s
+linear train gate_up contiguous dx M,N,K=[4096, 768, 4096]: reference=1642.28 us, student=1869.99 us, speedup=0.88x, reference=15.6915 TFLOP/s, student=13.7807 TFLOP/s
+linear train gate_up contiguous dweight M,N,K=[4096, 768, 4096]: reference=1521.88 us, student=1847.79 us, speedup=0.82x, reference=16.9329 TFLOP/s, student=13.9463 TFLOP/s
+linear train down contiguous forward M,N,K=[4096, 768, 2048]: reference=728.48 us, student=782.56 us, speedup=0.93x, reference=17.6873 TFLOP/s, student=16.4650 TFLOP/s
+linear train down contiguous dx M,N,K=[4096, 2048, 768]: reference=733.94 us, student=793.70 us, speedup=0.92x, reference=17.5558 TFLOP/s, student=16.2339 TFLOP/s
+linear train down contiguous dweight M,N,K=[768, 2048, 4096]: reference=780.86 us, student=1157.00 us, speedup=0.67x, reference=16.5009 TFLOP/s, student=11.1365 TFLOP/s
+linear train lm_head contiguous forward M,N,K=[4096, 8192, 768]: reference=2901.56 us, student=2859.42 us, speedup=1.01x, reference=17.7628 TFLOP/s, student=18.0245 TFLOP/s
+linear train lm_head contiguous dx M,N,K=[4096, 768, 8192]: reference=2807.10 us, student=3722.13 us, speedup=0.75x, reference=18.3604 TFLOP/s, student=13.8468 TFLOP/s
+linear train lm_head contiguous dweight M,N,K=[8192, 768, 4096]: reference=3148.47 us, student=3267.78 us, speedup=0.96x, reference=16.3697 TFLOP/s, student=15.7721 TFLOP/s
+linear prefill qkv contiguous forward M,N,K=[4096, 2304, 768]: reference=828.73 us, student=897.63 us, speedup=0.92x, reference=17.4912 TFLOP/s, student=16.1487 TFLOP/s
+linear prefill o contiguous forward M,N,K=[4096, 768, 768]: reference=294.01 us, student=301.34 us, speedup=0.98x, reference=16.4342 TFLOP/s, student=16.0344 TFLOP/s
+linear prefill gate_up contiguous forward M,N,K=[4096, 4096, 768]: reference=1440.74 us, student=1508.94 us, speedup=0.95x, reference=17.8865 TFLOP/s, student=17.0781 TFLOP/s
+linear prefill down contiguous forward M,N,K=[4096, 768, 2048]: reference=736.15 us, student=790.45 us, speedup=0.93x, reference=17.5030 TFLOP/s, student=16.3008 TFLOP/s
+linear prefill lm_head contiguous forward M,N,K=[8, 8192, 768]: reference=29.00 us, student=31.13 us, speedup=0.93x, reference=3.4712 TFLOP/s, student=3.2337 TFLOP/s
+linear decode qkv contiguous forward M,N,K=[8, 2304, 768]: reference=13.20 us, student=23.34 us, speedup=0.57x, reference=2.1449 TFLOP/s, student=1.2132 TFLOP/s
+linear decode o contiguous forward M,N,K=[8, 768, 768]: reference=9.42 us, student=23.24 us, speedup=0.41x, reference=1.0017 TFLOP/s, student=0.4060 TFLOP/s
+linear decode gate_up contiguous forward M,N,K=[8, 4096, 768]: reference=20.58 us, student=28.28 us, speedup=0.73x, reference=2.4454 TFLOP/s, student=1.7796 TFLOP/s
+linear decode down contiguous forward M,N,K=[8, 768, 2048]: reference=16.11 us, student=18.05 us, speedup=0.89x, reference=1.5624 TFLOP/s, student=1.3940 TFLOP/s
+linear decode down contiguous split_k_partials M,N,K=[8, 768, 2048]: student=16.31 us, performance=1.5427 TFLOP/s
+linear decode down contiguous split_k_reduce M,N,K=[8, 768, 2048]: student=1.70 us, performance=0.0145 TFLOP/s
+linear decode lm_head contiguous forward M,N,K=[8, 8192, 768]: reference=28.97 us, student=31.40 us, speedup=0.92x, reference=3.4749 TFLOP/s, student=3.2
