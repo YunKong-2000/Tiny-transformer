@@ -11,8 +11,8 @@ using BackwardCTAShape = cutlass::gemm::GemmShape<64, 64, 8>;
 using BackwardWarpShape = cutlass::gemm::GemmShape<32, 64, 8>;
 using BackwardInstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
 
-using InferenceCTAShape = cutlass::gemm::GemmShape<8, 64, 8>;
-using InferenceWarpShape = cutlass::gemm::GemmShape<8, 32, 8>;
+using InferenceCTAShape = cutlass::gemm::GemmShape<8, 32, 8>;
+using InferenceWarpShape = cutlass::gemm::GemmShape<4, 16, 8>;
 using InferenceInstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
 
 using OpClass = cutlass::arch::OpClassSimt;
