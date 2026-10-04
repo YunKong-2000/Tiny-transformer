@@ -41,9 +41,8 @@ using Operator = cutlass::arch::OpMultiplyAdd;
 using EpilogueOp = cutlass::epilogue::thread::LinearCombination< float, 1, float, float>;
 using SwizzleOp = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
 
-// Preserve FP32 partial sums until the final reduction/epilogue.
-using SplitKConvertOp = cutlass::epilogue::thread::Convert<float, 1, float>;
-using SplitKReduction = cutlass::reduction::thread::ReduceAdd<float, float, 1>;
+using SplitKConvertOp = cutlass::epilogue::thread::Convert< float, 1, float>;
+using SplitKReduction = cutlass::reduciton::thread::ReduceAdd<float, float, 1>;
 
 constexpr int kAlignmentA = 1;
 constexpr int kAlignmentB = 1;
