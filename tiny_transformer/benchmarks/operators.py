@@ -9,7 +9,7 @@ import torch
 from ..operators import reference, student
 from ..operators.dispatch import NAMES
 from ..runtime import DTYPES, device_for, environment, seed_all, validate_precision, write_json
-from .cases import make_case
+from .cases import LINEAR_PROJECTIONS, linear_spec, make_case
 from .common import MEASUREMENT, measure_pair, prepare_calls
 from .linear import LinearFp32Validator
 from .embedding import PATTERNS
@@ -45,8 +45,12 @@ def build_parser():
     parser.add_argument("--precision", choices=DTYPES, default="fp32")
     parser.add_argument("--phases", nargs="+", choices=("forward", "backward"),
                         default=["forward", "backward"])
-    parser.add_argument("--workloads", nargs="+", choices=("prefill", "decode"),
-                        default=["prefill", "decode"])
+    parser.add_argument("--workloads", nargs="+", choices=("train", "prefill", "decode"),
+                        default=None, help="Linear defaults to train/prefill/decode; other operators to prefill/decode")
+    parser.add_argument("--linear-projections", nargs="+", choices=(*LINEAR_PROJECTIONS, "custom"),
+                        default=list(LINEAR_PROJECTIONS))
+    parser.add_argument("--inference-batch-size", type=int,
+                        help="Linear inference batch size; defaults to --batch-size")
     parser.add_argument("--layouts", nargs="+", choices=("contiguous", "strided", "last-only"),
                         default=["contiguous"])
     parser.add_argument("--batch-size", type=int, default=8)
@@ -54,7 +58,8 @@ def build_parser():
     parser.add_argument("--vocab-size", type=int, default=8192)
     parser.add_argument("--dim", type=int, default=768)
     parser.add_argument("--heads", type=int, default=12)
-    parser.add_argument("--out-features", type=int, default=768)
+    parser.add_argument("--out-features", type=int, default=768,
+                        help="output width for --linear-projections custom")
     parser.add_argument("--hidden-dim", type=int, default=2048)
     parser.add_argument("--eps", type=float, default=1e-6)
     parser.add_argument("--patterns", choices=PATTERNS, nargs="+", default=list(PATTERNS))
@@ -69,6 +74,10 @@ def build_parser():
 
 
 def validate_args(parser, args):
+    if args.inference_batch_size is not None and args.inference_batch_size <= 0:
+        parser.error("inference-batch-size must be positive")
+    if args.workloads and "train" in args.workloads and args.operator not in ("linear", "all"):
+        parser.error("train workload is currently supported only for linear")
     if min(args.batch_size, args.seq_length, args.vocab_size, args.dim, args.heads,
            args.out_features, args.hidden_dim, args.hot_tokens, args.warmup,
            args.repeats, args.trials) <= 0:
@@ -119,10 +128,14 @@ def run(args, device):
     operators = NAMES if args.operator == "all" else (args.operator,)
     results = []
     for operator in operators:
+        if operator == "linear":
+            results.extend(run_linear(args, device))
+            continue
+        workloads = [w for w in (args.workloads or ("prefill", "decode")) if w != "train"]
         patterns = tuple(dict.fromkeys(args.patterns)) if operator == "embedding" else (None,)
         implementations = (("grouped", "baseline") if args.backward_impl == "all" else
                            (args.backward_impl,)) if operator == "embedding" and args.backend == "student" else (None,)
-        for workload, layout, pattern in product(dict.fromkeys(args.workloads),
+        for workload, layout, pattern in product(dict.fromkeys(workloads),
                                                 dict.fromkeys(args.layouts), patterns):
             reasons = {phase: unsupported_reason(operator, args.backend, args.precision, phase, layout, args.dim)
                        for phase in dict.fromkeys(args.phases)}
@@ -157,6 +170,51 @@ def run(args, device):
                         print(f"{label}: reference={value['reference_us']:.2f} us, "
                               f"{args.backend}={value['candidate_us']:.2f} us, speedup={ratio}")
             del case
+    return results
+
+
+def run_linear(args, device):
+    """Measure each distinct projection once; backward includes both dX and dW."""
+    results = []
+    for workload, projection, layout in product(
+            dict.fromkeys(args.workloads or ("train", "prefill", "decode")),
+            dict.fromkeys(args.linear_projections), dict.fromkeys(args.layouts)):
+        spec = linear_spec(args, workload, projection)
+        # Inference has no backward. An explicit backward-only request produces
+        # a visible skip instead of silently running a forward timing.
+        requested = tuple(p for p in dict.fromkeys(args.phases)
+                          if workload == "train" or p == "forward")
+        if not requested:
+            requested = ("backward",)
+        reasons = {phase: ("inference has no backward" if workload != "train" and phase == "backward"
+                           else unsupported_reason("linear", args.backend, args.precision, phase, layout, args.dim))
+                   for phase in requested}
+        phases = tuple(phase for phase, reason in reasons.items() if reason is None)
+        result = {"operator": "linear", "backend": args.backend, "workload": workload,
+                  "layout": layout, "status": "passed" if phases else "skipped", **spec}
+        if workload == "train":
+            result["backward_scope"] = "combined autograd dX and dWeight; not separate kernel timings"
+        for phase, reason in reasons.items():
+            if reason is not None:
+                result[phase] = {"status": "skipped", "reason": reason}
+        if phases:
+            case = make_case("linear", args, device, DTYPES[args.precision], workload, layout,
+                             projection=projection)
+            result["inputs"] = case.metadata
+            result.update(run_case("linear", args, case, phases, None))
+            del case
+        results.append(result)
+        for phase in requested:
+            value = result[phase]
+            shapes = (f"M,N,K={spec['gemm_shapes']['forward']}" if phase == "forward" else
+                      f"dX={spec['gemm_shapes'].get('dx')}, dW={spec['gemm_shapes'].get('dweight')}")
+            label = f"linear {workload} {projection} {layout} {phase} {shapes}"
+            if value["status"] == "skipped":
+                print(f"{label}: skipped ({value['reason']})")
+            else:
+                ratio = f"{value['speedup']:.2f}x" if value["speedup"] is not None else "n/a"
+                print(f"{label}: reference={value['reference_us']:.2f} us, "
+                      f"{args.backend}={value['candidate_us']:.2f} us, speedup={ratio}")
     return results
 
 

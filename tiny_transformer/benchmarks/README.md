@@ -20,7 +20,8 @@
 
 在 CUDA 开发环境从仓库根目录运行；A100 可设置 `TORCH_CUDA_ARCH_LIST=8.0`。
 默认 FP32、`B=8,T=512,H=768,V=8192`、20 次预热、每轮 100 次调用、5 轮采样。
-默认分别测 prefill 和 decode，并请求 forward/backward。只支持前向时，backward 明确跳过。
+Linear 默认覆盖五种投影的训练前向/反向、prefill 前向、decode 前向。
+其他算子保持 prefill/decode 和 forward/backward；只支持前向时，backward 明确跳过。
 
 ```bash
 # RMSNorm：前向与反向，包含连续、末维 stride=2 和 last-only prefill。
@@ -33,7 +34,7 @@ python -m tiny_transformer.benchmarks --operator embedding \
   --backward-impl all --patterns random same unique hot \
   --output runs/embedding-performance.json
 
-# Linear：FP32 SIMT 前向/反向，包含连续和跨步输入。
+# Linear：五种投影 × 训练/prefill/decode，包含连续和跨步输入。
 python -m tiny_transformer.benchmarks --operator linear --precision fp32 \
   --layouts contiguous strided --output runs/linear-performance.json
 
@@ -64,7 +65,7 @@ python -m tiny_transformer.benchmarks.model --config configs/smoke.json \
 | 算子 | 输入/测试维度 | 反向需要的输入 | 当前 student |
 |---|---|---|---|
 | embedding | `[B,T]` IDs、`[V,H]` weight；random/same/unique/hot；grouped/baseline | weight | FP32 前向、反向，连续输入 |
-| linear | `[B,T,H]`、`[out_features,H]` | x、weight | FP32 SIMT 前向/反向；wrapper 复制跨步输入；尚不支持 AMP/BF16/FP16 |
+| linear | QKV/O/Gate-Up/Down/LM head 的 `[B,T,K]`、`[N,K]`；训练与推理分别生成 | x、weight（仅训练反向） | FP32 SIMT 前向/反向；wrapper 复制跨步输入；尚不支持 AMP/BF16/FP16 |
 | rms_norm | `[B,T,H]`、`[H]`、eps；可测 last-only `[B,1,H]` | x、weight | FP32 前向/反向（H <= 1024）；wrapper 复制跨步输入 |
 | rope | `[B,heads,T,H/heads]` 与共享 cos/sin | x；cos/sin 是常量 | FP32 CuTe 前向/反向；直接消费输入及梯度的 stride |
 | attention | prefill `Q=K=T`；decode `Q=1,K=seq_length`，携带 past_len | q、k、v | 未实现；可用 SDPA 比较 |
@@ -78,6 +79,52 @@ RoPE 要求 head_dim 是偶数。`--seq-length` 在 decode 中仍决定 attentio
 并保留 RoPE transpose/SwiGLU chunk 布局；`last-only` 仅对 RMSNorm 有效。
 JSON 逐项记录实际 shape、stride、storage offset 和 dtype，last-only 的 prefill 行数为 B。
 这些是代表性性能场景，不替代各算子专属边界与模型正确性测试。
+
+### Linear 的完整形状矩阵
+
+默认命令每种 layout 生成 15 组 case、20 项计时：五种投影各有训练 forward/backward，
+以及推理 prefill/decode forward。推理没有 backward；训练的 backward 包含 dX 与 dWeight，
+不是单个梯度 kernel 的独立计时。训练 forward 仍沿用公共 no_grad 前向计时口径，
+反向在保留的计算图上测量。每组先执行 FP64 数值校验，再计时。
+
+默认维度对应 model_60m 的 `B=8,T=512,H=768,I=2048,V=8192`（不自动读取配置文件）：
+
+| 投影 | N | K | 训练 M | Prefill M | Decode M |
+|---|---:|---:|---:|---:|---:|
+| qkv | 2304 | 768 | 4096 | 4096 | 8 |
+| o | 768 | 768 | 4096 | 4096 | 8 |
+| gate_up | 4096 | 768 | 4096 | 4096 | 8 |
+| down | 768 | 2048 | 4096 | 4096 | 8 |
+| lm_head | 8192 | 768 | 4096 | 8 | 8 |
+
+推理 LM head 在 prefill 也只处理最后一个 token，与生成路径 `last_only=True` 一致。
+形状由 `--dim/--hidden-dim/--vocab-size/--batch-size/--seq-length` 控制；
+`--inference-batch-size` 可单独设置推理 batch，省略时使用 `--batch-size`。
+每种相同投影形状只测一次，不按层数重复，也不将 grad_accum 乘入 M。
+这里的训练场景表示形状和前反向工作量；`--precision` 仍是实际输入 dtype，不是 AMP。
+
+```bash
+# 全覆盖，训练 batch=8、推理 batch=1。
+python -m tiny_transformer.benchmarks --operator linear \
+  --inference-batch-size 1 --output runs/linear-performance.json
+
+# 只调训练中的 Down 和 LM head 反向。
+python -m tiny_transformer.benchmarks --operator linear \
+  --workloads train --linear-projections down lm_head --phases backward
+
+# 只测五种 decode 投影的前向。
+python -m tiny_transformer.benchmarks --operator linear --workloads decode
+
+# 手动指定一个非模型形状；out-features 仅用于 custom 投影。
+python -m tiny_transformer.benchmarks --operator linear --linear-projections custom \
+  --dim 1024 --out-features 3072 --workloads train
+```
+
+控制台显示 workload、projection、phase 和 GEMM 尺寸；JSON 每个 case 保存 `execution`、
+`projection`、`x_shape`、`weight_shape`、`output_shape`、`gemm_shapes`。
+训练 `gemm_shapes` 同时包含 forward=`[M,N,K]`、dx=`[M,K,N]`、dweight=`[N,K,M]`。
+显式请求推理 `--phases backward` 会记录 skip；默认混合阶段请求会自动只测推理 forward。
+`--operator all` 同样展开 Linear；`--workloads train` 在 all 中只作用于 Linear。
 
 当前 student 阶段表在 `operators.py::STUDENT_PHASES`，dtype/layout 限制在
 `unsupported_reason`。实现新 kernel 后更新这些声明即可沿用统一流程。

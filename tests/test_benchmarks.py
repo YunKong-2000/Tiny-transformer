@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from tiny_transformer.benchmarks import common
-from tiny_transformer.benchmarks.cases import make_case
+from tiny_transformer.benchmarks.cases import LINEAR_PROJECTIONS, linear_spec, make_case
 from tiny_transformer.benchmarks.linear import LinearFp32Validator
 from tiny_transformer.benchmarks.embedding import PATTERNS, make_ids
 from tiny_transformer.benchmarks.operators import build_parser, run, run_case, unsupported_reason, validate_args
@@ -235,11 +235,14 @@ class BenchmarkHostTests(unittest.TestCase):
                 patch.object(student, 'attention') as missing, redirect_stdout(io.StringIO()):
             results = run(args, torch.device('cpu'))
         missing.assert_not_called()
-        self.assertEqual(measure.call_count, 28)  # Seven operators, fwd/bwd, each workload.
-        self.assertEqual(len(results), 16)
+        self.assertEqual(measure.call_count, 44)  # Other operators 24; five Linear projections 20.
+        self.assertEqual(len(results), 29)  # Other operators 14; Linear 15.
         for row in results:
             if row['operator'] in ('linear', 'rms_norm', 'residual', 'cross_entropy', 'rope', 'swiglu'):
                 self.assertEqual(row['forward']['status'], 'passed')
+                if row['operator'] == 'linear' and row['workload'] != 'train':
+                    self.assertNotIn('backward', row)
+                    continue
                 self.assertEqual(row['backward']['status'], 'passed')
                 self.assertGreater(row['backward']['candidate_us'], 0)
             elif row['operator'] != 'embedding':
@@ -256,6 +259,76 @@ class BenchmarkHostTests(unittest.TestCase):
                     with self.assertRaises(type(error)):
                         run(args, torch.device('cpu'))
                 measure.assert_not_called()
+
+    def test_linear_default_suite_matches_all_model_gemm_shapes(self):
+        args = build_parser().parse_args(['--operator', 'linear'])
+        dimensions = {'qkv': (2304, 768), 'o': (768, 768),
+                      'gate_up': (4096, 768), 'down': (768, 2048), 'lm_head': (8192, 768)}
+        self.assertEqual(tuple(args.linear_projections), LINEAR_PROJECTIONS)
+        for projection, (n, k) in dimensions.items():
+            for workload in ('train', 'prefill', 'decode'):
+                with self.subTest(projection=projection, workload=workload):
+                    spec = linear_spec(args, workload, projection)
+                    m = 8 if workload == 'decode' or (workload == 'prefill' and projection == 'lm_head') else 4096
+                    self.assertEqual(spec['gemm_shapes']['forward'], [m, n, k])
+                    self.assertEqual(spec['x_shape'], [8, m // 8, k])
+                    self.assertEqual(spec['weight_shape'], [n, k])
+                    self.assertEqual(spec['output_shape'], [8, m // 8, n])
+                    if workload == 'train':
+                        self.assertEqual(spec['gemm_shapes']['dx'], [m, k, n])
+                        self.assertEqual(spec['gemm_shapes']['dweight'], [n, k, m])
+                    else:
+                        self.assertEqual(set(spec['gemm_shapes']), {'forward'})
+
+    def test_linear_cases_preserve_strides_and_use_actual_row_count(self):
+        args = small_args('--operator', 'linear', '--inference-batch-size', '1')
+        for workload in ('train', 'prefill', 'decode'):
+            for projection in LINEAR_PROJECTIONS:
+                case = make_case('linear', args, 'cpu', torch.float32, workload, 'strided',
+                                 projection=projection)
+                spec = linear_spec(args, workload, projection)
+                self.assertEqual(list(case.inputs[0].shape), spec['x_shape'])
+                self.assertEqual(list(case.inputs[1].shape), spec['weight_shape'])
+                self.assertEqual(case.inputs[0].stride()[-1], 2)
+                self.assertEqual(case.inputs[1].stride()[-1], 2)
+                self.assertEqual(case.upstream_scale, 1 / spec['gemm_shapes']['forward'][0])
+                expected_batch = 2 if workload == 'train' else 1
+                self.assertEqual(spec['x_shape'][0], expected_batch)
+
+    def test_linear_suite_phase_and_projection_filters(self):
+        timing = {'reference_us': 2, 'candidate_us': 1, 'speedup': 2}
+        for workloads, phases, expected_rows, expected_timings in (
+                (['train'], ['backward'], 2, 2),
+                (['prefill', 'decode'], ['forward', 'backward'], 4, 4),
+                (['decode'], ['backward'], 2, 0)):
+            args = small_args('--operator', 'linear', '--backend', 'reference',
+                              '--linear-projections', 'down', 'lm_head',
+                              '--workloads', *workloads, '--phases', *phases)
+            with patch('tiny_transformer.benchmarks.operators.measure_pair', return_value=timing) as measure, \
+                    redirect_stdout(io.StringIO()):
+                results = run(args, torch.device('cpu'))
+            self.assertEqual(len(results), expected_rows)
+            self.assertEqual(measure.call_count, expected_timings)
+            self.assertEqual({row['projection'] for row in results}, {'down', 'lm_head'})
+            for row in results:
+                if workloads == ['train']:
+                    self.assertNotIn('forward', row)
+                    self.assertIn('combined', row['backward_scope'])
+                elif phases == ['backward']:
+                    self.assertEqual(row['backward']['reason'], 'inference has no backward')
+                else:
+                    self.assertNotIn('backward', row)
+
+    def test_linear_skips_keep_shapes_without_allocating_and_custom_shape_is_explicit(self):
+        args = small_args('--operator', 'linear', '--precision', 'bf16')
+        with patch('tiny_transformer.benchmarks.operators.make_case') as allocate, \
+                redirect_stdout(io.StringIO()):
+            results = run(args, torch.device('cpu'))
+        allocate.assert_not_called()
+        self.assertEqual(len(results), 15)
+        self.assertTrue(all(row['status'] == 'skipped' and 'gemm_shapes' in row for row in results))
+        args = small_args('--operator', 'linear', '--linear-projections', 'custom', '--out-features', '11')
+        self.assertEqual(linear_spec(args, 'train', 'custom')['gemm_shapes']['forward'], [6, 11, 8])
 
     def test_variants_share_upstream_and_restore_rng(self):
         args = small_args('--operator', 'embedding', '--backward-impl', 'all')
@@ -301,7 +374,8 @@ class BenchmarkHostTests(unittest.TestCase):
 
     def test_invalid_options(self):
         for options in (('--dim', '7'), ('--dim', '6'), ('--repeats', '0'),
-                        ('--device', 'cpu'), ('--eps', 'nan')):
+                        ('--device', 'cpu'), ('--eps', 'nan'), ('--inference-batch-size', '0'),
+                        ('--operator', 'rope', '--workloads', 'train')):
             with self.subTest(options=options), redirect_stdout(io.StringIO()), \
                     patch('sys.stderr', new_callable=io.StringIO):
                 with self.assertRaises(SystemExit):

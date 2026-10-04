@@ -141,5 +141,13 @@ python -m tiny_transformer.benchmarks --operator linear \
   --output runs/linear-performance.json
 ```
 
+默认按 QKV、O、Gate/Up、Down、LM head 五种投影展开，共 15 组 case、20 项计时：
+训练每种投影分别测 forward 和完整 backward（dX+dWeight），推理 prefill/decode 只测 forward。
+prefill 的 LM head 按 `last_only=True` 使用 M=B，其余 block 投影使用 M=B*T。
+终端与 JSON 均标明投影和问题规模；训练同时记录前向、dX、dWeight 三组 GEMM 尺寸。
+默认推理 batch 与训练相同，可用 `--inference-batch-size 1` 单独测试小 batch 推理。
+可通过 `--workloads train`、`--linear-projections qkv down`、`--phases backward` 筛选。
+完整参数和形状表见 [Linear 性能用例](../../tiny_transformer/benchmarks/README.md#linear-的完整形状矩阵)。
+
 未实现的 student 算子/阶段会记录为 `skipped`，没有隐式 reference fallback；
 可用 `--backend reference` 验证完整测量流程。`check_ops --backward` 的结果不能替代反向性能数据。
