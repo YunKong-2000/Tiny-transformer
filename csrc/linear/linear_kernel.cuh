@@ -15,7 +15,7 @@ using InferenceCTAShape = cutlass::gemm::GemmShape<8, 32, 32>;
 // With K_tile=16 the FP32 SIMT transpose padding is 32/16=2.
 // Warp<8,16,32> gives LaneM=2, LaneN=2, both dividing this padding.
 // Warp<8,32,32> gives LaneN=4 and fails CUTLASS's padding assertion.
-using InferenceWarpShape = cutlass::gemm::GemmShape<8, 16, 32>;
+using InferenceWarpShape = cutlass::gemm::GemmShape<4, 8, 32>;
 using InferenceInstructionShape = cutlass::gemm::GemmShape<1, 1, 1>;
 
 // This two-stage scalar SIMT path stores shared-memory fragments without a
