@@ -165,3 +165,45 @@ linear decode down contiguous split_k_partials M,N,K=[8, 768, 2048]: student=11.
 linear decode down contiguous split_k_reduce M,N,K=[8, 768, 2048]: student=1.93 us, performance=0.0255 TFLOP/s
 linear decode lm_head contiguous forward M,N,K=[8, 8192, 768]: reference=29.01 us, student=32.41 us, speedup=0.90x, reference=3.4699 TFLOP/s, student=3.1060 TFLOP/s
 saved runs/linear-kernel-performance.json
+
+## 所有decode的阶段都使用split-k进行优化
+root@8cfa9e1a2f81:/workspace/tiny-transformer# python -m tiny_transformer.benchmarks --operator linear --device cuda:1 --output runs/linear-kernel-performance.json
+linear train qkv contiguous forward M,N,K=[4096, 2304, 768]: reference=808.09 us, student=886.76 us, speedup=0.91x, reference=17.9380 TFLOP/s, student=16.3465 TFLOP/s
+linear train qkv contiguous dx M,N,K=[4096, 768, 2304]: reference=927.91 us, student=1066.94 us, speedup=0.87x, reference=15.6217 TFLOP/s, student=13.5861 TFLOP/s
+linear train qkv contiguous dweight M,N,K=[2304, 768, 4096]: reference=766.48 us, student=1163.65 us, speedup=0.66x, reference=18.9117 TFLOP/s, student=12.4569 TFLOP/s
+linear train o contiguous forward M,N,K=[4096, 768, 768]: reference=293.61 us, student=299.10 us, speedup=0.98x, reference=16.4566 TFLOP/s, student=16.1546 TFLOP/s
+linear train o contiguous dx M,N,K=[4096, 768, 768]: reference=295.98 us, student=371.76 us, speedup=0.80x, reference=16.3250 TFLOP/s, student=12.9971 TFLOP/s
+linear train o contiguous dweight M,N,K=[768, 768, 4096]: reference=313.28 us, student=447.63 us, speedup=0.70x, reference=15.4233 TFLOP/s, student=10.7942 TFLOP/s
+linear train gate_up contiguous forward M,N,K=[4096, 4096, 768]: reference=1419.83 us, student=1489.21 us, speedup=0.95x, reference=18.1500 TFLOP/s, student=17.3043 TFLOP/s
+linear train gate_up contiguous dx M,N,K=[4096, 768, 4096]: reference=1648.52 us, student=1871.80 us, speedup=0.88x, reference=15.6321 TFLOP/s, student=13.7674 TFLOP/s
+linear train gate_up contiguous dweight M,N,K=[4096, 768, 4096]: reference=1520.68 us, student=1854.63 us, speedup=0.82x, reference=16.9462 TFLOP/s, student=13.8949 TFLOP/s
+linear train down contiguous forward M,N,K=[4096, 768, 2048]: reference=731.81 us, student=784.88 us, speedup=0.93x, reference=17.6069 TFLOP/s, student=16.4165 TFLOP/s
+linear train down contiguous dx M,N,K=[4096, 2048, 768]: reference=734.53 us, student=834.45 us, speedup=0.88x, reference=17.5418 TFLOP/s, student=15.4412 TFLOP/s
+linear train down contiguous dweight M,N,K=[768, 2048, 4096]: reference=777.00 us, student=1157.47 us, speedup=0.67x, reference=16.5829 TFLOP/s, student=11.1320 TFLOP/s
+linear train lm_head contiguous forward M,N,K=[4096, 8192, 768]: reference=2922.65 us, student=2863.01 us, speedup=1.02x, reference=17.6345 TFLOP/s, student=18.0019 TFLOP/s
+linear train lm_head contiguous dx M,N,K=[4096, 768, 8192]: reference=2818.74 us, student=3732.29 us, speedup=0.76x, reference=18.2846 TFLOP/s, student=13.8091 TFLOP/s
+linear train lm_head contiguous dweight M,N,K=[8192, 768, 4096]: reference=3155.77 us, student=3276.38 us, speedup=0.96x, reference=16.3318 TFLOP/s, student=15.7307 TFLOP/s
+linear prefill qkv contiguous forward M,N,K=[4096, 2304, 768]: reference=827.02 us, student=900.12 us, speedup=0.92x, reference=17.5273 TFLOP/s, student=16.1040 TFLOP/s
+linear prefill o contiguous forward M,N,K=[4096, 768, 768]: reference=295.85 us, student=301.66 us, speedup=0.98x, reference=16.3318 TFLOP/s, student=16.0175 TFLOP/s
+linear prefill gate_up contiguous forward M,N,K=[4096, 4096, 768]: reference=1440.89 us, student=1508.11 us, speedup=0.96x, reference=17.8846 TFLOP/s, student=17.0875 TFLOP/s
+linear prefill down contiguous forward M,N,K=[4096, 768, 2048]: reference=740.45 us, student=792.84 us, speedup=0.93x, reference=17.4013 TFLOP/s, student=16.2515 TFLOP/s
+linear prefill lm_head contiguous forward M,N,K=[8, 8192, 768]: reference=28.78 us, student=21.70 us, speedup=1.33x, reference=3.4971 TFLOP/s, student=4.6392 TFLOP/s
+linear prefill lm_head contiguous split_k_partials M,N,K=[8, 8192, 768]: student=18.95 us, performance=5.3109 TFLOP/s
+linear prefill lm_head contiguous split_k_reduce M,N,K=[8, 8192, 768]: student=2.64 us, performance=0.1984 TFLOP/s
+linear decode qkv contiguous forward M,N,K=[8, 2304, 768]: reference=13.19 us, student=10.57 us, speedup=1.25x, reference=2.1466 TFLOP/s, student=2.6791 TFLOP/s
+linear decode qkv contiguous split_k_partials M,N,K=[8, 2304, 768]: student=8.23 us, performance=3.4388 TFLOP/s
+linear decode qkv contiguous split_k_reduce M,N,K=[8, 2304, 768]: student=2.19 us, performance=0.0673 TFLOP/s
+linear decode o contiguous forward M,N,K=[8, 768, 768]: reference=9.42 us, student=7.84 us, speedup=1.20x, reference=1.0017 TFLOP/s, student=1.2031 TFLOP/s
+linear decode o contiguous split_k_partials M,N,K=[8, 768, 768]: student=5.77 us, performance=1.6369 TFLOP/s
+linear decode o contiguous split_k_reduce M,N,K=[8, 768, 768]: student=1.94 us, performance=0.0254 TFLOP/s
+linear decode gate_up contiguous forward M,N,K=[8, 4096, 768]: reference=20.62 us, student=13.99 us, speedup=1.47x, reference=2.4405 TFLOP/s, student=3.5982 TFLOP/s
+linear decode gate_up contiguous split_k_partials M,N,K=[8, 4096, 768]: student=11.59 us, performance=4.3420 TFLOP/s
+linear decode gate_up contiguous split_k_reduce M,N,K=[8, 4096, 768]: student=2.31 us, performance=0.1133 TFLOP/s
+linear decode down contiguous forward M,N,K=[8, 768, 2048]: reference=16.11 us, student=13.26 us, speedup=1.21x, reference=1.5624 TFLOP/s, student=1.8978 TFLOP/s
+linear decode down contiguous split_k_partials M,N,K=[8, 768, 2048]: student=11.19 us, performance=2.2485 TFLOP/s
+linear decode down contiguous split_k_reduce M,N,K=[8, 768, 2048]: student=1.94 us, performance=0.0254 TFLOP/s
+linear decode lm_head contiguous forward M,N,K=[8, 8192, 768]: reference=28.90 us, student=21.80 us, speedup=1.33x, reference=3.4835 TFLOP/s, student=4.6174 TFLOP/s
+linear decode lm_head contiguous split_k_partials M,N,K=[8, 8192, 768]: student=18.95 us, performance=5.3109 TFLOP/s
+linear decode lm_head contiguous split_k_reduce M,N,K=[8, 8192, 768]: student=2.65 us, performance=0.1977 TFLOP/s
+saved runs/linear-kernel-performance.jso
+基本所有小M的问题规模都获得相当多的性能提升。
