@@ -12,6 +12,7 @@
 #include "attention_common.h"
 #include "attention_forward_kernel.cuh"
 #include "attention_forward_BF16_kernel.cuh"
+#include "attention_decode_BF16_kernel.cuh"
 
 namespace {
 torch::Tensor aligned_contiguous(torch::Tensor x) {
@@ -100,6 +101,32 @@ attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v,
   }
   else {
     static_assert(sizeof(at::BFloat16) == sizeof(attention_bf16::Element));
+    if (Tq == 1 && Tk <= attention_bf16::DECODE_MAX_KEYS) {
+      namespace bf = attention_bf16;
+      const int splits = int((Tk - 1) / bf::DECODE_KEYS + 1);
+      auto qp = reinterpret_cast<const bf::Element*>(q.data_ptr<at::BFloat16>());
+      auto kp = reinterpret_cast<const bf::Element*>(k.data_ptr<at::BFloat16>());
+      auto vp = reinterpret_cast<const bf::Element*>(v.data_ptr<at::BFloat16>());
+      auto op = reinterpret_cast<bf::Element*>(o.data_ptr<at::BFloat16>());
+      // bh uses grid.x; splitting uses grid.y (at most 32), so existing grid
+      // bounds remain sufficient even for many batch/head pairs.
+      dim3 blocks(static_cast<unsigned>(B * Nh), static_cast<unsigned>(splits));
+      if (splits == 1) {
+        bf::decode_partial<true><<<blocks, bf::DECODE_THREADS, 0, stream>>>(
+            qp, kp, vp, op, lse.data_ptr<float>(), nullptr, Tk, splits);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+      } else {
+        auto partials = torch::empty({B, Nh, splits, bf::DECODE_PARTIAL},
+                                    q.options().dtype(at::kFloat));
+        bf::decode_partial<false><<<blocks, bf::DECODE_THREADS, 0, stream>>>(
+            qp, kp, vp, op, lse.data_ptr<float>(), partials.data_ptr<float>(), Tk, splits);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        bf::decode_merge<<<static_cast<unsigned>(B * Nh), bf::DH, 0, stream>>>(
+            partials.data_ptr<float>(), op, lse.data_ptr<float>(), splits);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+      }
+      return {o, lse};
+    }
     dim3 Blocks(static_cast<unsigned>(B * Nh * q_tiles));
     attention_bf16::forward<<<Blocks, attention_bf16::THREADS,
                             sizeof(attention_bf16::SharedStorage), stream>>>(

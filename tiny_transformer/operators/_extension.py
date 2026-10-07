@@ -21,7 +21,7 @@ def load_attention_extension():
     sources = [source_root / name for name in ("bindings.cpp", "attention.cu")]
     required = sources + [source_root / name for name in
                           ("attention.h", "attention_common.h", "attention_forward_kernel.cuh",
-                           "attention_forward_BF16_kernel.cuh")]
+                           "attention_forward_BF16_kernel.cuh", "attention_decode_BF16_kernel.cuh")]
     if not all(path.is_file() for path in required):
         raise RuntimeError(
             "student CUDA sources are missing; run from the repository or an editable install"

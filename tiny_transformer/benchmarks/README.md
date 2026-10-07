@@ -109,6 +109,11 @@ SDPA 保留 PyTorch 自动选择后端的行为；该选项不强制使用 Flash
 
 `--dim/--heads/--out-features/--hidden-dim/--vocab-size` 调整对应形状；
 BF16 attention 的 `--precision bf16` 直接创建 BF16 Q/K/V，不启用 autocast。
+BF16 prefill/chunk 使用 Q 常驻 shared memory、P 常驻寄存器的 Tensor Core kernel，
+`BQ=64,BK=BH=32`，K/V 通过两个 union stage 复用 subtile 存储（12 KiB/CTA）。
+`Q=1,K<=4096` 使用专用
+SIMT split-KV decode，K>128 时包含 partial 和 merge 两次 kernel 启动。K>4096 使用
+通用 Tensor Core kernel；可以用 `--seq-length 128/129/4096/4097` 分别观察分派边界。
 attention 默认 `--attention-timing operator` 使用完整算子计时，包含输出分配及必要的连续化/对齐复制；
 可用 `--layouts contiguous strided` 比较复制开销，`--linear-timing kernel` 不适用于 attention。
 `--attention-timing graph` 仅用于 `--operator attention --phases forward`。

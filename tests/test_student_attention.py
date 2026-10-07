@@ -80,7 +80,8 @@ class StudentAttentionCudaTests(unittest.TestCase):
 
     def test_bf16_tiles_tails_and_cache(self):
         self.require_bf16()
-        for tq, tk in ((1, 1), (17, 17), (64, 64), (65, 65), (129, 129),
+        for tq, tk in ((1, 1), (17, 17), (31, 31), (32, 32), (33, 33),
+                       (64, 64), (65, 65), (129, 129),
                        (193, 193), (257, 257), (1, 513), (7, 193), (65, 193)):
             with self.subTest(tq=tq, tk=tk):
                 q = torch.randn(2, 3, tq, 64, device='cuda', dtype=torch.bfloat16)
@@ -89,6 +90,22 @@ class StudentAttentionCudaTests(unittest.TestCase):
                 for store in stores:
                     store[:, :, :tk].normal_()
                 self.check_forward(q, stores[0][:, :, :tk], stores[1][:, :, :tk], tk - tq)
+
+    def test_bf16_feature_subtiles_and_full_output_rescale(self):
+        self.require_bf16()
+        # Each probe isolates a QK feature on either side of a BH/MMA boundary.
+        # Increasing key scores force alpha != 1 across BK=32 tiles, while V
+        # varies in both token and output-feature dimensions (including d>=32).
+        key_codes = torch.arange(65, device='cuda', dtype=torch.bfloat16) / 32
+        feature_codes = (torch.arange(64, device='cuda', dtype=torch.bfloat16) - 32) / 16
+        v = (key_codes[:, None] * feature_codes[None, :]).view(1, 1, 65, 64)
+        for feature in (0, 15, 16, 31, 32, 47, 48, 63):
+            with self.subTest(feature=feature):
+                q = torch.zeros_like(v)
+                k = torch.zeros_like(v)
+                q[..., feature] = 4
+                k[..., feature] = key_codes * 8
+                self.check_forward(q, k, v)
 
     def test_bf16_unaligned_and_strided_views(self):
         self.require_bf16()
@@ -105,6 +122,29 @@ class StudentAttentionCudaTests(unittest.TestCase):
         views = [torch.randn(1, 1, 65, 64, device='cuda', dtype=torch.bfloat16)
                  .expand(2, 3, -1, -1) for _ in range(3)]
         self.check_forward(*views)
+
+    def test_bf16_decode_split_boundaries_and_rescaling(self):
+        self.require_bf16()
+        # One-pass, split/merge, tail partitions, and the generic-kernel fallback.
+        for tk in (1, 2, 7, 127, 128, 129, 255, 256, 257, 511, 512, 513,
+                   4095, 4096, 4097):
+            with self.subTest(tk=tk):
+                q = torch.randn(2, 3, 1, 64, device='cuda', dtype=torch.bfloat16)
+                k, v = [torch.randn(2, 3, tk, 64, device='cuda', dtype=torch.bfloat16)
+                        for _ in range(2)]
+                self.check_forward(q, k, v, tk - 1)
+        # Different partition maxima must be rescaled before combining sums and
+        # numerators; averaging partition outputs or exponentiating raw scores fails.
+        q = torch.ones(2, 3, 1, 64, device='cuda', dtype=torch.bfloat16)
+        k, v = [torch.randn(2, 3, 257, 64, device='cuda', dtype=torch.bfloat16)
+                for _ in range(2)]
+        k[:, :, :128].fill_(-10)
+        k[:, :, 128:256].fill_(10)
+        self.check_forward(q, k, v, 256)
+        q.zero_()
+        v.fill_(1)
+        actual = self.check_forward(q, k, v, 256)
+        torch.testing.assert_close(actual, torch.ones_like(actual), atol=0, rtol=0)
 
     def test_bf16_exact_output_large_logits_and_causality(self):
         self.require_bf16()
@@ -127,22 +167,23 @@ class StudentAttentionCudaTests(unittest.TestCase):
     @torch.no_grad()
     def test_bf16_current_stream_with_alignment_copies(self):
         self.require_bf16()
-        count = 2 * 3 * 65 * 64
-        inputs = [torch.zeros(count + 1, device='cuda', dtype=torch.bfloat16)[1:]
-                  .view(2, 3, 65, 64) for _ in range(3)]
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            torch.cuda._sleep(10_000_000)
-            for x, value in zip(inputs, (0.25, 0.5, 2.0)):
-                x.fill_(value)
-            actual, lse = self.extension.attention_forward(*inputs)
-            actual, lse = actual.clone(), lse.clone()
-        stream.synchronize()
-        self.assertEqual(lse.dtype, torch.float32)
-        torch.testing.assert_close(actual, torch.full_like(actual, 2.0), atol=0, rtol=0)
-        expected_lse = 1.0 + torch.arange(1, 66, device='cuda').float().log()
-        torch.testing.assert_close(lse, expected_lse.expand_as(lse), atol=2e-4, rtol=2e-5)
+        for tq, tk in ((65, 65), (1, 257)):
+            with self.subTest(tq=tq, tk=tk):
+                inputs = [torch.zeros(2 * 3 * t * 64 + 1, device='cuda', dtype=torch.bfloat16)[1:]
+                          .view(2, 3, t, 64) for t in (tq, tk, tk)]
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    torch.cuda._sleep(10_000_000)
+                    for x, value in zip(inputs, (0.25, 0.5, 2.0)):
+                        x.fill_(value)
+                    actual, lse = self.extension.attention_forward(*inputs, tk - tq)
+                    actual, lse = actual.clone(), lse.clone()
+                stream.synchronize()
+                self.assertEqual(lse.dtype, torch.float32)
+                torch.testing.assert_close(actual, torch.full_like(actual, 2.0), atol=0, rtol=0)
+                expected_lse = 1.0 + torch.arange(tk - tq + 1, tk + 1, device='cuda').float().log()
+                torch.testing.assert_close(lse, expected_lse.expand_as(lse), atol=2e-4, rtol=2e-5)
 
     def test_bf16_validation(self):
         inputs = [torch.randn(2, 3, 7, 64, device='cuda', dtype=torch.bfloat16)
