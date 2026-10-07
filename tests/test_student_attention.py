@@ -42,8 +42,12 @@ class StudentAttentionCudaTests(unittest.TestCase):
 
     @torch.no_grad()
     def check_forward(self, q, k, v, past_len=0, segments=None):
-        originals = [x.clone() for x in (q, k, v)]
+        # SDPA backends may assume aligned bases even for contiguous tensors.
+        # clone (not just contiguous) gives the oracle fresh aligned storage;
+        # the candidate still receives the original views below.
+        originals = [x.clone(memory_format=torch.contiguous_format) for x in (q, k, v)]
         actual, lse = self.extension.attention_forward(q, k, v, past_len, segments)
+        torch.cuda.current_stream(q.device).synchronize()
         # FP64 oracle avoids TF32 settings affecting the reference.
         scores = q.double() @ k.double().transpose(-1, -2) / math.sqrt(64)
         allowed = reference.causal_mask(q, k, past_len, segments)
@@ -55,8 +59,9 @@ class StudentAttentionCudaTests(unittest.TestCase):
             # P is rounded to BF16 before PV, while LSE stays in FP32.
             torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=3e-2)
             torch.testing.assert_close(lse, scores.logsumexp(-1).float(), atol=2e-4, rtol=2e-5)
-            torch.testing.assert_close(actual, reference.sdpa_attention(q, k, v, past_len),
-                                       atol=2e-2, rtol=3e-2)
+            sdpa = reference.sdpa_attention(*originals, past_len=past_len)
+            torch.cuda.current_stream(q.device).synchronize()
+            torch.testing.assert_close(actual, sdpa, atol=2e-2, rtol=3e-2)
         else:
             torch.testing.assert_close(actual, expected.float(), atol=3e-5, rtol=3e-5)
             torch.testing.assert_close(lse, scores.logsumexp(-1).float(), atol=3e-5, rtol=3e-5)

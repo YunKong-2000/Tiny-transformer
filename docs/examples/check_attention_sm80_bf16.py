@@ -14,6 +14,7 @@ import torch.nn.functional as F
 @torch.no_grad()
 def check(extension, q, k, v, past_len):
     out, lse = extension.forward(q, k, v, past_len)
+    torch.cuda.current_stream(q.device).synchronize()
     tq, tk = q.shape[2], k.shape[2]
     qi = torch.arange(tq, device=q.device) + past_len
     kj = torch.arange(tk, device=q.device)
@@ -21,7 +22,11 @@ def check(extension, q, k, v, past_len):
     score = (q.double() @ k.double().transpose(-1, -2)) / math.sqrt(q.shape[-1])
     score = score.masked_fill(~mask, -float('inf'))
     oracle = score.softmax(-1) @ v.double()
-    sdpa = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+    # Only the candidate consumes the original adversarial views. Some SDPA
+    # backends assume aligned storage; contiguous() alone preserves an odd offset.
+    sdpa_inputs = [x.clone(memory_format=torch.contiguous_format) for x in (q, k, v)]
+    sdpa = F.scaled_dot_product_attention(*sdpa_inputs, attn_mask=mask, dropout_p=0.0)
+    torch.cuda.current_stream(q.device).synchronize()
     # P is rounded to BF16 per block before PV. This differs from FP64 and from
     # SDPA's internal rounding; report error and apply BF16-appropriate tolerances.
     torch.testing.assert_close(out.float(), oracle.float(), atol=2e-2, rtol=3e-2)
