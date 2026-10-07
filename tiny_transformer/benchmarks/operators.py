@@ -45,6 +45,8 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--operator", choices=(*NAMES, "all"), required=True)
     parser.add_argument("--backend", choices=("student", "reference", "sdpa"), default="student")
+    parser.add_argument("--baseline", choices=("reference", "sdpa"), default="reference",
+                        help="comparison baseline; sdpa is available for --operator attention")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--precision", choices=DTYPES, default="fp32")
     parser.add_argument("--phases", nargs="+", choices=("forward", "backward"),
@@ -98,6 +100,8 @@ def validate_args(parser, args):
         parser.error("this benchmark requires CUDA; CPU timings are not supported")
     if args.backend == "sdpa" and args.operator not in ("attention", "all"):
         parser.error("sdpa is only an attention backend")
+    if args.baseline == "sdpa" and args.operator != "attention":
+        parser.error("--baseline sdpa requires --operator attention")
 
 
 def run_case(operator, args, case, phases, implementation):
@@ -111,6 +115,10 @@ def run_case(operator, args, case, phases, implementation):
         candidate = getattr(student, operator)
         if operator == "embedding":
             candidate = partial(candidate, backward_impl=implementation)
+    # Select the baseline independently: --backend reference still means the
+    # unfused operator, even when it is measured against SDPA.
+    if args.baseline == "sdpa":
+        expected_function = reference.sdpa_attention
     # Re-seeding per variant gives grouped/baseline exactly the same upstream.
     # fork_rng restores state so validation does not change subsequent case inputs.
     devices = [case.inputs[0].device] if case.inputs[0].is_cuda else []
@@ -153,7 +161,8 @@ def run(args, device):
             # Unsupported cases need no GPU allocation or compilation.
             case = make_case(operator, args, device, DTYPES[args.precision], workload, layout, pattern) if phases else None
             for implementation in implementations:
-                result = {"operator": operator, "backend": args.backend, "workload": workload,
+                result = {"operator": operator, "backend": args.backend, "baseline": args.baseline,
+                          "workload": workload,
                           "layout": layout, "status": "passed" if phases else "skipped"}
                 if pattern is not None:
                     result["pattern"] = pattern
@@ -173,7 +182,7 @@ def run(args, device):
                         print(f"{label}: skipped ({value['reason']})")
                     else:
                         ratio = f"{value['speedup']:.2f}x" if value["speedup"] is not None else "n/a"
-                        print(f"{label}: reference={value['reference_us']:.2f} us, "
+                        print(f"{label}: {args.baseline}={value['reference_us']:.2f} us, "
                               f"{args.backend}={value['candidate_us']:.2f} us, speedup={ratio}")
             del case
     return results
@@ -196,7 +205,7 @@ def run_linear(args, device):
                            else unsupported_reason("linear", args.backend, args.precision, phase, layout, args.dim))
                    for phase in requested}
         phases = tuple(phase for phase, reason in reasons.items() if reason is None)
-        result = {"operator": "linear", "backend": args.backend, "workload": workload,
+        result = {"operator": "linear", "backend": args.backend, "baseline": "reference", "workload": workload,
                   "layout": layout, "status": "passed" if phases else "skipped",
                   "timing_mode": args.linear_timing, **spec}
         if workload == "train":

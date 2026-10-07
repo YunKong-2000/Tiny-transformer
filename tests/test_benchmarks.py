@@ -451,10 +451,68 @@ class BenchmarkHostTests(unittest.TestCase):
             self.assertEqual(row['forward']['status'], 'passed')
             self.assertEqual(row['backward']['status'], 'skipped')
 
+    def test_attention_sdpa_baseline_times_selected_pair_on_shared_inputs(self):
+        # Real CPU SDPA checks values; only CUDA timing/student are test doubles.
+        args = small_args('--operator', 'attention', '--baseline', 'sdpa',
+                          '--dim', '128', '--heads', '2', '--phases', 'forward')
+        validate_args(build_parser(), args)
+        sdpa, unfused = reference.sdpa_attention, reference.attention
+        timing = {'reference_us': 2., 'candidate_us': 1., 'speedup': 2.}
+        seen_shapes = []
+
+        def measure(functions, *unused):
+            baseline.reset_mock()
+            candidate.reset_mock()
+            left, right = [function() for function in functions]
+            baseline.assert_called_once()
+            candidate.assert_called_once()
+            for a, b in zip(baseline.call_args.args[:3], candidate.call_args.args[:3]):
+                self.assertEqual(a.data_ptr(), b.data_ptr())
+                self.assertEqual(a.dtype, b.dtype)
+            seen_shapes.append((baseline.call_args.args[0].shape[-2],
+                                baseline.call_args.args[1].shape[-2]))
+            torch.testing.assert_close(left, right, atol=1e-5, rtol=1e-4)
+            return timing
+
+        output = io.StringIO()
+        with patch.object(reference, 'sdpa_attention', side_effect=sdpa) as baseline, \
+                patch.object(student, 'attention', side_effect=unfused) as candidate, \
+                patch('tiny_transformer.benchmarks.operators.measure_pair', side_effect=measure), \
+                redirect_stdout(output):
+            rows = run(args, torch.device('cpu'))
+        self.assertEqual(seen_shapes, [(3, 3), (1, 3)])
+        self.assertIn('sdpa=2.00 us, student=1.00 us, speedup=2.00x', output.getvalue())
+        for row in rows:
+            self.assertEqual(row['baseline'], 'sdpa')
+            self.assertEqual(row['backend'], 'student')
+            self.assertEqual(row['forward']['speedup'], 2.)
+
+    def test_sdpa_baseline_does_not_replace_reference_candidate(self):
+        args = small_args('--operator', 'attention', '--baseline', 'sdpa', '--backend', 'reference')
+        case = make_case('attention', args, 'cpu', torch.float32, 'prefill')
+        sdpa, unfused = reference.sdpa_attention, reference.attention
+        with patch.object(reference, 'sdpa_attention', side_effect=sdpa) as baseline, \
+                patch.object(reference, 'attention', side_effect=unfused) as candidate, \
+                patch('tiny_transformer.benchmarks.operators.measure_pair', return_value={}):
+            run_case('attention', args, case, ('forward', 'backward'), None)
+        self.assertGreater(baseline.call_count, 0)
+        self.assertGreater(candidate.call_count, 0)
+
+    def test_sdpa_comparison_rejects_wrong_values_before_timing(self):
+        args = small_args('--operator', 'attention', '--baseline', 'sdpa',
+                          '--dim', '128', '--heads', '2', '--phases', 'forward')
+        with patch.object(student, 'attention', side_effect=lambda *a: reference.attention(*a) + 1), \
+                patch('tiny_transformer.benchmarks.operators.measure_pair') as measure:
+            with self.assertRaises(AssertionError):
+                run(args, torch.device('cpu'))
+        measure.assert_not_called()
+
     def test_invalid_options(self):
         for options in (('--dim', '7'), ('--dim', '6'), ('--repeats', '0'),
                         ('--device', 'cpu'), ('--eps', 'nan'), ('--inference-batch-size', '0'),
-                        ('--operator', 'rope', '--workloads', 'train')):
+                        ('--operator', 'rope', '--workloads', 'train'),
+                        ('--baseline', 'sdpa'),
+                        ('--operator', 'linear', '--baseline', 'sdpa')):
             with self.subTest(options=options), redirect_stdout(io.StringIO()), \
                     patch('sys.stderr', new_callable=io.StringIO):
                 with self.assertRaises(SystemExit):

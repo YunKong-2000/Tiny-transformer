@@ -53,6 +53,13 @@ python -m tiny_transformer.benchmarks --operator all --backend reference \
 python -m tiny_transformer.benchmarks --operator attention --backend sdpa \
   --precision bf16 --output runs/attention-sdpa-performance.json
 
+# 同一组输入直接比较 student 与 SDPA：speedup = SDPA 耗时 / student 耗时。
+python -m tiny_transformer.benchmarks --operator attention \
+  --backend student --baseline sdpa --phases forward \
+  --device cuda:1 --precision fp32 \
+  --batch-size 8 --heads 12 --dim 768 --seq-length 512 \
+  --output runs/attention-student-vs-sdpa.json
+
 # 整模型请求指标。
 python -m tiny_transformer.benchmarks.model --config configs/smoke.json \
   --device cuda --precision fp32 --op rms_norm=student \
@@ -62,6 +69,13 @@ python -m tiny_transformer.benchmarks.model --config configs/smoke.json \
 `python -m tiny_transformer.benchmarks.embedding` 是统一 CLI 的快捷入口，默认只测 prefill，
 保留原 embedding 默认行为；可传 `--workloads prefill decode`。
 所有入口都可用 `--help` 查看选项。
+
+`--baseline` 默认为 `reference`；`--baseline sdpa` 仅用于 `--operator attention`。
+基线与候选使用同一组输入和 dtype，先校验再交替计时；FP32 matmul 使用 `highest` 精度。
+控制台会显示 `sdpa=... us, student=... us`。JSON 每项的 `baseline` 标识所选基线，
+`reference_us/reference_trials_us` 保存该基线的耗时，`candidate_us` 保存 `--backend` 的耗时，
+`speedup` 始终为基线耗时除以候选耗时，大于 1 表示候选更快。
+SDPA 保留 PyTorch 自动选择后端的行为；该选项不强制使用 FlashAttention kernel。
 
 ## 相同的方法，不同的输入契约
 
