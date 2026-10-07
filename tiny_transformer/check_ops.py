@@ -41,7 +41,7 @@ def differentiable_args(args):
     return tuple(x.detach().clone().requires_grad_(True) if torch.is_tensor(x) and x.is_floating_point() else x for x in args)
 
 
-def main():
+def main(argv=None):
     from .operators.dispatch import NAMES
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--operator", choices=NAMES, required=True)
@@ -53,11 +53,23 @@ def main():
     parser.add_argument("--trials", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=100)
     parser.add_argument("--output", default="runs/operator_check.json")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if min(args.warmup, args.trials, args.repeats) <= 0 or (args.backend == "sdpa" and args.operator != "attention"):
         parser.error("positive warmup/trials/repeats required; sdpa is only an attention backend")
     device = device_for(args.device)
     validate_precision(device, args.precision)
+    previous = torch.get_float32_matmul_precision()
+    try:
+        # FP32 tensors may otherwise use TF32 matmul in the reference. Keep
+        # correctness checks, timings and the recorded environment consistent.
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        run_checks(args, device)
+    finally:
+        torch.set_float32_matmul_precision(previous)
+
+
+def run_checks(args, device):
     seed_all(42)
     function = reference.sdpa_attention if args.backend == "sdpa" else getattr(student if args.backend == "student" else reference, args.operator)
     expected_function = getattr(reference, args.operator)

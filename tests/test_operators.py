@@ -1,9 +1,16 @@
+from contextlib import redirect_stdout
+import io
+import json
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from tiny_transformer.operators import Operators, reference, student
 from tiny_transformer.check_ops import cases, differentiable_args
+from tiny_transformer import check_ops
 
 
 class OperatorTests(unittest.TestCase):
@@ -55,6 +62,43 @@ class OperatorTests(unittest.TestCase):
         q, k, v = [torch.randn(2, 2, 4, 8) for _ in range(3)]
         segments = torch.tensor([[0, 0, 1, 1], [0, 1, 1, 1]])
         torch.testing.assert_close(reference.sdpa_attention(q, k, v, segment_ids=segments), reference.attention(q, k, v, segment_ids=segments))
+
+    def test_check_ops_uses_strict_fp32_and_restores_precision(self):
+        # CPU checks policy and CLI wiring, not GPU arithmetic or TF32 kernels.
+        previous = torch.get_float32_matmul_precision()
+        self.addCleanup(torch.set_float32_matmul_precision, previous)
+        attention = reference.attention
+        for fail in (False, True):
+            with self.subTest(fail=fail), tempfile.TemporaryDirectory() as directory:
+                torch.set_float32_matmul_precision('high')
+
+                def checked_attention(*args):
+                    self.assertEqual(torch.get_float32_matmul_precision(), 'highest')
+                    self.assertFalse(torch.backends.cuda.matmul.allow_tf32)
+                    if fail:
+                        raise RuntimeError('reference failed')
+                    return attention(*args)
+
+                output = Path(directory) / 'attention.json'
+                argv = ['--operator', 'attention', '--backend', 'reference',
+                        '--device', 'cpu', '--precision', 'fp32', '--warmup', '1',
+                        '--repeats', '1', '--trials', '1', '--output', str(output)]
+                with patch.object(reference, 'attention', side_effect=checked_attention) as call, \
+                        redirect_stdout(io.StringIO()):
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError, 'reference failed'):
+                            check_ops.main(argv)
+                    else:
+                        check_ops.main(argv)
+                self.assertGreater(call.call_count, 0)
+                self.assertEqual(torch.get_float32_matmul_precision(), 'high')
+                self.assertTrue(torch.backends.cuda.matmul.allow_tf32)
+                if not fail:
+                    report = json.loads(output.read_text())
+                    self.assertFalse(report['environment']['tf32_matmul'])
+                    self.assertEqual(report['atol'], 1e-5)
+                    self.assertEqual(report['rtol'], 1e-4)
+                    self.assertEqual([row['case'] for row in report['cases']], ['prefill', 'decode'])
 
     def test_loss_ignores_masked_targets(self):
         logits = torch.randn(1, 3, 7)

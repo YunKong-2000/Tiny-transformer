@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <math_constants.h>
 #include <cute/tensor.hpp>
 #include <cute/algorithm/gemm.hpp>
 #include <cute/atom/mma_atom.hpp>
