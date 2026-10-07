@@ -30,7 +30,9 @@ def unsupported_reason(operator, backend, precision, phase, layout, dim=None, he
     if backend == "student":
         if phase not in STUDENT_PHASES.get(operator, ()):
             return f"student {operator} {phase} is not implemented"
-        if precision != "fp32" and operator not in ("residual", "cross_entropy"):
+        if operator == "attention" and precision not in ("fp32", "bf16"):
+            return "student attention currently supports only fp32 and bf16"
+        if precision != "fp32" and operator not in ("residual", "cross_entropy", "attention"):
             return f"student {operator} currently supports only fp32"
         if operator == "rms_norm" and phase == "backward" and dim is not None and dim > 1024:
             return "student rms_norm backward requires H <= 1024"

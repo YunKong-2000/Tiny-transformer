@@ -60,6 +60,14 @@ python -m tiny_transformer.benchmarks --operator attention \
   --batch-size 8 --heads 12 --dim 768 --seq-length 512 \
   --output runs/attention-student-vs-sdpa.json
 
+# BF16 Tensor Core attention：A100 上对比同 dtype 的 SDPA，仅测前向。
+TORCH_CUDA_ARCH_LIST=8.0 python -m tiny_transformer.benchmarks \
+  --operator attention --backend student --baseline sdpa --precision bf16 \
+  --device cuda:0 --phases forward --workloads prefill decode \
+  --layouts contiguous --batch-size 8 --heads 12 --dim 768 --seq-length 512 \
+  --warmup 20 --repeats 100 --trials 5 \
+  --output runs/attention-bf16-student-vs-sdpa.json
+
 # 整模型请求指标。
 python -m tiny_transformer.benchmarks.model --config configs/smoke.json \
   --device cuda --precision fp32 --op rms_norm=student \
@@ -85,12 +93,15 @@ SDPA 保留 PyTorch 自动选择后端的行为；该选项不强制使用 Flash
 | linear | QKV/O/Gate-Up/Down/LM head 的 `[B,T,K]`、`[N,K]`；训练与推理分别生成 | x、weight（仅训练反向） | FP32 SIMT 前向/反向；wrapper 复制跨步输入；尚不支持 AMP/BF16/FP16 |
 | rms_norm | `[B,T,H]`、`[H]`、eps；可测 last-only `[B,1,H]` | x、weight | FP32 前向/反向（H <= 1024）；wrapper 复制跨步输入 |
 | rope | `[B,heads,T,H/heads]` 与共享 cos/sin | x；cos/sin 是常量 | FP32 CuTe 前向/反向；直接消费输入及梯度的 stride |
-| attention | prefill `Q=K=T`；decode `Q=1,K=seq_length`，携带 past_len | q、k、v | FP32 SIMT 前向，head_dim=64；反向/低精度跳过；CUDA 验收待运行 |
+| attention | prefill `Q=K=T`；decode `Q=1,K=seq_length`，携带 past_len | q、k、v | FP32 SIMT / BF16 Tensor Core 前向，head_dim=64；BF16 要求 SM80+，无 segments；反向/FP16 跳过 |
 | swiglu | `[B,T,hidden_dim]` gate/up；跨步用例保留 chunk view | gate、up | FP32 CuTe 前向/反向；支持独立输入 stride 和非连续/零 stride 上游梯度 |
 | residual | 两个 `[B,T,H]` | 两项输入 | FP32 kernel 前向/反向；wrapper 支持 FP16/BF16 与跨步输入，计入转换/复制成本 |
 | cross_entropy | `[B,T,V]` logits、含 ignore_index 的 targets | logits | FP32 kernel 前向/反向；wrapper 支持 FP16/BF16 与跨步输入，返回 FP32 平均 loss，计入转换/复制成本 |
 
 `--dim/--heads/--out-features/--hidden-dim/--vocab-size` 调整对应形状；
+BF16 attention 的 `--precision bf16` 直接创建 BF16 Q/K/V，不启用 autocast。
+当前 attention 使用完整算子计时，包含输出分配及必要的连续化/对齐复制；
+可用 `--layouts contiguous strided` 比较复制开销，`--linear-timing kernel` 不适用于 attention。
 RoPE 要求 head_dim 是偶数。`--seq-length` 在 decode 中仍决定 attention 的 KV 长度。
 `--layouts contiguous` 使所有输入连续；`strided` 将浮点输入的末维 stride 设为 2，
 并保留 RoPE transpose/SwiGLU chunk 布局；`last-only` 仅对 RMSNorm 有效。
