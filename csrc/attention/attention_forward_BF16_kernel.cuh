@@ -216,12 +216,14 @@ void forward(const Element* q, const Element* k, const Element* v,
     }
     __syncthreads(); // All P stores must be visible before ldmatrix reads.
     gemm_smem(sP, sVt, rO, Copy_Atom<SM75_U16x4_LDSM_T, Element>{});
-    __syncthreads(); // Release current KV stage and P before either is overwritten.
 
     if (has_next) {
       cp_async_wait<0>(); // Only the prefetched next block is outstanding.
-      __syncthreads();   // Make that stage consumable by the whole CTA.
+      // One rendezvous both publishes the prefetched stage and releases the
+      // current KV/P buffers: every thread has finished PV before arriving.
+      __syncthreads();
     }
+    // The last iteration only writes register results; shared memory is not reused.
   }
 
   CUTE_UNROLL

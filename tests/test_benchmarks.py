@@ -495,6 +495,36 @@ class BenchmarkHostTests(unittest.TestCase):
             self.assertEqual(row['backend'], 'student')
             self.assertEqual(row['forward']['speedup'], 2.)
 
+    def test_attention_graph_mode_uses_validated_calls_and_keeps_trials(self):
+        args = small_args('--operator', 'attention', '--baseline', 'sdpa',
+                          '--precision', 'bf16', '--dim', '128', '--heads', '2',
+                          '--phases', 'forward', '--attention-timing', 'graph')
+        validate_args(build_parser(), args)
+        def graph_measure(functions, device, warmup, repeats, trials):
+            # Exercise the actual validated callables; graph timing itself needs CUDA.
+            left, right = [fn() for fn in functions]
+            self.assertEqual(left.dtype, torch.bfloat16)
+            torch.testing.assert_close(left, right, atol=0, rtol=0)
+            return [{'us': 4., 'trials_us': [3., 4., 5.]},
+                    {'us': 2., 'trials_us': [1., 2., 3.]}]
+        with patch.object(student, 'attention', side_effect=reference.sdpa_attention), \
+                patch('tiny_transformer.benchmarks.operators.measure_graph_calls', side_effect=graph_measure) as graph, \
+                patch('tiny_transformer.benchmarks.operators.measure_pair') as eager, \
+                redirect_stdout(io.StringIO()):
+            rows = run(args, torch.device('cpu'))
+        eager.assert_not_called()
+        self.assertEqual(graph.call_count, 2)
+        for row in rows:
+            self.assertEqual(row['timing_mode'], 'graph')
+            self.assertIn('graph replay', row['measurement']['timer'])
+            self.assertEqual(row['forward']['speedup'], 2.)
+            self.assertEqual(row['forward']['candidate_trials_us'], [1., 2., 3.])
+        with patch.object(student, 'attention', side_effect=lambda *a: reference.sdpa_attention(*a) + 1), \
+                patch('tiny_transformer.benchmarks.operators.measure_graph_calls') as graph:
+            with self.assertRaises(AssertionError):
+                run(args, torch.device('cpu'))
+        graph.assert_not_called()
+
     def test_sdpa_baseline_does_not_replace_reference_candidate(self):
         args = small_args('--operator', 'attention', '--baseline', 'sdpa', '--backend', 'reference')
         case = make_case('attention', args, 'cpu', torch.float32, 'prefill')
@@ -520,6 +550,8 @@ class BenchmarkHostTests(unittest.TestCase):
                         ('--device', 'cpu'), ('--eps', 'nan'), ('--inference-batch-size', '0'),
                         ('--operator', 'rope', '--workloads', 'train'),
                         ('--baseline', 'sdpa'),
+                        ('--attention-timing', 'graph'),
+                        ('--operator', 'attention', '--attention-timing', 'graph'),
                         ('--operator', 'linear', '--baseline', 'sdpa')):
             with self.subTest(options=options), redirect_stdout(io.StringIO()), \
                     patch('sys.stderr', new_callable=io.StringIO):

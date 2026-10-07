@@ -12,7 +12,7 @@ from ..runtime import DTYPES, device_for, environment, seed_all, validate_precis
 from .cases import LINEAR_PROJECTIONS, linear_spec, make_case
 from .common import MEASUREMENT, measure_pair, prepare_calls
 from .linear import LinearFp32Validator
-from .linear_kernels import KERNEL_MEASUREMENT, run_kernel_case
+from .linear_kernels import KERNEL_MEASUREMENT, measure_graph_calls, run_kernel_case
 from .embedding import PATTERNS
 
 
@@ -20,6 +20,15 @@ from .embedding import PATTERNS
 STUDENT_PHASES = {name: ("forward", "backward")
                   for name in ("embedding", "linear", "rms_norm", "residual", "cross_entropy", "rope", "swiglu")}
 STUDENT_PHASES["attention"] = ("forward",)
+
+ATTENTION_GRAPH_MEASUREMENT = {
+    "timer": "CUDA events around graph replay; median of per-trial mean call times",
+    "order": "alternate baseline/candidate order across trials after warming both graphs",
+    "forward": "capture complete no_grad operator calls; replay includes device kernels and required copies",
+    "excluded": "Python/host dispatch, host allocation, input generation, validation, JIT, capture and warmup",
+    "scope": "fixed inputs and graph-pool buffers, warm caches; includes device scheduling gaps; not profiler-exclusive kernel time",
+    "speedup": "reference_us / candidate_us",
+}
 
 
 def unsupported_reason(operator, backend, precision, phase, layout, dim=None, heads=None):
@@ -59,6 +68,8 @@ def build_parser():
                         default=list(LINEAR_PROJECTIONS))
     parser.add_argument("--linear-timing", choices=("kernel", "operator"), default="kernel",
                         help="Linear: prepared CUDA Graph kernel timing (default), or full operator calls")
+    parser.add_argument("--attention-timing", choices=("operator", "graph"), default="operator",
+                        help="Attention forward: eager operator calls (default), or CUDA Graph replay without host submission gaps")
     parser.add_argument("--inference-batch-size", type=int,
                         help="Linear inference batch size; defaults to --batch-size")
     parser.add_argument("--layouts", nargs="+", choices=("contiguous", "strided", "last-only"),
@@ -84,6 +95,8 @@ def build_parser():
 
 
 def validate_args(parser, args):
+    if args.attention_timing == "graph" and (args.operator != "attention" or set(args.phases) != {"forward"}):
+        parser.error("--attention-timing graph requires --operator attention --phases forward")
     if args.inference_batch_size is not None and args.inference_batch_size <= 0:
         parser.error("inference-batch-size must be positive")
     if args.workloads and "train" in args.workloads and args.operator not in ("linear", "all"):
@@ -134,9 +147,21 @@ def run_case(operator, args, case, phases, implementation):
             validator=LinearFp32Validator(*case.inputs)
             if operator == "linear" and case.inputs[0].dtype == torch.float32 else None)
     result = {"validation": errors}
+    graph_timing = operator == "attention" and args.attention_timing == "graph"
+    if operator == "attention":
+        result["timing_mode"] = args.attention_timing
+        result["measurement"] = ATTENTION_GRAPH_MEASUREMENT if graph_timing else MEASUREMENT
     for phase, functions in calls.items():
-        result[phase] = {"status": "passed", **measure_pair(
-            functions, args.warmup, args.repeats, args.trials)}
+        if graph_timing:
+            baseline, candidate = measure_graph_calls(
+                functions, case.inputs[0].device, args.warmup, args.repeats, args.trials)
+            timing = {"reference_us": baseline["us"], "candidate_us": candidate["us"],
+                      "reference_trials_us": baseline["trials_us"],
+                      "candidate_trials_us": candidate["trials_us"],
+                      "speedup": baseline["us"] / candidate["us"] if candidate["us"] > 0 else None}
+        else:
+            timing = measure_pair(functions, args.warmup, args.repeats, args.trials)
+        result[phase] = {"status": "passed", **timing}
     return result
 
 
@@ -265,7 +290,8 @@ def main(argv=None):
             results = run(args, device)
             write_json(args.output, {
                 "schema_version": 2, "environment": environment(device), "arguments": vars(args),
-                "measurement": KERNEL_MEASUREMENT if args.operator == "linear" and args.linear_timing == "kernel" else MEASUREMENT,
+                "measurement": (ATTENTION_GRAPH_MEASUREMENT if args.attention_timing == "graph" else
+                                KERNEL_MEASUREMENT if args.operator == "linear" and args.linear_timing == "kernel" else MEASUREMENT),
                 "linear_kernel_measurement": KERNEL_MEASUREMENT if args.linear_timing == "kernel" else None,
                 "notice": "reference backend is a harness baseline; skipped phases have no timings; "
                           "representative cases do not certify the full operator contract",

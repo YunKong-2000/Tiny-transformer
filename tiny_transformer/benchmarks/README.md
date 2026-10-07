@@ -68,6 +68,15 @@ TORCH_CUDA_ARCH_LIST=8.0 python -m tiny_transformer.benchmarks \
   --warmup 20 --repeats 100 --trials 5 \
   --output runs/attention-bf16-student-vs-sdpa.json
 
+# 同一算子的 Graph 重放计时：帮助区分 host 提交间隙和 GPU 执行开销。
+TORCH_CUDA_ARCH_LIST=8.0 python -m tiny_transformer.benchmarks \
+  --operator attention --backend student --baseline sdpa --precision bf16 \
+  --device cuda:0 --phases forward --workloads prefill decode \
+  --attention-timing graph --layouts contiguous \
+  --batch-size 8 --heads 12 --dim 768 --seq-length 512 \
+  --warmup 20 --repeats 100 --trials 5 \
+  --output runs/attention-bf16-graph.json
+
 # 整模型请求指标。
 python -m tiny_transformer.benchmarks.model --config configs/smoke.json \
   --device cuda --precision fp32 --op rms_norm=student \
@@ -100,8 +109,16 @@ SDPA 保留 PyTorch 自动选择后端的行为；该选项不强制使用 Flash
 
 `--dim/--heads/--out-features/--hidden-dim/--vocab-size` 调整对应形状；
 BF16 attention 的 `--precision bf16` 直接创建 BF16 Q/K/V，不启用 autocast。
-当前 attention 使用完整算子计时，包含输出分配及必要的连续化/对齐复制；
+attention 默认 `--attention-timing operator` 使用完整算子计时，包含输出分配及必要的连续化/对齐复制；
 可用 `--layouts contiguous strided` 比较复制开销，`--linear-timing kernel` 不适用于 attention。
+`--attention-timing graph` 仅用于 `--operator attention --phases forward`。
+两边使用原有完整算子和相同输入，在数值校验与预热后各捕获 repeats 次调用；
+用 CUDA events 测量图重放时间，除以 repeats，交替后端顺序并取 trials 中位数。
+host 参数检查、分配和 Python 调度在捕获阶段完成；重放包含 GPU kernel、必要的数据复制
+和图调度间隙，使用固定输入和 graph pool 缓冲区，不是 profiler 的纯 kernel 时间。
+JSON 的 `timing_mode` 和 `measurement` 区分两种口径；只能在同一口径内比较 speedup。
+原计时很慢而 graph 明显变快提示 host 提交开销；graph 仍慢则需要进一步用 profiler
+检查 GPU 执行。SDPA 仍由 PyTorch 自动选择后端，不强制某种 attention kernel。
 RoPE 要求 head_dim 是偶数。`--seq-length` 在 decode 中仍决定 attention 的 KV 长度。
 `--layouts contiguous` 使所有输入连续；`strided` 将浮点输入的末维 stride 设为 2，
 并保留 RoPE transpose/SwiGLU chunk 布局；`last-only` 仅对 RMSNorm 有效。

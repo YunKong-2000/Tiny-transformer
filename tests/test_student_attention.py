@@ -167,6 +167,31 @@ class StudentAttentionCudaTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'SM80'):
                 self.extension.attention_forward(*inputs)
 
+    @torch.no_grad()
+    def test_bf16_cuda_graph_replay(self):
+        self.require_bf16()
+        for tq, tk in ((65, 193), (1, 193)):
+            with self.subTest(tq=tq, tk=tk):
+                # Capture also covers alignment copies and output allocations.
+                inputs = [torch.randn(2 * 3 * t * 64 + 1, device='cuda', dtype=torch.bfloat16)[1:]
+                          .view(2, 3, t, 64) for t in (tq, tk, tk)]
+                expected = self.check_forward(*inputs, past_len=tk - tq)
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    for _ in range(3):
+                        _, expected_lse = self.extension.attention_forward(*inputs, tk - tq)
+                stream.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    actual, lse = self.extension.attention_forward(*inputs, tk - tq)
+                for _ in range(2):
+                    actual.fill_(float('nan'))
+                    lse.fill_(float('nan'))
+                    graph.replay()
+                    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+                    torch.testing.assert_close(lse, expected_lse, atol=0, rtol=0)
+
     def test_prefill_tiles_and_sequence_tails(self):
         for time in (1, 7, 31, 32, 33, 65, 96):
             with self.subTest(time=time):

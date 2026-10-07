@@ -30,6 +30,15 @@ compute-sanitizer --tool synccheck --error-exitcode 1 python -m unittest discove
 Clang 对输入检查头文件和绑定的 C++17 语法检查通过；此检查不包含 CUDA kernel。
 尚未运行 nvcc、GPU 数值测试或 compute-sanitizer。
 
+BF16 性能排查：host 使用 `at::cuda::getDeviceProperties` 的设备缓存，避免每次调用
+查询 CUDA runtime。每轮 PV 后的缓冲区释放同步和下一 stage 的发布同步合并：
+先等待预取完成，再做一次 CTA barrier；到达 barrier 时所有线程都已完成当前 PV。
+最后一轮不再复用 shared memory，无需额外 barrier。P 写完后的消费前同步保留。
+同步改动仍需重跑数值测试和 compute-sanitizer racecheck/synccheck 验证。
+性能入口新增 `--attention-timing graph --phases forward`，完整算子图重放与原有
+operator 耗时分开报告，具体口径见 benchmarks README。新增 GPU 测试检查未对齐
+prefill/decode 输入在 CUDA Graph 中捕获和重复重放的 O/LSE。
+
 2026-10-07 本地验证：student 回归 82 项（11 项通过、71 项 CUDA 跳过），
 benchmark 回归 25 项通过，operator 回归 10 项通过；Clang 对绑定和输入检查头文件的
 C++17 语法检查通过。未运行 nvcc、GPU 数值测试或 compute-sanitizer。

@@ -2,6 +2,7 @@
 #include <optional>
 #include <limits>
 #include <cstdint>
+#include <ATen/cuda/CUDAContextLight.h>
 #include <c10/core/GradMode.h>
 #include <c10/cuda/CUDAException.h>
 #include "c10/cuda/CUDAStream.h"
@@ -57,9 +58,9 @@ attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v,
   // Q/K are contiguous inside the kernel. This also handles cache prefixes,
   // arbitrary input views and their storage offsets on the current stream.
   if (is_bf16) {
-    cudaDeviceProp props;
-    C10_CUDA_CHECK(cudaGetDeviceProperties(&props, q.get_device()));
-    TORCH_CHECK(props.major >= 8, "BF16 MMA/cp.async require SM80 or later");
+    // PyTorch caches properties per device; avoid a runtime query on every call.
+    const auto* props = at::cuda::getDeviceProperties(q.get_device());
+    TORCH_CHECK(props->major >= 8, "BF16 MMA/cp.async require SM80 or later");
     q = aligned_contiguous(q);
     k = aligned_contiguous(k);
     v = aligned_contiguous(v);
