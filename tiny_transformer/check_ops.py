@@ -23,7 +23,7 @@ def cases(name, device, dtype, decode=False):
         return x, angles.cos(), angles.sin()
     if name == "attention":
         length = 23 if decode else time
-        return (rand(batch, heads, time, 16), rand(batch, heads, length, 16), rand(batch, heads, length, 16), length - time, None)
+        return (rand(batch, heads, time, 64), rand(batch, heads, length, 64), rand(batch, heads, length, 64), length - time, None)
     if name in ("swiglu", "residual"):
         return rand(batch, time, 65), rand(batch, time, 65)
     if name == "embedding":

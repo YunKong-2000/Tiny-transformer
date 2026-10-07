@@ -1,5 +1,10 @@
 # 学生 CUDA / CuTe / CUTLASS 源码目录
 
+Attention 位于 `attention/`：CuTe FP32 SIMT 融合前向，固定 head_dim=64，支持
+causal prefill/decode/chunk、序列尾块、跨步输入和可选 segment IDs。
+`load_attention_extension()` 延迟编译，原生返回 O/LSE，Python 只返回 O。
+反向和 AMP 尚未实现；测试及 CUDA 验收限制见 [Attention 实现记录](attention/development.md)。
+
 Linear 位于 `linear/`：CUTLASS FP32 SIMT 的前向、dX 和 dW，使用当前 CUDA stream。
 通过独立的 `bindings.cpp` 和 `load_linear_extension()` 延迟编译；Python wrapper 复制跨步输入、
 恢复前导维度并接入一阶 autograd。当前不支持 BF16/FP16、autocast 或 compile 自定义算子注册。

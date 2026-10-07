@@ -436,6 +436,21 @@ class BenchmarkHostTests(unittest.TestCase):
         self.assertIsNone(unsupported_reason('rms_norm', 'student', 'fp32', 'forward', 'contiguous', 1025))
         self.assertIsNone(unsupported_reason('rms_norm', 'student', 'fp32', 'backward', 'contiguous', 1024))
 
+    def test_attention_forward_support_and_explicit_limits(self):
+        self.assertIsNone(unsupported_reason('attention', 'student', 'fp32', 'forward', 'strided', 768, 12))
+        self.assertIn('head_dim=64', unsupported_reason('attention', 'student', 'fp32', 'forward', 'contiguous', 128, 4))
+        self.assertIn('not implemented', unsupported_reason('attention', 'student', 'fp32', 'backward', 'contiguous', 768, 12))
+        self.assertIn('fp32', unsupported_reason('attention', 'student', 'bf16', 'forward', 'contiguous', 768, 12))
+        args = small_args('--operator', 'attention', '--dim', '128', '--heads', '2')
+        with patch.object(student, 'attention', side_effect=reference.attention), \
+                patch('tiny_transformer.benchmarks.operators.measure_pair',
+                      return_value={'speedup': 1., 'reference_us': 1., 'candidate_us': 1.}), \
+                redirect_stdout(io.StringIO()):
+            results = run(args, torch.device('cpu'))
+        for row in results:
+            self.assertEqual(row['forward']['status'], 'passed')
+            self.assertEqual(row['backward']['status'], 'skipped')
+
     def test_invalid_options(self):
         for options in (('--dim', '7'), ('--dim', '6'), ('--repeats', '0'),
                         ('--device', 'cpu'), ('--eps', 'nan'), ('--inference-batch-size', '0'),

@@ -2,6 +2,11 @@
 
 [返回算子总契约](README.md) · [参考实现](../../tiny_transformer/operators/reference.py) · [调用位置](../../tiny_transformer/model.py)
 
+当前 student 已接入 **FP32 SIMT 前向、固定 head_dim=64**。支持序列尾块、cache/chunk、
+非连续输入和可选 segment IDs；Q/K/segment IDs 在原生入口连续化，V 使用实际 stride。
+反向和 AMP/低精度尚未实现。GPU 编译、数值与竞态仍须在 CUDA 环境验收，命令见
+[实现记录](../../csrc/attention/development.md)；本地 CPU 测试不代表 CUDA 验证通过。
+
 ## 1. 接口与职责
 
 ```python

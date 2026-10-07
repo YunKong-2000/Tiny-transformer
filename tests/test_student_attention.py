@@ -1,0 +1,172 @@
+"""Attention forward: online softmax, tails, cache strides and API boundaries."""
+import math
+import unittest
+from unittest.mock import Mock, patch
+
+import torch
+
+from tiny_transformer.operators import reference, student
+from tiny_transformer.operators._extension import load_attention_extension
+
+
+class StudentAttentionHostTests(unittest.TestCase):
+    def test_forward_bridge_and_backward_guard(self):
+        # Test doubles check only Python wiring; no CUDA arithmetic is simulated.
+        q, k, v = [Mock(is_cuda=True, requires_grad=False) for _ in range(3)]
+        output, lse, segments = object(), object(), object()
+        extension = Mock()
+        extension.attention_forward.return_value = (output, lse)
+        with patch.object(student, 'load_attention_extension', return_value=extension) as load:
+            self.assertIs(student.attention(q, k, v, 0, segments), output)
+            extension.attention_forward.assert_called_once_with(q, k, v, 0, segments)
+            for tensor in (q, k, v):
+                tensor.requires_grad = True
+                load.reset_mock()
+                with self.assertRaisesRegex(NotImplementedError, 'backward'):
+                    student.attention(q, k, v)
+                load.assert_not_called()
+                with torch.no_grad():
+                    self.assertIs(student.attention(q, k, v, 9), output)
+                extension.attention_forward.assert_called_with(q, k, v, 9, None)
+                tensor.requires_grad = False
+
+
+@unittest.skipUnless(torch.cuda.is_available(), 'requires CUDA and nvcc')
+class StudentAttentionCudaTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.extension = load_attention_extension()
+
+    def setUp(self):
+        torch.manual_seed(42)
+
+    @torch.no_grad()
+    def check_forward(self, q, k, v, past_len=0, segments=None):
+        originals = [x.clone() for x in (q, k, v)]
+        actual, lse = self.extension.attention_forward(q, k, v, past_len, segments)
+        # FP64 oracle avoids TF32 settings affecting the reference.
+        scores = q.double() @ k.double().transpose(-1, -2) / math.sqrt(64)
+        allowed = reference.causal_mask(q, k, past_len, segments)
+        scores = scores.masked_fill(~allowed, -float('inf'))
+        expected = scores.softmax(-1) @ v.double()
+        torch.testing.assert_close(actual, expected.float(), atol=3e-5, rtol=3e-5)
+        torch.testing.assert_close(lse, scores.logsumexp(-1).float(), atol=3e-5, rtol=3e-5)
+        self.assertEqual(lse.shape, q.shape[:-1])
+        self.assertTrue(actual.is_contiguous())
+        self.assertTrue(torch.isfinite(actual).all())
+        for x, original in zip((q, k, v), originals):
+            torch.testing.assert_close(x, original, atol=0, rtol=0)
+        public = student.attention(q, k, v, past_len, segments)
+        torch.testing.assert_close(public, actual, atol=0, rtol=0)
+        return actual
+
+    def test_prefill_tiles_and_sequence_tails(self):
+        for time in (1, 7, 31, 32, 33, 65, 96):
+            with self.subTest(time=time):
+                q, k, v = [torch.randn(2, 3, time, 64, device='cuda') for _ in range(3)]
+                self.check_forward(q, k, v)
+
+    def test_qkv_views_and_feature_strides(self):
+        storage = torch.randn(2 * 65 * 3 * 3 * 64 + 7, device='cuda')
+        qkv = storage[7:].view(2, 65, 3, 3, 64)
+        q, k, v = [x.transpose(1, 2) for x in qkv.unbind(2)]
+        self.check_forward(q, k, v)
+        views = [torch.randn(2, 3, 33, 129, device='cuda')[..., 1::2] for _ in range(3)]
+        self.check_forward(*views)
+        # Zero strides are valid too; in particular V must not assume contiguous rows.
+        views = [torch.randn(1, 1, 33, 64, device='cuda').expand(2, 3, -1, -1)
+                 for _ in range(3)]
+        self.check_forward(*views)
+
+    def test_decode_chunk_and_cache_capacity_strides(self):
+        for tq, tk in ((1, 1), (1, 65), (7, 65), (33, 96)):
+            with self.subTest(tq=tq, tk=tk):
+                q = torch.randn(2, 3, tq, 64, device='cuda')
+                stores = [torch.full((2, 3, 128, 64), float('nan'), device='cuda')
+                          for _ in range(2)]
+                for store in stores:
+                    store[:, :, :tk].normal_()
+                k, v = [store[:, :, :tk] for store in stores]
+                self.check_forward(q, k, v, tk - tq)
+
+    def test_segments_and_causal_isolation(self):
+        q, k, v = [torch.randn(2, 3, 65, 64, device='cuda') for _ in range(3)]
+        backing = torch.empty(2, 130, dtype=torch.long, device='cuda')
+        segments = backing[:, 1::2]
+        segments.copy_(torch.arange(65, device='cuda')[None, :] // 17)
+        before_ids = segments.clone()
+        before = self.check_forward(q, k, v, segments=segments)
+        k2, v2 = k.clone(), v.clone()
+        k2[:, :, :17].add_(10)
+        v2[:, :, :17].add_(10)
+        after = self.check_forward(q, k2, v2, segments=segments)
+        torch.testing.assert_close(before[:, :, 17:], after[:, :, 17:], atol=0, rtol=0)
+        k2, v2 = k.clone(), v.clone()
+        k2[:, :, 33:].add_(10)
+        v2[:, :, 33:].add_(10)
+        after = self.check_forward(q, k2, v2, segments=segments)
+        torch.testing.assert_close(before[:, :, :33], after[:, :, :33], atol=0, rtol=0)
+        torch.testing.assert_close(segments, before_ids, atol=0, rtol=0)
+
+    def test_large_logits_remain_finite(self):
+        q, k, v = [torch.randn(2, 2, 65, 64, device='cuda') for _ in range(3)]
+        # Identical keys keep the large-score case well conditioned while still
+        # overflowing exp(score) if the row maximum is not subtracted.
+        q.fill_(10)
+        k.fill_(10)
+        self.check_forward(q, k, v)
+
+    def test_native_validation_and_grad_guards(self):
+        q, k, v = [torch.randn(2, 3, 7, 64, device='cuda') for _ in range(3)]
+        ids = torch.zeros(2, 7, dtype=torch.long, device='cuda')
+        cases = [
+            ((q.cpu(), k, v), 'CUDA'),
+            ((q.half(), k, v), 'float32'),
+            ((q.to_sparse(), k, v), 'strided'),
+            ((q[0], k, v), '4D'),
+            ((q[..., :32], k[..., :32], v[..., :32]), 'head_dim=64'),
+            ((q[:, :, :0], k, v), 'positive'),
+            ((q, k[:1], v), 'first dimension'),
+            ((q, k[:, :2], v), 'second dimension'),
+            ((q, k, v[:, :, :6]), 'sequence length'),
+            ((q, k, v, -1), 'non-negative'),
+            ((q, k, v, 1), 'Tk == past_len'),
+            ((q, k, v, 0, ids.float()), 'int64'),
+            ((q, k, v, 0, ids.cpu()), 'CUDA'),
+            ((q, k, v, 0, ids[:, :6]), 'shape'),
+            ((q[:, :, :1], k, v, 6, ids[:, :1]), 'without past'),
+        ]
+        for args, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(RuntimeError, message):
+                self.extension.attention_forward(*args)
+        for i in range(3):
+            inputs = [q.detach(), k.detach(), v.detach()]
+            inputs[i].requires_grad_(True)
+            with self.assertRaisesRegex(RuntimeError, 'backward'):
+                self.extension.attention_forward(*inputs)
+            with self.assertRaisesRegex(NotImplementedError, 'backward'):
+                student.attention(*inputs)
+            with torch.no_grad():
+                self.assertFalse(student.attention(*inputs).requires_grad)
+        with torch.autocast('cuda'), self.assertRaisesRegex(RuntimeError, 'autocast'):
+            student.attention(q, k, v)
+
+    @torch.no_grad()
+    def test_current_stream_including_contiguous_copies(self):
+        inputs = [torch.zeros(2, 3, 33, 128, device='cuda')[..., ::2] for _ in range(3)]
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(10_000_000)
+            for x, value in zip(inputs, (0.25, 0.5, 2.0)):
+                x.fill_(value)
+            actual, lse = self.extension.attention_forward(*inputs)
+            actual, lse = actual.clone(), lse.clone()
+        stream.synchronize()
+        torch.testing.assert_close(actual, torch.full_like(actual, 2.0), atol=1e-6, rtol=1e-6)
+        expected_lse = 1.0 + torch.arange(1, 34, device='cuda').float().log()
+        torch.testing.assert_close(lse, expected_lse.expand_as(lse), atol=1e-6, rtol=1e-6)
+
+
+if __name__ == '__main__':
+    unittest.main()

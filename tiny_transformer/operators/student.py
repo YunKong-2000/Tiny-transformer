@@ -6,6 +6,7 @@ Cross entropy supports FP32/FP16/BF16 logits, ignored labels and first-order aut
 RoPE supports strided CUDA FP32 inputs and first-order gradients with constant cos/sin.
 SwiGLU supports strided CUDA FP32 gate/up inputs and first-order gradients.
 Linear supports CUDA FP32 inputs and first-order gradients, with explicit view copies; no AMP.
+Attention supports CUDA FP32 forward with head_dim=64; no backward or AMP.
 There is no silent reference fallback.
 Match reference.py semantics, device, shape, dtype, strides and gradients.
 Use --op NAME=student to enable only a completed operator.
@@ -18,6 +19,7 @@ import torch
 from torch.autograd.function import once_differentiable
 
 from ._extension import (
+    load_attention_extension,
     load_cross_entropy_extension, load_embedding_extension, load_linear_extension,
     load_residual_extension, load_rms_norm_extension, load_rope_extension, load_swiglu_extension,
 )
@@ -186,7 +188,19 @@ def rope(x, cos, sin):
 
 
 def attention(q, k, v, past_len=0, segment_ids=None):
-    return _todo("attention")
+    """FP32 CUDA causal attention forward, head_dim=64, with optional segments.
+
+    The native entry copies Q/K and segment views and reads V using its strides.
+    LSE is internal; the public operator returns only O. Backward is not implemented.
+    """
+    if not all(x.is_cuda for x in (q, k, v)):
+        raise RuntimeError("student attention requires q, k, v to be CUDA tensors")
+    if torch.is_autocast_enabled("cuda"):
+        raise RuntimeError("student attention does not support AMP/autocast yet")
+    if torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v)):
+        raise NotImplementedError("student attention backward is not implemented")
+    output, _ = load_attention_extension().attention_forward(q, k, v, past_len, segment_ids)
+    return output
 
 
 class _SwiGLU(torch.autograd.Function):

@@ -41,6 +41,7 @@ for function, args in (
     (student.cross_entropy, (torch.ones(2, 3, 4), torch.zeros(2, 3, dtype=torch.long))),
     (student.swiglu, (torch.ones(2, 3, 4), torch.ones(2, 3, 4))),
     (student.linear, (torch.ones(2, 3, 4), torch.ones(7, 4))),
+    (student.attention, (torch.ones(1, 1, 2, 64),) * 3),
 ):
     try:
         function(*args)

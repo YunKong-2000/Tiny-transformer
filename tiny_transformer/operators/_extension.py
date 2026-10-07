@@ -6,6 +6,37 @@ from tiny_transformer._cutlass import cutlass_include_paths
 
 
 @lru_cache(maxsize=1)
+def load_attention_extension():
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("student attention requires CUDA-enabled PyTorch and a CUDA device")
+
+    from torch.utils.cpp_extension import CUDA_HOME, load
+
+    if CUDA_HOME is None:
+        raise RuntimeError("student attention requires a CUDA toolkit with nvcc; set CUDA_HOME")
+
+    source_root = Path(__file__).resolve().parents[2] / "csrc" / "attention"
+    sources = [source_root / name for name in ("bindings.cpp", "attention.cu")]
+    required = sources + [source_root / name for name in
+                          ("attention.h", "attention_common.h", "attention_forward_kernel.cuh")]
+    if not all(path.is_file() for path in required):
+        raise RuntimeError(
+            "student CUDA sources are missing; run from the repository or an editable install"
+        )
+
+    return load(
+        name="tiny_transformer_attention_cuda",
+        sources=[str(path) for path in sources],
+        extra_include_paths=cutlass_include_paths(),
+        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-lineinfo"],
+        with_cuda=True,
+    )
+
+
+@lru_cache(maxsize=1)
 def load_embedding_extension():
     # Importing the model/reference operators must not require a CUDA toolkit,
     # Ninja, or a C++ compiler. Only the first student CUDA call builds anything.

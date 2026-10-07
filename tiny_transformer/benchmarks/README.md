@@ -71,7 +71,7 @@ python -m tiny_transformer.benchmarks.model --config configs/smoke.json \
 | linear | QKV/O/Gate-Up/Down/LM head 的 `[B,T,K]`、`[N,K]`；训练与推理分别生成 | x、weight（仅训练反向） | FP32 SIMT 前向/反向；wrapper 复制跨步输入；尚不支持 AMP/BF16/FP16 |
 | rms_norm | `[B,T,H]`、`[H]`、eps；可测 last-only `[B,1,H]` | x、weight | FP32 前向/反向（H <= 1024）；wrapper 复制跨步输入 |
 | rope | `[B,heads,T,H/heads]` 与共享 cos/sin | x；cos/sin 是常量 | FP32 CuTe 前向/反向；直接消费输入及梯度的 stride |
-| attention | prefill `Q=K=T`；decode `Q=1,K=seq_length`，携带 past_len | q、k、v | 未实现；可用 SDPA 比较 |
+| attention | prefill `Q=K=T`；decode `Q=1,K=seq_length`，携带 past_len | q、k、v | FP32 SIMT 前向，head_dim=64；反向/低精度跳过；CUDA 验收待运行 |
 | swiglu | `[B,T,hidden_dim]` gate/up；跨步用例保留 chunk view | gate、up | FP32 CuTe 前向/反向；支持独立输入 stride 和非连续/零 stride 上游梯度 |
 | residual | 两个 `[B,T,H]` | 两项输入 | FP32 kernel 前向/反向；wrapper 支持 FP16/BF16 与跨步输入，计入转换/复制成本 |
 | cross_entropy | `[B,T,V]` logits、含 ignore_index 的 targets | logits | FP32 kernel 前向/反向；wrapper 支持 FP16/BF16 与跨步输入，返回 FP32 平均 loss，计入转换/复制成本 |
