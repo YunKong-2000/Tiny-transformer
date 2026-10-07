@@ -207,8 +207,10 @@ void forward(const Element* q, const Element* k, const Element* v,
 
   for (int64_t tile = 0; tile < kv_tiles; ++tile) {
     const int64_t key0 = tile * BK;
-    // An A-shaped register fragment of P; no memory is read from this identity tensor.
-    auto rP = thr.partition_fragment_A(score_coords);
+    // Identity tensors have ScaledBasis strides, which make_fragment_like cannot
+    // order. Keep only the partition's shape and allocate ordinary compact
+    // register storage, with the atom value dimension contiguous.
+    auto rP = make_tensor<Element>(shape(thr.partition_A(score_coords)));
     {
       auto rS = thr.make_fragment_C(tS);
       clear(rS); // Clear once per KV tile, not once per feature subtile.
