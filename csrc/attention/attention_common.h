@@ -14,7 +14,11 @@ inline void check_tensors(const std::initializer_list<torch::Tensor>& tensors) {
   auto device = tensors.begin()->device();
   for (const auto& tensor : tensors) {
     TORCH_CHECK(tensor.device() == device, "All inputs must be on the same device");
-    TORCH_CHECK(tensor.scalar_type() == at::kFloat, "attention supports only float32 inputs");
+    TORCH_CHECK(tensor.scalar_type() == at::kFloat
+                || tensor.scalar_type() == at::kBFloat16,
+                "attention supports only float32 and bf16 inputs");
+    TORCH_CHECK(tensor.scalar_type() == tensors.begin()->scalar_type(),
+                "q, k, v must have the same dtype");
     TORCH_CHECK(tensor.layout() == at::kStrided, "All inputs must be strided tensors");
   }
 }

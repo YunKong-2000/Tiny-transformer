@@ -49,8 +49,17 @@ class StudentAttentionCudaTests(unittest.TestCase):
         allowed = reference.causal_mask(q, k, past_len, segments)
         scores = scores.masked_fill(~allowed, -float('inf'))
         expected = scores.softmax(-1) @ v.double()
-        torch.testing.assert_close(actual, expected.float(), atol=3e-5, rtol=3e-5)
-        torch.testing.assert_close(lse, scores.logsumexp(-1).float(), atol=3e-5, rtol=3e-5)
+        self.assertEqual(actual.dtype, q.dtype)
+        self.assertEqual(lse.dtype, torch.float32)
+        if q.dtype == torch.bfloat16:
+            # P is rounded to BF16 before PV, while LSE stays in FP32.
+            torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=3e-2)
+            torch.testing.assert_close(lse, scores.logsumexp(-1).float(), atol=2e-4, rtol=2e-5)
+            torch.testing.assert_close(actual, reference.sdpa_attention(q, k, v, past_len),
+                                       atol=2e-2, rtol=3e-2)
+        else:
+            torch.testing.assert_close(actual, expected.float(), atol=3e-5, rtol=3e-5)
+            torch.testing.assert_close(lse, scores.logsumexp(-1).float(), atol=3e-5, rtol=3e-5)
         self.assertEqual(lse.shape, q.shape[:-1])
         self.assertTrue(actual.is_contiguous())
         self.assertTrue(torch.isfinite(actual).all())
@@ -59,6 +68,99 @@ class StudentAttentionCudaTests(unittest.TestCase):
         public = student.attention(q, k, v, past_len, segments)
         torch.testing.assert_close(public, actual, atol=0, rtol=0)
         return actual
+
+    def require_bf16(self):
+        if torch.cuda.get_device_capability()[0] < 8:
+            self.skipTest('BF16 MMA/cp.async require SM80 or later')
+
+    def test_bf16_tiles_tails_and_cache(self):
+        self.require_bf16()
+        for tq, tk in ((1, 1), (17, 17), (64, 64), (65, 65), (129, 129),
+                       (193, 193), (257, 257), (1, 513), (7, 193), (65, 193)):
+            with self.subTest(tq=tq, tk=tk):
+                q = torch.randn(2, 3, tq, 64, device='cuda', dtype=torch.bfloat16)
+                stores = [torch.full((2, 3, tk + 64, 64), float('nan'),
+                                     device='cuda', dtype=torch.bfloat16) for _ in range(2)]
+                for store in stores:
+                    store[:, :, :tk].normal_()
+                self.check_forward(q, stores[0][:, :, :tk], stores[1][:, :, :tk], tk - tq)
+
+    def test_bf16_unaligned_and_strided_views(self):
+        self.require_bf16()
+        count = 2 * 3 * 65 * 64
+        views = [torch.randn(count + 1, device='cuda', dtype=torch.bfloat16)[1:]
+                 .view(2, 3, 65, 64) for _ in range(3)]
+        for view in views:
+            self.assertTrue(view.is_contiguous())
+            self.assertNotEqual(view.data_ptr() % 16, 0)
+        self.check_forward(*views)
+        views = [torch.randn(2, 3, 65, 128, device='cuda', dtype=torch.bfloat16)[..., ::2]
+                 for _ in range(3)]
+        self.check_forward(*views)
+        views = [torch.randn(1, 1, 65, 64, device='cuda', dtype=torch.bfloat16)
+                 .expand(2, 3, -1, -1) for _ in range(3)]
+        self.check_forward(*views)
+
+    def test_bf16_exact_output_large_logits_and_causality(self):
+        self.require_bf16()
+        q = torch.zeros(2, 3, 193, 64, device='cuda', dtype=torch.bfloat16)
+        k, v = torch.zeros_like(q), torch.ones_like(q)
+        actual = self.check_forward(q, k, v)
+        torch.testing.assert_close(actual, v, atol=0, rtol=0)
+        q.fill_(10)
+        k.fill_(10)
+        v.normal_()
+        self.check_forward(q, k, v)
+        q.normal_()
+        k.normal_()
+        before = self.check_forward(q, k, v)
+        k[:, :, 65:].add_(4)
+        v[:, :, 65:].add_(4)
+        after = self.check_forward(q, k, v)
+        torch.testing.assert_close(before[:, :, :65], after[:, :, :65], atol=0, rtol=0)
+
+    @torch.no_grad()
+    def test_bf16_current_stream_with_alignment_copies(self):
+        self.require_bf16()
+        count = 2 * 3 * 65 * 64
+        inputs = [torch.zeros(count + 1, device='cuda', dtype=torch.bfloat16)[1:]
+                  .view(2, 3, 65, 64) for _ in range(3)]
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(10_000_000)
+            for x, value in zip(inputs, (0.25, 0.5, 2.0)):
+                x.fill_(value)
+            actual, lse = self.extension.attention_forward(*inputs)
+            actual, lse = actual.clone(), lse.clone()
+        stream.synchronize()
+        self.assertEqual(lse.dtype, torch.float32)
+        torch.testing.assert_close(actual, torch.full_like(actual, 2.0), atol=0, rtol=0)
+        expected_lse = 1.0 + torch.arange(1, 66, device='cuda').float().log()
+        torch.testing.assert_close(lse, expected_lse.expand_as(lse), atol=2e-4, rtol=2e-5)
+
+    def test_bf16_validation(self):
+        inputs = [torch.randn(2, 3, 7, 64, device='cuda', dtype=torch.bfloat16)
+                  for _ in range(3)]
+        ids = torch.zeros(2, 7, dtype=torch.long, device='cuda')
+        with self.assertRaisesRegex(RuntimeError, 'segment_ids is not supported'):
+            self.extension.attention_forward(*inputs, 0, ids)
+        for dtype in (torch.float32, torch.bfloat16):
+            for index in range(3):
+                with self.subTest(dtype=dtype, index=index):
+                    mixed = [x.to(dtype) for x in inputs]
+                    other = torch.bfloat16 if dtype == torch.float32 else torch.float32
+                    mixed[index] = mixed[index].to(other)
+                    with self.assertRaisesRegex(RuntimeError, 'same dtype'):
+                        self.extension.attention_forward(*mixed)
+        # Expanded views exercise overflow checks without allocating a huge tensor.
+        for shape in ((2**31, 1, 1, 64), (65536, 1, 64 * 32768, 64)):
+            big = torch.zeros(1, 1, 1, 64, device='cuda', dtype=torch.bfloat16).expand(shape)
+            with self.assertRaisesRegex(RuntimeError, 'grid limits'):
+                self.extension.attention_forward(big, big, big)
+        if torch.cuda.get_device_capability()[0] < 8:
+            with self.assertRaisesRegex(RuntimeError, 'SM80'):
+                self.extension.attention_forward(*inputs)
 
     def test_prefill_tiles_and_sequence_tails(self):
         for time in (1, 7, 31, 32, 33, 65, 96):

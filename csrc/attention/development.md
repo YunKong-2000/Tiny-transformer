@@ -1,21 +1,34 @@
 # flashAttention
 
-当前接入的是 FP32 SIMT 前向，固定 `head_dim=64`，每 CTA 128 线程。
-支持 causal prefill、decode/chunk、非连续 Q/K/V、可选的文档 segment IDs 和序列尾块。
-host 将 Q/K 和 segment IDs 连续化；V 直接使用实际 stride。原生接口返回 `(O, LSE)`，
-Python `student.attention` 只返回 O。反向和 AMP/BF16/FP16 尚未实现；需要梯度时明确报错。
+当前接入 FP32 SIMT 和 BF16 Tensor Core 前向，固定 `head_dim=64`，每 CTA 128 线程。
+两条路径均支持 causal prefill、decode/chunk 和序列尾块，Q/K/V 必须具有相同 dtype。
+FP32 支持文档 segment IDs；host 将 Q/K 和 segment IDs 连续化，V 直接使用实际 stride。
+BF16 要求 SM80+，不支持 segment IDs；host 将 Q/K/V 连续化，必要时 clone 保证起点
+16-byte 对齐，kernel 本身不处理任意 stride。BF16 使用 BQ=BK=64、双缓冲和 48 KiB
+动态共享内存；score、softmax 统计量和输出累加器为 FP32，P 在 PV 前转成 BF16。
+原生接口返回 `(O, LSE)`：O 与输入同 dtype，LSE 始终为 FP32；Python 只返回 O。
+反向、AMP/autocast 和 FP16 尚未实现；需要梯度时明确报错。
 输入 batch、heads、序列长度必须为正，且 `Tk = past_len + Tq`。
-二维 grid 当前要求 `B*H <= 65535`、`ceil(Tq/32) <= INT_MAX`，超出时显式拒绝。
+FP32 二维 grid 要求 `B*H <= 65535`、`ceil(Tq/32) <= INT_MAX`；
+BF16 一维 grid 要求 `B*H*ceil(Tq/64) <= INT_MAX`，乘法前检查溢出。
 
 CUDA 验收（包含编译、FP64 oracle、tail/cache/segment/stream 检查）：
 
 ```bash
 TORCH_CUDA_ARCH_LIST=8.0 python -m unittest discover -s tests -p 'test_student_attention.py' -v
-compute-sanitizer --tool memcheck python -m unittest discover -s tests -p 'test_student_attention.py'
-compute-sanitizer --tool racecheck python -m unittest discover -s tests -p 'test_student_attention.py'
+compute-sanitizer --tool memcheck --error-exitcode 1 python -m unittest discover -s tests -p 'test_student_attention.py'
+compute-sanitizer --tool racecheck --error-exitcode 1 python -m unittest discover -s tests -p 'test_student_attention.py'
+compute-sanitizer --tool synccheck --error-exitcode 1 python -m unittest discover -s tests -p 'test_student_attention.py'
 ```
 
 本地无 CUDA 时只能运行 Python 接线检查，GPU 用例会跳过；不能据此宣称 CUDA 已验证。
+
+新增 BF16 测试直接调用生产 attention 扩展，比较 FP64 oracle 与 BF16 SDPA，
+覆盖多轮 stage 复用、尾块、cache 前缀、非连续/未对齐 view、精确常数输出、
+大 logits、因果隔离、非默认 stream、混合 dtype、segment 拒绝和 grid 上限。
+2026-10-07 BF16 修复后的 student 回归：87 项（11 项通过、76 项 CUDA 跳过）。
+Clang 对输入检查头文件和绑定的 C++17 语法检查通过；此检查不包含 CUDA kernel。
+尚未运行 nvcc、GPU 数值测试或 compute-sanitizer。
 
 2026-10-07 本地验证：student 回归 82 项（11 项通过、71 项 CUDA 跳过），
 benchmark 回归 25 项通过，operator 回归 10 项通过；Clang 对绑定和输入检查头文件的
@@ -71,3 +84,6 @@ PV 真正的归约维是 key token：按 RK=8 准备 P/V 寄存器片段，累�
 完整 streaming 循环后，将输出累加器逐行除以 l 得到 O，并写回 GMEM；LSE=m+log(l) 单独保存。
 ### 流水线
 streaming循环可以使用pipeline进行延迟隐藏，可以将整个streaming循环分为第一个
+
+### swizzle技术
+本质上Swizzle操作是对元素偏移offset的二进制数的分析和操作。数据类型决定了offset对应的bank的起始位置，例如fp32的起始位就是0，因为一个bank恰好对应一个元素，而对于fp16或者bf16起始位就是1，因为一个bank对应两个数，如果有int8,fp8这样的类型，起始位就是2，因为一个bank对应8个元素;而读取数据的段长决定了最终的保留位，段长以元素个数位单位，之前的例子是一个线程读连续4个fp32,那就保留最低两位，线的例子事以8个bf16位一段，那就保留最低8位；其次就是同一次访问指令中同一bank的不同地址的stride，在这个例子中每隔64个元素就会落入到同一个bank,所以就是发生bank conflict的两个地址第6位以上才不同，这个数字恰好也是bank的起始位加上5，也就是bank的终止位的下一位；最后需要决定低位中哪些位需要被修改，很明显，最低的保留位是不能动的，因此需要从保留位下一位开始，根据bank conflict的way的数量决定，比如是8way，就需要log(8)=3位做修改，这样才能得到8个不同的新目标地址。

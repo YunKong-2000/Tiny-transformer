@@ -188,10 +188,12 @@ def rope(x, cos, sin):
 
 
 def attention(q, k, v, past_len=0, segment_ids=None):
-    """FP32 CUDA causal attention forward, head_dim=64, with optional segments.
+    """FP32/BF16 CUDA causal attention forward, head_dim=64.
 
-    The native entry copies Q/K and segment views and reads V using its strides.
-    LSE is internal; the public operator returns only O. Backward is not implemented.
+    FP32 supports segments and reads V using its strides. BF16 requires SM80+,
+    rejects segments, and copies Q/K/V as needed for contiguous, aligned storage.
+    LSE stays FP32 internally; the public operator returns O in the input dtype.
+    Backward and autocast are not implemented.
     """
     if not all(x.is_cuda for x in (q, k, v)):
         raise RuntimeError("student attention requires q, k, v to be CUDA tensors")
