@@ -38,11 +38,13 @@ using TiledMma = decltype(make_tiled_mma(
 
 using QLayout = decltype(composition(
     Swizzle<3, 3, 3>{}, Layout<Shape<Int<BQ>, Int<DH>>, Stride<Int<DH>, _1>>{}));
-// A 32-element row has four 16-byte vectors: XOR its two vector-index bits.
+// A 32-BF16 row advances 16 banks. Its low row bit already selects a bank
+// half, so XOR row bits 1/2 (element-address bits 6/7) into vector bits 3/4.
+// Shift=2 would reuse the low row bit and collide again after four rows.
 using KVLayout = decltype(composition(
-    Swizzle<2, 3, 2>{}, Layout<Shape<Int<BK>, Int<BH>>, Stride<Int<BH>, _1>>{}));
+    Swizzle<2, 3, 3>{}, Layout<Shape<Int<BK>, Int<BH>>, Stride<Int<BH>, _1>>{}));
 using VTransposedLayout = decltype(composition(
-    Swizzle<2, 3, 2>{}, Layout<Shape<Int<BH>, Int<BK>>, Stride<_1, Int<BH>>>{}));
+    Swizzle<2, 3, 3>{}, Layout<Shape<Int<BH>, Int<BK>>, Stride<_1, Int<BH>>>{}));
 
 struct alignas(16) SharedStorage {
   Element q[BQ * DH];
@@ -297,12 +299,15 @@ void forward(const Element* q, const Element* k, const Element* v,
     if (qi < tq) {
       CUTE_UNROLL
       for (int n = 0; n < OUTPUT_N_ITER; ++n) {
-        CUTE_UNROLL
-        for (int b = 0; b < TN; ++b) {
-          const int vi = TN * a + b;
-          const int d = get<1>(tO(vi, 0, n));
-          o[qi * DH + d] = Element(l[a] > 0.f ? rO(vi, 0, n) / l[a] : 0.f);
-        }
+        static_assert(TN == 2);
+        const int vi = TN * a;
+        const int d = get<1>(tO(vi, 0, n));
+        const Element lo(l[a] > 0.f ? rO(vi, 0, n) / l[a] : 0.f);
+        const Element hi(l[a] > 0.f ? rO(vi + 1, 0, n) / l[a] : 0.f);
+        // The two atom values are consecutive columns with an even first d.
+        // Pack their exact BF16 bits into one aligned store instead of two STG.U16.
+        const uint32_t packed = uint32_t(lo.raw()) | (uint32_t(hi.raw()) << 16);
+        *reinterpret_cast<uint32_t*>(o + qi * DH + d) = packed;
       }
       if (threadIdx.x % LANES_PER_ROW == 0)
         lse[qi] = l[a] > 0.f ? m[a] + logf(l[a]) : -CUDART_INF_F;

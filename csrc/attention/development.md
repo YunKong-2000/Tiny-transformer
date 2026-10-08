@@ -49,7 +49,9 @@ prefill/decode 输入在 CUDA Graph 中捕获和重复重放的 O/LSE。
   当前 MMA 的 K=16 Q fragment 到寄存器，避免 Q 的完整寄存器 fragment 跨循环存活。
 - K/V 的 subtile 均为 `(BK,BH)=(32,32)`，每个 2 KiB；每个 stage 使用 union 复用
   K/V 存储，两个 stage 共 4 KiB。共享内存总量为 `8+2*2=12 KiB`，没有 shared P。
-  Q 使用 `Swizzle<3,3,3>`；K/V 的行宽变为 32，使用 `Swizzle<2,3,2>`。
+  Q 使用 `Swizzle<3,3,3>`；K/V 的行宽为 32，使用 `Swizzle<2,3,3>`。
+  32 个 BF16 的行跨越 16 个 bank，行低位已经选择 bank 的前/后半；swizzle 应使用
+  行的第 1/2 位，即元素地址第 6/7 位。旧的 shift=2 会使相隔 4 行的片段重复占用 banks。
 - 每轮 KV tile 中，先遍历 Q/K 特征 `d=0,32`，将两个部分点积累加到同一个 S；
   完成全部 DH 后才做 scale/mask/softmax。每线程 S 为 `(4,1,4)`，16 个 FP32。
 - softmax 直接将 `rS(vi,0,n)` 对应的概率写到
@@ -76,6 +78,24 @@ benchmark 主机测试 29 项通过；attention 测试 1 项通过、15 项因�
 以及 QK 特征 15/16/31/32/47/48/63 的独立探针；随 key 增大的 score 检查 alpha
 是否覆盖 O 的全部列。仍需检查 ptxas register/spill 报告和 Nsight Compute；
 当前没有此版本 GPU 耗时结论。
+
+NCU 后续反馈包含 61440 次 local-memory spilling requests、global-store 每 sector
+约 8.19/32 bytes 有效数据，以及 shared-load bank-conflict wavefront 占比 43.60%。
+已将 K/V swizzle 从 `<2,3,2>` 修为 `<2,3,3>`：8x8 物理子矩阵的 8 个行起始 bank
+由 `[0,20,8,28,0,20,8,28]` 变为 `[0,16,4,20,8,24,12,28]`，CPU 地址检查通过。
+输出将同线程相邻两个 BF16 的原始位打包为一个对齐 uint32 store，减少零散的 16-bit 写入；
+这仍不是完整的 epilogue 数据重排。以上改动需 GPU 数值与 NCU 复测，不能视作 spill 已修复。
+spill 的来源需要结合 Source Counters/SASS 和 ptxas 输出定位；新增可选编译诊断：
+
+```bash
+TORCH_CUDA_ARCH_LIST=8.0 TINY_TRANSFORMER_CUDA_VERBOSE=1 \
+python -u -m unittest discover -s tests -p 'test_student_attention.py' -k bf16 -v
+```
+
+该环境变量仅对 attention 扩展启用 verbose 和 `--ptxas-options=-v,--warn-on-spills`，
+输出每个 kernel 的 registers、stack frame、spill loads/stores。开关会改变构建参数，
+切换时可能重新编译。应保留 forward kernel 的报告与 NCU Source Counters 对照，
+不要仅凭 local-memory 流量断言某个 C++ fragment 一定发生了寄存器容量溢出。
 
 2026-10-07 本地验证：student 回归 82 项（11 项通过、71 项 CUDA 跳过），
 benchmark 回归 25 项通过，operator 回归 10 项通过；Clang 对绑定和输入检查头文件的

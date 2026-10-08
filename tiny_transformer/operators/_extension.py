@@ -1,5 +1,6 @@
 """Lazy JIT builds of independent student CUDA extensions from this checkout."""
 from functools import lru_cache
+import os
 from pathlib import Path
 
 from tiny_transformer._cutlass import cutlass_include_paths
@@ -27,13 +28,19 @@ def load_attention_extension():
             "student CUDA sources are missing; run from the repository or an editable install"
         )
 
+    verbose = os.environ.get("TINY_TRANSFORMER_CUDA_VERBOSE") == "1"
+    cuda_flags = ["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-lineinfo"]
+    if verbose:
+        cuda_flags.append("--ptxas-options=-v,--warn-on-spills")
+
     return load(
         name="tiny_transformer_attention_cuda",
         sources=[str(path) for path in sources],
         extra_include_paths=cutlass_include_paths(),
         extra_cflags=["-O3", "-std=c++17"],
-        extra_cuda_cflags=["-O3", "-std=c++17", "--expt-relaxed-constexpr", "-lineinfo"],
+        extra_cuda_cflags=cuda_flags,
         with_cuda=True,
+        verbose=verbose,
     )
 
 
