@@ -107,6 +107,30 @@ class StudentAttentionCudaTests(unittest.TestCase):
                 k[..., feature] = key_codes * 8
                 self.check_forward(q, k, v)
 
+    def test_bf16_full_tile_mask_boundary(self):
+        self.require_bf16()
+        # At past=30, key 31 is future for query 0; at past=31 it becomes
+        # valid for every row of the first full query tile (inclusive boundary).
+        # Tq=63/65 also forces the padded-query path; Tk crosses BK boundaries.
+        for tq in (63, 64, 65, 128):
+            for past in (0, 30, 31, 32, 33):
+                with self.subTest(tq=tq, past=past):
+                    tk = tq + past
+                    q, k = [torch.zeros(1, 1, t, 64, device='cuda', dtype=torch.bfloat16)
+                            for t in (tq, tk)]
+                    v = torch.zeros_like(k)
+                    # Spikes expose a one-key leak that random inputs may hide
+                    # behind the BF16 output tolerance.
+                    v[:, :, 31].fill_(64)
+                    if tk > 63:
+                        v[:, :, 63].fill_(-64)
+                    v[:, :, -1].add_(32)
+                    before = self.check_forward(q, k, v, past)
+                    changed = v.clone()
+                    changed[:, :, past + 1:].add_(16)
+                    after = self.check_forward(q, k, changed, past)
+                    torch.testing.assert_close(before[:, :, :1], after[:, :, :1], atol=0, rtol=0)
+
     def test_bf16_causal_tile_order_and_pipeline_transitions(self):
         self.require_bf16()
         # Distinct head offsets expose remapped blocks writing to a wrong head.

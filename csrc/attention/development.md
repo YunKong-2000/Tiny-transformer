@@ -121,6 +121,25 @@ python -u -m unittest discover -s tests -p 'test_student_attention.py' -k bf16 -
 1/2/3/16 个 KV tile 的 stage 发布/释放状态模型均通过。attention 测试 1 项通过、
 16 项因缺少 CUDA 跳过；没有执行 nvcc、GPU 数值/竞态检查或性能测试。
 
+2026-10-08 编译反馈：上述三个改动合并后的 BF16 forward 使用 128 registers，
+16-byte stack frame，20-byte spill stores、28-byte spill loads；原版本约 120 registers
+且零 spill。显式缩小 rB 并没有证明能缩小最终分配，三个改动的独立影响尚未测量。
+当前先撤回 QK/PV 的手写 N=8 内层展开，恢复完整 N fragment 的 CuTe gemm；
+保留跨阶段预取和 CTA 重排，以单独观察这次撤回的编译结果。
+不添加 maxrregcount 或更强的 launch_bounds，当前代码不能宣称 spill 已消失。
+如果仍有 spill，应进一步单独比较预取与 CTA 重排，或恢复原先的零-spill版本作为基线。
+
+2026-10-08 完整合法 KV tile 的 mask fast path：只将 scale/mask 循环抽成
+`scale_mask_scores<FULL_TILE>`，online softmax、PV、tile 大小和流水线共用。
+CTA 内统一分支的条件是 query tile 完整、key tile 完整，且第一行 query 已可见
+该 key tile 的最后一个 key：`q_end-q0==BQ && tk-key0>=BK &&
+past_len+q0-key0>=BK-1`。完整块仅乘 SCALE，编译期移除每元素的坐标与 mask 判断；
+其余块使用原先的尾部/causal 检查。采用减法避免构造可能越界的 padded key 端点。
+测试新增 Tq=63/64/65/128、past=0/30/31/32/33，在 key 31/63 放入脉冲 V，
+对照 FP64/SDPA 并检查改变未来 V 不影响首行，以覆盖 inclusive causal 边界和路径切换。
+该改动基于当前工作区（已撤回 N=8 手写展开），没有恢复该展开或改变 BK/BH。
+未执行 CUDA 编译或计时，寄存器和性能影响仍需单独比较。
+
 2026-10-07 本地验证：student 回归 82 项（11 项通过、71 项 CUDA 跳过），
 benchmark 回归 25 项通过，operator 回归 10 项通过；Clang 对绑定和输入检查头文件的
 C++17 语法检查通过。未运行 nvcc、GPU 数值测试或 compute-sanitizer。

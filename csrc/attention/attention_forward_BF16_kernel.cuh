@@ -114,6 +114,8 @@ load_v_async(const Element* v, int64_t key0, int64_t tk,
 
 // QK: consume Q[:, feature0:feature0+BH] and K[:, feature0:feature0+BH].
 // Only a K=16 register fragment of Q is live at a time, not the full Q tile.
+// Keep B's N fragments in one CuTe GEMM. Manually expanding one N=8 MMA at
+// a time did not reduce compiled register usage in the measured build.
 template <class QTensor, class KTensor, class STensor>
 __device__ __forceinline__ void
 gemm_qk_subtile(const QTensor& sQ, const KTensor& sK, STensor& acc) {
@@ -123,25 +125,20 @@ gemm_qk_subtile(const QTensor& sQ, const KTensor& sK, STensor& acc) {
   auto copy_b = make_tiled_copy_B(Copy_Atom<SM75_U32x2_LDSM_N, Element>{}, mma);
   auto thr_a = copy_a.get_slice(threadIdx.x);
   auto thr_b = copy_b.get_slice(threadIdx.x);
-  for_each(make_seq<BH / MMA_K>{}, [&](auto ki) {
+  CUTE_UNROLL
+  for (int ki = 0; ki < BH / MMA_K; ++ki) {
     auto a = local_tile(sQ, Shape<Int<BQ>, Int<MMA_K>>{}, make_coord(0, ki));
+    auto b = local_tile(sK, Shape<Int<BK>, Int<MMA_K>>{}, make_coord(0, ki));
     auto rA = thr.partition_fragment_A(a);
+    auto rB = thr.partition_fragment_B(b);
     auto tAs = thr_a.partition_S(a);
+    auto tBs = thr_b.partition_S(b);
     auto tAr = thr_a.retile_D(rA);
+    auto tBr = thr_b.retile_D(rB);
     copy(copy_a, tAs, tAr);
-    // Load just one N=8 B fragment (4 BF16/thread), instead of all BK=32
-    // columns (16 BF16/thread). A is reused across these four MMA calls.
-    for_each(make_seq<SCORE_N_ITER>{}, [&](auto ni) {
-      auto b = local_tile(sK, Shape<Int<MMA_N>, Int<MMA_K>>{}, make_coord(ni, ki));
-      auto rB = thr.partition_fragment_B(b);
-      auto tBs = thr_b.partition_S(b);
-      auto tBr = thr_b.retile_D(rB);
-      copy(copy_b, tBs, tBr);
-      CUTE_STATIC_ASSERT_V(size(rB) == Int<4>{});
-      auto c = acc(_, _0{}, ni);
-      gemm(mma, rA(_, _0{}, _0{}), rB(_, _0{}, _0{}), c);
-    });
-  });
+    copy(copy_b, tBs, tBr);
+    gemm(mma, rA, rB, acc);
+  }
 }
 
 // PV: output width is BH, while the reduction dimension is BK (key tokens).
@@ -155,18 +152,42 @@ gemm_pv_subtile(const PTensor& rP, const VTensor& sVt, OTensor& acc) {
   CUTE_STATIC_ASSERT_V(size<0>(rP) == Int<8>{});
   CUTE_STATIC_ASSERT_V(size<2>(rP) == Int<BK / MMA_K>{});
   CUTE_STATIC_ASSERT_V(size<2>(acc) == Int<PV_N_ITER>{});
-  for_each(make_seq<BK / MMA_K>{}, [&](auto ki) {
-    for_each(make_seq<PV_N_ITER>{}, [&](auto ni) {
-      auto b = local_tile(sVt, Shape<Int<MMA_N>, Int<MMA_K>>{}, make_coord(ni, ki));
-      auto rB = thr.partition_fragment_B(b);
-      auto tBs = thr_b.partition_S(b);
-      auto tBr = thr_b.retile_D(rB);
-      copy(copy_b, tBs, tBr);
-      CUTE_STATIC_ASSERT_V(size(rB) == Int<4>{});
-      auto c = acc(_, _0{}, ni);
-      gemm(mma, rP(_, _0{}, ki), rB(_, _0{}, _0{}), c);
-    });
-  });
+  CUTE_UNROLL
+  for (int ki = 0; ki < BK / MMA_K; ++ki) {
+    auto b = local_tile(sVt, Shape<Int<BH>, Int<MMA_K>>{}, make_coord(0, ki));
+    auto rB = thr.partition_fragment_B(b);
+    auto tBs = thr_b.partition_S(b);
+    auto tBr = thr_b.retile_D(rB);
+    copy(copy_b, tBs, tBr);
+    gemm(mma, rP(_, _, ki), rB(_, _, 0), acc);
+  }
+}
+
+// The full-tile specialization has no per-element coordinate/mask operations.
+// Keep only this small loop specialized; share the online-softmax/PV code so
+// that the fast path does not duplicate the entire kernel body.
+template <bool FULL_TILE, class STensor, class CoordTensor>
+__device__ __forceinline__ void
+scale_mask_scores(STensor& scores, const CoordTensor& coords,
+                  int64_t q0, int64_t key0, int64_t tq, int64_t tk, int64_t past_len) {
+  CUTE_UNROLL
+  for (int a = 0; a < TM; ++a) {
+    CUTE_UNROLL
+    for (int n = 0; n < SCORE_N_ITER; ++n) {
+      CUTE_UNROLL
+      for (int b = 0; b < TN; ++b) {
+        const int vi = TN * a + b;
+        if constexpr (FULL_TILE) {
+          scores(vi, 0, n) *= SCALE;
+        } else {
+          const int64_t qi = q0 + get<0>(coords(vi, 0, n));
+          const int64_t kj = key0 + get<1>(coords(vi, 0, n));
+          const bool valid = qi < tq && kj < tk && kj <= past_len + qi;
+          scores(vi, 0, n) = valid ? scores(vi, 0, n) * SCALE : -CUDART_INF_F;
+        }
+      }
+    }
+  }
 }
 
 __device__ __forceinline__ float row_max(float x) {
@@ -250,20 +271,25 @@ void forward(const Element* q, const Element* k, const Element* v,
         // The V-ready barrier after softmax also releases the last K stage.
       });
 
+      // All rows must exist, and even the first query must see the last key.
+      // Subtractions avoid constructing a padded key endpoint beyond int64_t.
+      // This branch is uniform across the CTA; padded query rows take the mask path.
+      const bool fully_valid = q_end - q0 == BQ && tk - key0 >= BK &&
+                               past_len + q0 - key0 >= BK - 1;
+      if (fully_valid)
+        scale_mask_scores<true>(rS, tS, q0, key0, tq, tk, past_len);
+      else
+        scale_mask_scores<false>(rS, tS, q0, key0, tq, tk, past_len);
+
       // V[0] is already in flight; softmax needs no shared-memory operands.
       CUTE_UNROLL
       for (int a = 0; a < TM; ++a) {
-        const int row = get<0>(tS(TN * a, 0, 0));
-        const int64_t qi = q0 + row;
         float local_max = -CUDART_INF_F;
         CUTE_UNROLL
         for (int n = 0; n < SCORE_N_ITER; ++n) {
           CUTE_UNROLL
           for (int b = 0; b < TN; ++b) {
             const int vi = TN * a + b;
-            const int64_t kj = key0 + get<1>(tS(vi, 0, n));
-            const bool valid = qi < tq && kj < tk && kj <= past_len + qi;
-            rS(vi, 0, n) = valid ? rS(vi, 0, n) * SCALE : -CUDART_INF_F;
             local_max = fmaxf(local_max, rS(vi, 0, n));
           }
         }
