@@ -148,7 +148,11 @@ class StudentAttentionCudaTests(unittest.TestCase):
 
     def test_bf16_full_width_kv_pipeline_poisoned_tails(self):
         self.require_bf16()
-        for tq, tk in ((2, 63), (2, 64), (2, 65), (64, 64), (65, 129), (129, 257)):
+        # Include full/full, tail/full and full/tail shapes: neither sequence
+        # being divisible by 64 alone permits unguarded Q/K/V copies.
+        for tq, tk in ((2, 63), (2, 64), (2, 65), (64, 64),
+                       (63, 128), (64, 127), (64, 128), (64, 129),
+                       (128, 192), (129, 192), (65, 129), (129, 257)):
             with self.subTest(tq=tq, tk=tk):
                 q = torch.randn(1, 1, tq, 64, device='cuda', dtype=torch.bfloat16)
                 stores = [torch.full((1, 1, tk + 64, 64), float('nan'),
@@ -160,6 +164,26 @@ class StudentAttentionCudaTests(unittest.TestCase):
                 # host uses the original allocation with NaNs directly after Tk.
                 self.assertTrue(k.is_contiguous() and v.is_contiguous())
                 self.check_forward(q, k, v, tk - tq)
+
+    @torch.no_grad()
+    def test_bf16_even_tiles_match_causal_prefix_of_tail_path(self):
+        self.require_bf16()
+        for tq, tk in ((64, 64), (64, 128), (128, 192), (128, 256)):
+            with self.subTest(tq=tq, tk=tk):
+                # Appending one query and key keeps past_len unchanged and
+                # forces the general kernel. Its existing query rows must not
+                # see the appended key, even across a cached causal diagonal.
+                q = torch.randn(2, 2, tq + 1, 64, device='cuda', dtype=torch.bfloat16)
+                k = torch.randn(2, 2, tk + 1, 64, device='cuda', dtype=torch.bfloat16)
+                v = torch.randn_like(k)
+                v[:, :, -1].fill_(64)
+                even = [x[:, :, :-1].contiguous() for x in (q, k, v)]
+                self.check_forward(*even, past_len=tk - tq)
+                self.check_forward(q, k, v, past_len=tk - tq)
+                full_o, full_lse = self.extension.attention_forward(*even, tk - tq, None)
+                tail_o, tail_lse = self.extension.attention_forward(q, k, v, tk - tq, None)
+                torch.testing.assert_close(full_o, tail_o[:, :, :tq], atol=2e-2, rtol=3e-2)
+                torch.testing.assert_close(full_lse, tail_lse[:, :, :tq], atol=2e-4, rtol=2e-5)
 
     def test_bf16_output_feature_and_head_order(self):
         self.require_bf16()

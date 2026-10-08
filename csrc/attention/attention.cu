@@ -2,6 +2,7 @@
 #include <optional>
 #include <limits>
 #include <cstdint>
+#include <type_traits>
 #include <ATen/cuda/CUDAContextLight.h>
 #include <c10/core/GradMode.h>
 #include <c10/cuda/CUDAException.h>
@@ -132,17 +133,22 @@ attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v,
       return {o, lse};
     }
     dim3 Blocks(static_cast<unsigned>(B * Nh * q_tiles));
-    attention_bf16::forward<<<Blocks, attention_bf16::THREADS,
-                            sizeof(attention_bf16::SharedStorage), stream>>>(
-      reinterpret_cast<const attention_bf16::Element*>(q.data_ptr<at::BFloat16>()),
-      reinterpret_cast<const attention_bf16::Element*>(k.data_ptr<at::BFloat16>()),
-      reinterpret_cast<const attention_bf16::Element*>(v.data_ptr<at::BFloat16>()),
-      reinterpret_cast<attention_bf16::Element*>(o.data_ptr<at::BFloat16>()),
-      lse.data_ptr<float>(),
-      static_cast<int32_t>(Tq),
-      static_cast<int32_t>(Tk),
-      static_cast<int32_t>(past_len)
-    );
+    auto launch_forward = [&](auto even_tiles) {
+      attention_bf16::forward<decltype(even_tiles)::value><<<Blocks, attention_bf16::THREADS,
+                              sizeof(attention_bf16::SharedStorage), stream>>>(
+          reinterpret_cast<const attention_bf16::Element*>(q.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const attention_bf16::Element*>(k.data_ptr<at::BFloat16>()),
+          reinterpret_cast<const attention_bf16::Element*>(v.data_ptr<at::BFloat16>()),
+          reinterpret_cast<attention_bf16::Element*>(o.data_ptr<at::BFloat16>()),
+          lse.data_ptr<float>(),
+          static_cast<int32_t>(Tq),
+          static_cast<int32_t>(Tk),
+          static_cast<int32_t>(past_len));
+    };
+    if (Tq % attention_bf16::BQ == 0 && Tk % attention_bf16::BK == 0)
+      launch_forward(std::true_type{});
+    else
+      launch_forward(std::false_type{});
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   return {o, lse};

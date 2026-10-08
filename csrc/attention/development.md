@@ -18,6 +18,26 @@ BF16 另要求 `Tk <= INT32_MAX`，host 在连续化/输出分配前检查，再
 传为 int32；完整元素地址偏移仍为 int64。
 单 query 专用路径 grid 为 `(B*H, ceil(Tk/128))`，第二维最多 32，沿用上述边界检查。
 
+2026-10-08 完整序列 tile 编译期特化（待 GPU 验收）：
+
+- Host 在 `Tq % BQ == 0 && Tk % BK == 0` 时启动 `forward<true>`，其余通用
+  BF16 输入启动 `forward<false>`；单 query decode 分派仍在此前处理。
+- 完整 tile 的 Q/K/V 使用无 zero-fill 操作数的 `SM80_CP_ASYNC_CACHEGLOBAL`，
+  去掉逐向量行边界判断和无效源地址选择。Q tile 终点直接为 `q0+BQ`。
+- 完整 tile 的 mask 只检查 causal 条件，fully_valid 只检查最早 query 能否看到
+  最后 key；输出无需 `qi<tq` 判断。尾块版本仍保留行边界检查和 zero-fill。
+- 保持 BQ/BK/BH=64、24 KiB smem、launch_bounds(128,4)、PV 寄存器预取、
+  base-2 softmax、分母延迟归约及直接 O pair stores。没有同时引入首轮 softmax 特化。
+
+GPU 测试新增：同一组 query 的完整 tile 路径与追加一个 query/key 后的尾块路径
+对照 O/LSE，并分别对照 FP64 和 SDPA；覆盖 cached causal 对角线。
+NaN cache-capacity 用例补充 full/full、tail/full、full/tail，验证不能只检查一个长度。
+本地 attention 测试 25 项：1 项 host 通过、24 项 CUDA 跳过。独立 CPU 索引检查覆盖
+116 组长度、982 对抽样 tile（含 int32 上限），完整 tile 访存边界与 causal mask
+等价性通过；不代表 CUDA 编译或运行验证。性能待与用户实测 42.38 us 基线比较。
+编译日志/NCU 中现在应关注 `attention_bf16::forward<true>`；原有
+`regex:attention_bf16::forward` 过滤器仍可匹配两个特化版本。
+
 CUDA 验收（包含编译、FP64 oracle、tail/cache/segment/stream 检查）：
 
 ```bash

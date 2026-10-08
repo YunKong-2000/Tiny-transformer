@@ -82,8 +82,9 @@ constexpr bool compatible_probability_fragment() {
 static_assert(compatible_probability_fragment());
 
 // Source rows always have global stride DH; COLS is only the copied width.
-// Invalid token rows are zero-filled. All valid source/target vectors are 16B aligned.
-template <int ROWS, int COLS, class SmemLayout>
+// The full-tile specialization needs no row predicate or zero-fill operand.
+// Otherwise invalid token rows are zero-filled. All vectors are 16B aligned.
+template <int ROWS, int COLS, bool EVEN_TILES, class SmemLayout>
 __device__ __forceinline__ void
 load_subtile_async(const Element* base, int32_t row0, int32_t rows,
                    int feature0, Element* dst, SmemLayout layout) {
@@ -93,27 +94,36 @@ load_subtile_async(const Element* base, int32_t row0, int32_t rows,
   for (int vector = int(threadIdx.x); vector < ROWS * vectors_per_row; vector += THREADS) {
     const int r = vector / vectors_per_row;
     const int d = (vector % vectors_per_row) * VEC_LEN;
-    const bool valid = row0 + r < rows;
-    // Row indices are int32; a row's element offset need not fit int32.
-    const Element* src = valid ? base + int64_t(row0 + r) * DH + feature0 + d : base;
     Element* target = dst + layout(make_coord(r, d));
-    SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<uint128_t>::copy(
-        *reinterpret_cast<const uint128_t*>(src),
-        *reinterpret_cast<uint128_t*>(target), valid);
+    // Row indices are int32; a row's element offset need not fit int32.
+    if constexpr (EVEN_TILES) {
+      const Element* src = base + int64_t(row0 + r) * DH + feature0 + d;
+      SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>::copy(
+          *reinterpret_cast<const uint128_t*>(src),
+          *reinterpret_cast<uint128_t*>(target));
+    } else {
+      const bool valid = row0 + r < rows;
+      const Element* src = valid ? base + int64_t(row0 + r) * DH + feature0 + d : base;
+      SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<uint128_t>::copy(
+          *reinterpret_cast<const uint128_t*>(src),
+          *reinterpret_cast<uint128_t*>(target), valid);
+    }
   }
 }
 
+template <bool EVEN_TILES>
 __device__ __forceinline__ void
 load_k_async(const Element* k, int32_t key0, int32_t tk,
              int feature0, SharedStorage& storage, int stage) {
-  load_subtile_async<BK, BH>(k, key0, tk, feature0, storage.kv[stage].k, KVLayout{});
+  load_subtile_async<BK, BH, EVEN_TILES>(k, key0, tk, feature0, storage.kv[stage].k, KVLayout{});
   cp_async_fence();
 }
 
+template <bool EVEN_TILES>
 __device__ __forceinline__ void
 load_v_async(const Element* v, int32_t key0, int32_t tk,
              int feature0, SharedStorage& storage, int stage) {
-  load_subtile_async<BK, BH>(v, key0, tk, feature0, storage.kv[stage].v, KVLayout{});
+  load_subtile_async<BK, BH, EVEN_TILES>(v, key0, tk, feature0, storage.kv[stage].v, KVLayout{});
   cp_async_fence();
 }
 
@@ -188,7 +198,7 @@ gemm_pv_subtile(const PTensor& rP, const VTensor& sVt, OTensor& acc) {
 // Keep valid scores unscaled: max(raw_score) * SCALE_LOG2 needs one scale
 // per row, and each probability fuses its scale/subtraction into one FMA.
 // Full tiles skip this helper entirely; boundary tiles only mask invalid scores.
-template <class STensor, class CoordTensor>
+template <bool EVEN_TILES, class STensor, class CoordTensor>
 __device__ __forceinline__ void
 mask_scores(STensor& scores, const CoordTensor& coords,
                   int32_t q0, int32_t key0, int32_t tq, int32_t tk, int32_t past_len) {
@@ -203,7 +213,8 @@ mask_scores(STensor& scores, const CoordTensor& coords,
         const int32_t kj = key0 + get<1>(coords(vi, 0, n));
         // Subtract past instead of adding it to a potentially padded query
         // index. kj - past_len fits int32 even at Tk == INT32_MAX.
-        const bool valid = qi < tq && kj < tk && kj - past_len <= qi;
+        bool valid = kj - past_len <= qi;
+        if constexpr (!EVEN_TILES) valid = valid && qi < tq && kj < tk;
         if (!valid) scores(vi, 0, n) = -CUDART_INF_F;
       }
     }
@@ -219,6 +230,9 @@ __device__ __forceinline__ float row_sum(float x) {
   return x + __shfl_xor_sync(0xffffffffu, x, 2);
 }
 
+// Host selects EVEN_TILES only when Tq % BQ == 0 && Tk % BK == 0.
+// This removes sequence-tail guards, not the causal diagonal mask.
+template <bool EVEN_TILES>
 __global__ __launch_bounds__(THREADS, 4)
 void forward(const Element* q, const Element* k, const Element* v,
              Element* o, float* lse, int32_t tq, int32_t tk, int32_t past_len) {
@@ -227,7 +241,7 @@ void forward(const Element* q, const Element* k, const Element* v,
   // Host bounds all lengths and grid.x by INT32_MAX. Fixed 64-row tiles
   // also keep padded indices <= INT32_MAX (the largest is 2^31 - 1).
   static_assert(BQ == 64 && BK == 64);
-  const int32_t q_tiles = (tq - 1) / BQ + 1;
+  const int32_t q_tiles = EVEN_TILES ? tq / BQ : (tq - 1) / BQ + 1;
   // Enumerate long causal tiles first, across all heads. This is a scheduling
   // hint via block numbering; CUDA does not guarantee block execution order.
   const int32_t batch_heads = int32_t(gridDim.x) / q_tiles;
@@ -239,7 +253,7 @@ void forward(const Element* q, const Element* k, const Element* v,
   o += int64_t(bh) * tq * DH;
   lse += int64_t(bh) * tq;
   // q0+BQ can be 2^31 on a tail tile, so bound the addend first.
-  const int32_t q_end = q0 + (tq - q0 < BQ ? tq - q0 : BQ);
+  const int32_t q_end = q0 + (EVEN_TILES ? BQ : (tq - q0 < BQ ? tq - q0 : BQ));
   const int32_t kv_tiles = (past_len + q_end - 1) / BK + 1;
 
   auto sQ = make_tensor(make_smem_ptr(storage.q), QLayout{});
@@ -261,8 +275,8 @@ void forward(const Element* q, const Element* k, const Element* v,
   // is not needed by QK, softmax weights or PV until the final normalization.
   float l_partial[TM] = {0.f, 0.f};
 
-  load_subtile_async<BQ, DH>(q, q0, tq, 0, storage.q, QLayout{});
-  load_k_async(k, 0, tk, 0, storage, 0); // Commit Q and first K in one group.
+  load_subtile_async<BQ, DH, EVEN_TILES>(q, q0, tq, 0, storage.q, QLayout{});
+  load_k_async<EVEN_TILES>(k, 0, tk, 0, storage, 0); // Commit Q and first K in one group.
   cp_async_wait<0>();
   __syncthreads(); // Q and K[0] ready; Q stays read-only for the whole CTA.
 
@@ -281,17 +295,18 @@ void forward(const Element* q, const Element* k, const Element* v,
       // The full K tile is ready from the prologue or previous PV step.
       // Prefetch full V in the other slot while QK and softmax run. The
       // preceding CTA barrier guarantees that all old V readers have finished.
-      load_v_async(v, key0, tk, 0, storage, 1);
+      load_v_async<EVEN_TILES>(v, key0, tk, 0, storage, 1);
       auto sK = make_tensor(make_smem_ptr(storage.kv[0].k), KVLayout{});
       gemm_qk_subtile(sQ, sK, rS);
 
       // All rows must exist, and even the first query must see the last key.
       // Subtractions avoid constructing a padded key endpoint beyond int32.
       // This branch is uniform across the CTA; padded query rows take the mask path.
-      const bool fully_valid = q_end - q0 == BQ && tk - key0 >= BK &&
-                               past_len + q0 - key0 >= BK - 1;
+      bool fully_valid = past_len + q0 - key0 >= BK - 1;
+      if constexpr (!EVEN_TILES)
+        fully_valid = fully_valid && q_end - q0 == BQ && tk - key0 >= BK;
       if (!fully_valid)
-        mask_scores(rS, tS, q0, key0, tq, tk, past_len);
+        mask_scores<EVEN_TILES>(rS, tS, q0, key0, tq, tk, past_len);
 
       // V is already in flight; softmax needs no shared-memory operands.
       CUTE_UNROLL
@@ -337,7 +352,7 @@ void forward(const Element* q, const Element* k, const Element* v,
     __syncthreads(); // Publish V[1] and release K[0] after all QK reads.
     if (tile + 1 < kv_tiles) {
       // Next K can overwrite slot 0 while current PV only reads slot 1.
-      load_k_async(k, key0 + BK, tk, 0, storage, 0);
+      load_k_async<EVEN_TILES>(k, key0 + BK, tk, 0, storage, 0);
     }
     auto sVt = make_tensor(make_smem_ptr(storage.kv[1].v), VTransposedLayout{});
     gemm_pv_subtile(rP, sVt, rO);
@@ -354,7 +369,7 @@ void forward(const Element* q, const Element* k, const Element* v,
     // Placing this inside qi<tq would make a tail warp's participation invalid.
     const float denominator = row_sum(l_partial[a]);
     const int32_t qi = q0 + get<0>(tO(TN * a, 0, 0));
-    if (qi < tq) {
+    if (EVEN_TILES || qi < tq) {
       const bool has_sum = denominator > 0.f;
       const float inv_l = has_sum ? 1.0f / denominator : 0.f;
       CUTE_UNROLL
