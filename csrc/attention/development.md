@@ -13,6 +13,8 @@ score、softmax 统计量和输出累加器为 FP32，P 直接转换为 BF16 A f
 输入 batch、heads、序列长度必须为正，且 `Tk = past_len + Tq`。
 FP32 二维 grid 要求 `B*H <= 65535`、`ceil(Tq/32) <= INT_MAX`；
 BF16 通用路径一维 grid 要求 `B*H*ceil(Tq/64) <= INT_MAX`，乘法前检查溢出。
+BF16 另要求 `Tk <= INT32_MAX`，host 在连续化/输出分配前检查，再将 Tq/Tk/past_len
+传为 int32；完整元素地址偏移仍为 int64。
 单 query 专用路径 grid 为 `(B*H, ceil(Tk/128))`，第二维最多 32，沿用上述边界检查。
 
 CUDA 验收（包含编译、FP64 oracle、tail/cache/segment/stream 检查）：
@@ -63,7 +65,7 @@ prefill/decode 输入在 CUDA Graph 中捕获和重复重放的 O/LSE。
 - 两个 union stage 交替预取，跨越 QK/PV 阶段与相邻 KV tile；V[0] 的加载与 K[1]
   的计算及 softmax 重叠，下一 tile 的 K[0] 与当前 V[1] 的计算重叠。
   该方案减少 shared memory 和 fragment 大小，但增加 subtile 切换与同步，收益需实测。
-- 通用 softmax 使用 base-2 最大值、`__exp2f` 与融合 scale/subtract；LSE 写回时转换
+- 通用 softmax 使用 base-2 最大值、`exp2f` 与融合 scale/subtract；LSE 写回时转换
   为自然对数，仍为 FP32。专用 decode 路径保持原有自然指数实现。
 - `Tq=1 && Tk<=4096` 使用专用 SIMT split-KV 路径，每 CTA 256 线程处理 128 个 key。
   QK、P、PV 使用 FP32；单块直接输出，多块写 FP32 `(numerator, max, sum)` 并由第二个
@@ -194,8 +196,31 @@ FMA 和 base-2 最大值的舍入与旧实现不同，最大概率可能因舍�
 cache chunk、full/masked tile 切换及 query padding。CPU 分块模型使用 FP64
 乘加后舍入 FP32 模拟 FMA，49 个完整 tile 和 60 个 mask tile 通过 FP64 对照，
 最大 O 绝对误差 0.006991，最大 LSE 绝对误差 0.00006104（均在原阈值内）。
-attention 主机测试 1 项通过、19 项 CUDA 跳过。未运行 nvcc、CUDA __exp2f 精度检查、
+attention 主机测试 1 项通过、19 项 CUDA 跳过。未运行 nvcc、CUDA exp2f 精度检查、
 GPU racecheck 或性能测试，寄存器分配与加速效果需由目标 A100 验证。
+
+CUDA 编译修复：两处 base-2 指数改用 CUDA device math 的 `exp2f`，与 CUTLASS
+example 41 的调用一致。此前误用了 `__exp2f`，目标工具链将其识别为 host 函数，
+不能在 device code 调用。保留 base-2 最大值、FMA、自然对数 LSE 和 launch bounds；
+不添加全局 fast-math 开关。具体指令和性能仍以 nvcc/SASS 和 A100 测量为准。
+
+2026-10-08 索引宽度实验：通用 BF16 forward 的 Tq/Tk/past_len 参数、CTA 映射、
+query/key/tile 循环变量及 mask 比较改为 int32。保持当前 base-2 softmax、BK=64、
+BH=32、launch_bounds(128,4) 和流水线，以用户 base-2 Graph 51.11 us 为直接对照。
+未同时退回自然指数，避免将两项改动的收益混在一起。FP32 和专用 decode kernel 未改。
+
+安全边界：由 host 的 `Tk=past_len+Tq`、正尺寸及 `Tk<=INT32_MAX` 推导 Tq/past_len
+也可安全缩窄；grid.x 的原有 INT_MAX 检查保证 block 编号、batch_heads 可转为 int32。
+固定 BQ=BK=64 下，末块的 padded row/key 最大为 INT32_MAX；query 结束位置使用
+`q0 + min(tq-q0,BQ)`，避免 `q0+BQ` 超界。causal 条件使用 `kj-past_len<=qi`，
+避免在 padded query 行求 `past_len+qi` 时溢出。下一 key tile 起点只在确实有下一块时求值。
+global load/store 的 `row*DH`、batch/head base 偏移在乘法前显式提升为 int64，
+所以单 head 或整个 tensor 的元素/字节偏移不受 int32 限制。
+
+新增 CUDA 测试用零 stride view 检查超长序列在复制前被拒绝，无需分配巨大输入。
+本地另用 Clang UBSan 编译 kernel 中提取的真实索引表达式，对 INT32_MAX 附近的
+尾块、非零 past_len、CTA 映射与原 int64 mask 语义进行对照。该检查不替代 nvcc、
+CUDA 数值/竞态或性能测试；attention 主机测试 1 项通过、20 项 CUDA 跳过。
 
 2026-10-07 本地验证：student 回归 82 项（11 项通过、71 项 CUDA 跳过），
 benchmark 回归 25 项通过，operator 回归 10 项通过；Clang 对绑定和输入检查头文件的

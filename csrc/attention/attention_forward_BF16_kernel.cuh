@@ -84,7 +84,7 @@ static_assert(compatible_probability_fragment());
 // Invalid token rows are zero-filled. All valid source/target vectors are 16B aligned.
 template <int ROWS, int COLS, class SmemLayout>
 __device__ __forceinline__ void
-load_subtile_async(const Element* base, int64_t row0, int64_t rows,
+load_subtile_async(const Element* base, int32_t row0, int32_t rows,
                    int feature0, Element* dst, SmemLayout layout) {
   static_assert(COLS % VEC_LEN == 0);
   constexpr int vectors_per_row = COLS / VEC_LEN;
@@ -93,7 +93,8 @@ load_subtile_async(const Element* base, int64_t row0, int64_t rows,
     const int r = vector / vectors_per_row;
     const int d = (vector % vectors_per_row) * VEC_LEN;
     const bool valid = row0 + r < rows;
-    const Element* src = valid ? base + (row0 + r) * DH + feature0 + d : base;
+    // Row indices are int32; a row's element offset need not fit int32.
+    const Element* src = valid ? base + int64_t(row0 + r) * DH + feature0 + d : base;
     Element* target = dst + layout(make_coord(r, d));
     SM80_CP_ASYNC_CACHEGLOBAL_ZFILL<uint128_t>::copy(
         *reinterpret_cast<const uint128_t*>(src),
@@ -102,14 +103,14 @@ load_subtile_async(const Element* base, int64_t row0, int64_t rows,
 }
 
 __device__ __forceinline__ void
-load_k_async(const Element* k, int64_t key0, int64_t tk,
+load_k_async(const Element* k, int32_t key0, int32_t tk,
              int feature0, SharedStorage& storage, int stage) {
   load_subtile_async<BK, BH>(k, key0, tk, feature0, storage.kv[stage].k, KVLayout{});
   cp_async_fence();
 }
 
 __device__ __forceinline__ void
-load_v_async(const Element* v, int64_t key0, int64_t tk,
+load_v_async(const Element* v, int32_t key0, int32_t tk,
              int feature0, SharedStorage& storage, int stage) {
   load_subtile_async<BK, BH>(v, key0, tk, feature0, storage.kv[stage].v, KVLayout{});
   cp_async_fence();
@@ -172,7 +173,7 @@ gemm_pv_subtile(const PTensor& rP, const VTensor& sVt, OTensor& acc) {
 template <class STensor, class CoordTensor>
 __device__ __forceinline__ void
 mask_scores(STensor& scores, const CoordTensor& coords,
-                  int64_t q0, int64_t key0, int64_t tq, int64_t tk, int64_t past_len) {
+                  int32_t q0, int32_t key0, int32_t tq, int32_t tk, int32_t past_len) {
   CUTE_UNROLL
   for (int a = 0; a < TM; ++a) {
     CUTE_UNROLL
@@ -180,9 +181,11 @@ mask_scores(STensor& scores, const CoordTensor& coords,
       CUTE_UNROLL
       for (int b = 0; b < TN; ++b) {
         const int vi = TN * a + b;
-        const int64_t qi = q0 + get<0>(coords(vi, 0, n));
-        const int64_t kj = key0 + get<1>(coords(vi, 0, n));
-        const bool valid = qi < tq && kj < tk && kj <= past_len + qi;
+        const int32_t qi = q0 + get<0>(coords(vi, 0, n));
+        const int32_t kj = key0 + get<1>(coords(vi, 0, n));
+        // Subtract past instead of adding it to a potentially padded query
+        // index. kj - past_len fits int32 even at Tk == INT32_MAX.
+        const bool valid = qi < tq && kj < tk && kj - past_len <= qi;
         if (!valid) scores(vi, 0, n) = -CUDART_INF_F;
       }
     }
@@ -200,22 +203,26 @@ __device__ __forceinline__ float row_sum(float x) {
 
 __global__ __launch_bounds__(THREADS, 4)
 void forward(const Element* q, const Element* k, const Element* v,
-             Element* o, float* lse, int64_t tq, int64_t tk, int64_t past_len) {
+             Element* o, float* lse, int32_t tq, int32_t tk, int32_t past_len) {
   extern __shared__ __align__(16) unsigned char shared_bytes[];
   auto& storage = *reinterpret_cast<SharedStorage*>(shared_bytes);
-  const int64_t q_tiles = (tq - 1) / BQ + 1;
+  // Host bounds all lengths and grid.x by INT32_MAX. Fixed 64-row tiles
+  // also keep padded indices <= INT32_MAX (the largest is 2^31 - 1).
+  static_assert(BQ == 64 && BK == 64);
+  const int32_t q_tiles = (tq - 1) / BQ + 1;
   // Enumerate long causal tiles first, across all heads. This is a scheduling
   // hint via block numbering; CUDA does not guarantee block execution order.
-  const int64_t batch_heads = int64_t(gridDim.x) / q_tiles;
-  const int64_t bh = int64_t(blockIdx.x) % batch_heads;
-  const int64_t q0 = (q_tiles - 1 - int64_t(blockIdx.x) / batch_heads) * BQ;
-  q += bh * tq * DH;
-  k += bh * tk * DH;
-  v += bh * tk * DH;
-  o += bh * tq * DH;
-  lse += bh * tq;
-  const int64_t q_end = q0 + BQ < tq ? q0 + BQ : tq;
-  const int64_t kv_tiles = (past_len + q_end - 1) / BK + 1;
+  const int32_t batch_heads = int32_t(gridDim.x) / q_tiles;
+  const int32_t bh = int32_t(blockIdx.x) % batch_heads;
+  const int32_t q0 = (q_tiles - 1 - int32_t(blockIdx.x) / batch_heads) * BQ;
+  q += int64_t(bh) * tq * DH;
+  k += int64_t(bh) * tk * DH;
+  v += int64_t(bh) * tk * DH;
+  o += int64_t(bh) * tq * DH;
+  lse += int64_t(bh) * tq;
+  // q0+BQ can be 2^31 on a tail tile, so bound the addend first.
+  const int32_t q_end = q0 + (tq - q0 < BQ ? tq - q0 : BQ);
+  const int32_t kv_tiles = (past_len + q_end - 1) / BK + 1;
 
   auto sQ = make_tensor(make_smem_ptr(storage.q), QLayout{});
   TiledMma mma;
@@ -238,8 +245,8 @@ void forward(const Element* q, const Element* k, const Element* v,
   cp_async_wait<0>();
   __syncthreads(); // Q and K[0] ready; Q stays read-only for the whole CTA.
 
-  for (int64_t tile = 0; tile < kv_tiles; ++tile) {
-    const int64_t key0 = tile * BK;
+  for (int32_t tile = 0; tile < kv_tiles; ++tile) {
+    const int32_t key0 = tile * BK;
     // Identity tensors have ScaledBasis strides, which make_fragment_like cannot
     // order. Keep only the partition's shape and allocate ordinary compact
     // register storage, with the atom value dimension contiguous.
@@ -274,7 +281,7 @@ void forward(const Element* q, const Element* k, const Element* v,
       });
 
       // All rows must exist, and even the first query must see the last key.
-      // Subtractions avoid constructing a padded key endpoint beyond int64_t.
+      // Subtractions avoid constructing a padded key endpoint beyond int32.
       // This branch is uniform across the CTA; padded query rows take the mask path.
       const bool fully_valid = q_end - q0 == BQ && tk - key0 >= BK &&
                                past_len + q0 - key0 >= BK - 1;
@@ -294,7 +301,7 @@ void forward(const Element* q, const Element* k, const Element* v,
           }
         }
         const float m2_new = fmaxf(m2[a], row_max(local_max) * SCALE_LOG2);
-        const float alpha = m2[a] == -CUDART_INF_F ? 0.f : __exp2f(m2[a] - m2_new);
+        const float alpha = m2[a] == -CUDART_INF_F ? 0.f : exp2f(m2[a] - m2_new);
         float local_sum = 0.f;
         CUTE_UNROLL
         for (int n = 0; n < SCORE_N_ITER; ++n) {
@@ -304,7 +311,7 @@ void forward(const Element* q, const Element* k, const Element* v,
             const float score = rS(vi, 0, n);
             // Guard fully masked padded rows before evaluating -inf - (-inf).
             const float p = score == -CUDART_INF_F ? 0.f :
-                __exp2f(fmaf(score, SCALE_LOG2, -m2_new));
+                exp2f(fmaf(score, SCALE_LOG2, -m2_new));
             local_sum += p;
             rP(vi + (n % 2) * (TM * TN), 0, n / 2) = Element(p);
           }
@@ -351,7 +358,7 @@ void forward(const Element* q, const Element* k, const Element* v,
 
   CUTE_UNROLL
   for (int a = 0; a < TM; ++a) {
-    const int64_t qi = q0 + get<0>(tO(TN * a, 0, 0));
+    const int32_t qi = q0 + get<0>(tO(TN * a, 0, 0));
     if (qi < tq) {
       CUTE_UNROLL
       for (int n = 0; n < OUTPUT_N_ITER; ++n) {
@@ -363,7 +370,7 @@ void forward(const Element* q, const Element* k, const Element* v,
         // The two atom values are consecutive columns with an even first d.
         // Pack their exact BF16 bits into one aligned store instead of two STG.U16.
         const uint32_t packed = uint32_t(lo.raw()) | (uint32_t(hi.raw()) << 16);
-        *reinterpret_cast<uint32_t*>(o + qi * DH + d) = packed;
+        *reinterpret_cast<uint32_t*>(o + int64_t(qi) * DH + d) = packed;
       }
       if (threadIdx.x % LANES_PER_ROW == 0)
         // Public LSE is a natural logarithm, even though internal maxima use base 2.

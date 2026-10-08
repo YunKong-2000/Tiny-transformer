@@ -48,6 +48,10 @@ attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v,
     // Divide before multiplying: the BF16 kernel flattens all CTAs into grid.x.
     TORCH_CHECK(q_tiles <= max_grid_x && B <= max_grid_x / q_tiles / Nh,
                 "attention shape exceeds the supported CUDA grid limits");
+    // check_mask_inputs established 0 < Tq <= Tk and past_len == Tk - Tq.
+    // Reject before contiguous copies/output allocation or any narrowing cast.
+    TORCH_CHECK(Tk <= std::numeric_limits<int32_t>::max(),
+                "bf16 attention sequence lengths must fit int32 (Tk <= INT32_MAX)");
   } else {
     TORCH_CHECK(q_tiles <= max_grid_x && B <= 65535 / Nh,
                 "attention shape exceeds the supported CUDA grid limits");
@@ -135,9 +139,9 @@ attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v,
       reinterpret_cast<const attention_bf16::Element*>(v.data_ptr<at::BFloat16>()),
       reinterpret_cast<attention_bf16::Element*>(o.data_ptr<at::BFloat16>()),
       lse.data_ptr<float>(),
-      Tq,
-      Tk,
-      past_len
+      static_cast<int32_t>(Tq),
+      static_cast<int32_t>(Tk),
+      static_cast<int32_t>(past_len)
     );
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }

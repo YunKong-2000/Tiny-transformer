@@ -6,6 +6,8 @@
 两条路径支持序列尾块、cache/chunk 和非连续输入；FP32 支持 segment IDs，V 使用实际 stride。
 BF16 要求 SM80+，拒绝 segment IDs；原生入口连续化 Q/K/V，并保证 16-byte 对齐。
 Q/K/V 必须同 dtype，O 保持输入 dtype，内部 LSE 为 FP32。
+BF16 的序列长度要求 `Tk <= INT32_MAX`；kernel 使用 int32 序列索引，元素地址偏移
+仍使用 int64，长度检查在输入连续化和输出分配之前执行。
 BF16 通用路径将 Q 整块保存在 shared memory、P 保存在寄存器，当前实验配置的 K/V 为
 `(64,32)` subtile，两个 union stage 复用存储，共 16 KiB/CTA；`Tq=1,Tk<=4096` 使用专用
 SIMT split-KV decode，分块 softmax 在 FP32 中合并；更长序列使用通用 Tensor Core 路径。

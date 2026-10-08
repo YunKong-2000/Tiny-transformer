@@ -305,6 +305,17 @@ class StudentAttentionCudaTests(unittest.TestCase):
                     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
                     torch.testing.assert_close(lse, expected_lse, atol=0, rtol=0)
 
+    def test_bf16_rejects_sequence_index_overflow_before_copy(self):
+        # Zero-stride views require only 64 BF16 values. The host must reject
+        # lengths before casting to int32 or materializing these huge views.
+        seed = torch.zeros(1, 1, 1, 64, device='cuda', dtype=torch.bfloat16)
+        for tq, tk in ((2**31, 2**31), (2, 2**31), (65, 2**31 + 64)):
+            with self.subTest(tq=tq, tk=tk):
+                q = seed.expand(1, 1, tq, 64)
+                kv = seed.expand(1, 1, tk, 64)
+                with self.assertRaisesRegex(RuntimeError, 'sequence lengths must fit int32'):
+                    self.extension.attention_forward(q, kv, kv, tk - tq)
+
     def test_prefill_tiles_and_sequence_tails(self):
         for time in (1, 7, 31, 32, 33, 65, 96):
             with self.subTest(time=time):
