@@ -159,6 +159,21 @@ class StudentAttentionCudaTests(unittest.TestCase):
                 self.assertTrue(k.is_contiguous() and v.is_contiguous())
                 self.check_forward(q, k, v, tk - tq)
 
+    def test_bf16_output_relayout_feature_and_head_order(self):
+        self.require_bf16()
+        features = torch.arange(64, device='cuda', dtype=torch.bfloat16) / 8 - 4
+        offsets = torch.tensor([-24., -8., 8., 24.], device='cuda',
+                               dtype=torch.bfloat16).view(2, 2, 1, 1)
+        for tq in (2, 63, 64, 65, 129):
+            with self.subTest(tq=tq):
+                q = torch.zeros(2, 2, tq, 64, device='cuda', dtype=torch.bfloat16)
+                k = torch.zeros_like(q)
+                # Exactly representable and distinct per column/head; uniform
+                # attention must reproduce the vector at every valid query row.
+                v = (offsets + features).expand_as(q).contiguous()
+                actual = self.check_forward(q, k, v)
+                torch.testing.assert_close(actual, v, atol=0, rtol=0)
+
     def test_bf16_causal_tile_order_and_pipeline_transitions(self):
         self.require_bf16()
         # Distinct head offsets expose remapped blocks writing to a wrong head.

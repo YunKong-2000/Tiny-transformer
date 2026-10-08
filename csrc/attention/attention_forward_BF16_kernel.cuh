@@ -325,9 +325,11 @@ void forward(const Element* q, const Element* k, const Element* v,
       cp_async_wait<0>();
       __syncthreads(); // Publish next K[0] and release V[1] before next V load.
     }
-    // Last iteration has no outstanding copies and only stores register results.
+    // Last iteration has no outstanding copies; Q is released for the epilogue.
   }
 
+  // The last QK->PV barrier has released every Q reader. Reuse Q's 8 KiB
+  // for an epilogue layout conversion; normalization arithmetic is unchanged.
   CUTE_UNROLL
   for (int a = 0; a < TM; ++a) {
     const int32_t qi = q0 + get<0>(tO(TN * a, 0, 0));
@@ -339,14 +341,31 @@ void forward(const Element* q, const Element* k, const Element* v,
         const int d = get<1>(tO(vi, 0, n));
         const Element lo(l[a] > 0.f ? rO(vi, 0, n) / l[a] : 0.f);
         const Element hi(l[a] > 0.f ? rO(vi + 1, 0, n) / l[a] : 0.f);
-        // The two atom values are consecutive columns with an even first d.
-        // Pack their exact BF16 bits into one aligned store instead of two STG.U16.
+        // Write each MMA-owned pair to its logical output position in shared
+        // memory. All values of a valid row are produced exactly once.
         const uint32_t packed = uint32_t(lo.raw()) | (uint32_t(hi.raw()) << 16);
-        *reinterpret_cast<uint32_t*>(o + int64_t(qi) * DH + d) = packed;
+        const int offset = QLayout{}(make_coord(qi - q0, d));
+        *reinterpret_cast<uint32_t*>(storage.q + offset) = packed;
       }
       if (threadIdx.x % LANES_PER_ROW == 0)
         // Public LSE is a natural logarithm, even though internal maxima use base 2.
         lse[qi] = l[a] > 0.f ? fmaf(m2[a], LN2, logf(l[a])) : -CUDART_INF_F;
+    }
+  }
+  __syncthreads(); // Output writers and vector readers have different ownership.
+
+  // Eight adjacent lanes write one complete 64-BF16 row. Each lane transfers
+  // 8 BF16 values (16 bytes), filling every 32-byte global-store sector.
+  constexpr int vectors_per_row = DH / VEC_LEN;
+  CUTE_UNROLL
+  for (int vector = int(threadIdx.x); vector < BQ * vectors_per_row; vector += THREADS) {
+    const int row = vector / vectors_per_row;
+    const int d = (vector % vectors_per_row) * VEC_LEN;
+    const int32_t qi = q0 + row;
+    if (qi < tq) {
+      const int offset = QLayout{}(make_coord(row, d));
+      const uint4 values = *reinterpret_cast<const uint4*>(storage.q + offset);
+      *reinterpret_cast<uint4*>(o + int64_t(qi) * DH + d) = values;
     }
   }
 }

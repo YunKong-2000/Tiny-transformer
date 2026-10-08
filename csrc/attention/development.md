@@ -61,7 +61,8 @@ prefill/decode 输入在 CUDA Graph 中捕获和重复重放的 O/LSE。
 - 先对完整 O 的 64 列缩放一次 alpha，再直接计算 `O += P @ V`；
   PV 内部按 K=16 归约 BK，不再切分输出特征。O 仍为 `(4,1,8)`，32 个 FP32。
 - 完整 V 的加载与 QK/softmax 重叠，下一 tile 的完整 K 与当前 PV 重叠。
-  每个 CTA 消费 N 个 KV tile 时共 2N 次 barrier（含 prologue），收益需实测。
+  每个 CTA 消费 N 个 KV tile 时主循环共 2N 次 barrier（含 prologue），
+  当前输出重排另加 1 次；收益需实测。
 - 通用 softmax 与已保存的 int32/base-2 基线一致，使用 `exp2f` 和 FMA，LSE
   写回时转换为自然对数 FP32。该轮实验只改变 K/V 宽度、相应 swizzle 和流水线。
 - `Tq=1 && Tk<=4096` 使用专用 SIMT split-KV 路径，每 CTA 256 线程处理 128 个 key。
@@ -262,6 +263,22 @@ benchmark 回归 25 项通过，operator 回归 10 项通过；Clang 对绑定�
 C++17 语法检查通过。未运行 nvcc、GPU 数值测试或 compute-sanitizer。
 
 ## 整体算法 overall algorithm
+
+2026-10-08 输出重排实验：复用 `storage.q` 的 8 KiB，先由 MMA 原线程将归一化的
+BF16 pair 写到 QLayout 对应位置，再执行一次全 CTA barrier。随后按每行 8 个线程、
+每线程 8 个 BF16 重新读取，使用对齐的 uint4 向 global memory 写回。共享内存仍为
+24 KiB，没有额外分配；原来的逐元素除法和 LSE 计算保留，只测试输出访问布局变化。
+最后一次 QK→PV barrier 保证所有 Q 读取已经结束，因此写 Q 缓冲之前无需新增 barrier；
+输出写入与 vector 读取的线程分工不同，中间 barrier 必须由包括 padded query 线程在内
+的所有线程执行。global vector store 只对有效 query 行执行。
+
+本地覆盖 1/2/7/16/31/32/33/63/64 个有效行的逐位重排、唯一覆盖、4/16-byte 对齐和
+完整 32-byte sector 检查，均通过；新增 GPU 精确输出用例使用各 head/feature 不同的
+常量 V，覆盖 2/63/64/65/129 行。attention 测试 1 项通过、22 项 CUDA 跳过。
+尚未运行 nvcc、racecheck/synccheck 或性能测试，新增 shared 往返及 barrier 的代价
+必须与更好的 global store 合并效果一起测量。分母延迟归约和每行倒数是另两项独立建议，
+本轮没有同时实现。
+
 $$
 \mathbf{Q}_i \in \mathbb{R}^{B_q \times D_n} \\ 
 \mathbf{K}_{jd} \in \mathbb{R}^{B_k \times B_d} \\
