@@ -107,6 +107,20 @@ class StudentAttentionCudaTests(unittest.TestCase):
                 k[..., feature] = key_codes * 8
                 self.check_forward(q, k, v)
 
+    def test_bf16_causal_tile_order_and_pipeline_transitions(self):
+        self.require_bf16()
+        # Distinct head offsets expose remapped blocks writing to a wrong head.
+        # V=token_index also makes every causal prefix produce a different mean.
+        for tq, tk in ((2, 2), (33, 33), (64, 64), (65, 65),
+                       (129, 161), (193, 225)):
+            with self.subTest(tq=tq, tk=tk):
+                q = torch.zeros(2, 3, tq, 64, device='cuda', dtype=torch.bfloat16)
+                k = torch.zeros(2, 3, tk, 64, device='cuda', dtype=torch.bfloat16)
+                offsets = torch.arange(6, device='cuda').view(2, 3, 1, 1) / 8
+                tokens = torch.arange(tk, device='cuda').view(1, 1, tk, 1) / 256
+                v = (offsets + tokens).expand(2, 3, tk, 64).to(torch.bfloat16).contiguous()
+                self.check_forward(q, k, v, tk - tq)
+
     def test_bf16_unaligned_and_strided_views(self):
         self.require_bf16()
         count = 2 * 3 * 65 * 64

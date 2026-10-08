@@ -123,20 +123,25 @@ gemm_qk_subtile(const QTensor& sQ, const KTensor& sK, STensor& acc) {
   auto copy_b = make_tiled_copy_B(Copy_Atom<SM75_U32x2_LDSM_N, Element>{}, mma);
   auto thr_a = copy_a.get_slice(threadIdx.x);
   auto thr_b = copy_b.get_slice(threadIdx.x);
-  CUTE_UNROLL
-  for (int ki = 0; ki < BH / MMA_K; ++ki) {
+  for_each(make_seq<BH / MMA_K>{}, [&](auto ki) {
     auto a = local_tile(sQ, Shape<Int<BQ>, Int<MMA_K>>{}, make_coord(0, ki));
-    auto b = local_tile(sK, Shape<Int<BK>, Int<MMA_K>>{}, make_coord(0, ki));
     auto rA = thr.partition_fragment_A(a);
-    auto rB = thr.partition_fragment_B(b);
     auto tAs = thr_a.partition_S(a);
-    auto tBs = thr_b.partition_S(b);
     auto tAr = thr_a.retile_D(rA);
-    auto tBr = thr_b.retile_D(rB);
     copy(copy_a, tAs, tAr);
-    copy(copy_b, tBs, tBr);
-    gemm(mma, rA, rB, acc);
-  }
+    // Load just one N=8 B fragment (4 BF16/thread), instead of all BK=32
+    // columns (16 BF16/thread). A is reused across these four MMA calls.
+    for_each(make_seq<SCORE_N_ITER>{}, [&](auto ni) {
+      auto b = local_tile(sK, Shape<Int<MMA_N>, Int<MMA_K>>{}, make_coord(ni, ki));
+      auto rB = thr.partition_fragment_B(b);
+      auto tBs = thr_b.partition_S(b);
+      auto tBr = thr_b.retile_D(rB);
+      copy(copy_b, tBs, tBr);
+      CUTE_STATIC_ASSERT_V(size(rB) == Int<4>{});
+      auto c = acc(_, _0{}, ni);
+      gemm(mma, rA(_, _0{}, _0{}), rB(_, _0{}, _0{}), c);
+    });
+  });
 }
 
 // PV: output width is BH, while the reduction dimension is BK (key tokens).
@@ -150,15 +155,18 @@ gemm_pv_subtile(const PTensor& rP, const VTensor& sVt, OTensor& acc) {
   CUTE_STATIC_ASSERT_V(size<0>(rP) == Int<8>{});
   CUTE_STATIC_ASSERT_V(size<2>(rP) == Int<BK / MMA_K>{});
   CUTE_STATIC_ASSERT_V(size<2>(acc) == Int<PV_N_ITER>{});
-  CUTE_UNROLL
-  for (int ki = 0; ki < BK / MMA_K; ++ki) {
-    auto b = local_tile(sVt, Shape<Int<BH>, Int<MMA_K>>{}, make_coord(0, ki));
-    auto rB = thr.partition_fragment_B(b);
-    auto tBs = thr_b.partition_S(b);
-    auto tBr = thr_b.retile_D(rB);
-    copy(copy_b, tBs, tBr);
-    gemm(mma, rP(_, _, ki), rB(_, _, 0), acc);
-  }
+  for_each(make_seq<BK / MMA_K>{}, [&](auto ki) {
+    for_each(make_seq<PV_N_ITER>{}, [&](auto ni) {
+      auto b = local_tile(sVt, Shape<Int<MMA_N>, Int<MMA_K>>{}, make_coord(ni, ki));
+      auto rB = thr.partition_fragment_B(b);
+      auto tBs = thr_b.partition_S(b);
+      auto tBr = thr_b.retile_D(rB);
+      copy(copy_b, tBs, tBr);
+      CUTE_STATIC_ASSERT_V(size(rB) == Int<4>{});
+      auto c = acc(_, _0{}, ni);
+      gemm(mma, rP(_, _0{}, ki), rB(_, _0{}, _0{}), c);
+    });
+  });
 }
 
 __device__ __forceinline__ float row_max(float x) {
@@ -176,8 +184,11 @@ void forward(const Element* q, const Element* k, const Element* v,
   extern __shared__ __align__(16) unsigned char shared_bytes[];
   auto& storage = *reinterpret_cast<SharedStorage*>(shared_bytes);
   const int64_t q_tiles = (tq - 1) / BQ + 1;
-  const int64_t bh = int64_t(blockIdx.x) / q_tiles;
-  const int64_t q0 = (int64_t(blockIdx.x) % q_tiles) * BQ;
+  // Enumerate long causal tiles first, across all heads. This is a scheduling
+  // hint via block numbering; CUDA does not guarantee block execution order.
+  const int64_t batch_heads = int64_t(gridDim.x) / q_tiles;
+  const int64_t bh = int64_t(blockIdx.x) % batch_heads;
+  const int64_t q0 = (q_tiles - 1 - int64_t(blockIdx.x) / batch_heads) * BQ;
   q += bh * tq * DH;
   k += bh * tk * DH;
   v += bh * tk * DH;
@@ -203,9 +214,9 @@ void forward(const Element* q, const Element* k, const Element* v,
   float l[TM] = {0.f, 0.f};
 
   load_subtile_async<BQ, DH>(q, q0, tq, 0, storage.q, QLayout{});
-  cp_async_fence();
+  load_k_async(k, 0, tk, 0, storage, 0); // Commit Q and first K in one group.
   cp_async_wait<0>();
-  __syncthreads(); // Q remains read-only in shared memory for the whole CTA.
+  __syncthreads(); // Q and K[0] ready; Q stays read-only for the whole CTA.
 
   for (int64_t tile = 0; tile < kv_tiles; ++tile) {
     const int64_t key0 = tile * BK;
@@ -216,24 +227,30 @@ void forward(const Element* q, const Element* k, const Element* v,
     {
       auto rS = thr.make_fragment_C(tS);
       clear(rS); // Clear once per KV tile, not once per feature subtile.
-      load_k_async(k, key0, tk, 0, storage, 0);
-      cp_async_wait<0>();
-      __syncthreads();
+      // K[0] is ready from the prologue or the preceding tile's last PV step.
 
       for_each(make_seq<FEATURE_TILES>{}, [&](auto feature) {
         constexpr int f = decltype(feature)::value;
         constexpr int stage = f % STAGES;
         if constexpr (f + 1 < FEATURE_TILES)
           load_k_async(k, key0, tk, (f + 1) * BH, storage, (f + 1) % STAGES);
+        else {
+          static_assert(FEATURE_TILES == 2);
+          // The preceding barrier released stage 0. Load V[0] while K[1]
+          // is consumed from stage 1, then continue overlapping with softmax.
+          load_v_async(v, key0, tk, 0, storage, 0);
+        }
         auto q_part = local_tile(sQ, Shape<Int<BQ>, Int<BH>>{}, make_coord(0, feature));
         auto sK = make_tensor(make_smem_ptr(storage.kv[stage].k), KVLayout{});
         gemm_qk_subtile(q_part, sK, rS);
-        if constexpr (f + 1 < FEATURE_TILES) cp_async_wait<0>();
-        __syncthreads(); // Publish next K; the last iteration releases both union stages.
+        if constexpr (f + 1 < FEATURE_TILES) {
+          cp_async_wait<0>();
+          __syncthreads(); // Publish K[1] and release K[0] before V[0] overwrites it.
+        }
+        // The V-ready barrier after softmax also releases the last K stage.
       });
 
-      // K is fully consumed. Overlap the first V subtile load with softmax.
-      load_v_async(v, key0, tk, 0, storage, 0);
+      // V[0] is already in flight; softmax needs no shared-memory operands.
       CUTE_UNROLL
       for (int a = 0; a < TM; ++a) {
         const int row = get<0>(tS(TN * a, 0, 0));
@@ -283,13 +300,24 @@ void forward(const Element* q, const Element* k, const Element* v,
       constexpr int stage = f % STAGES;
       if constexpr (f + 1 < FEATURE_TILES)
         load_v_async(v, key0, tk, (f + 1) * BH, storage, (f + 1) % STAGES);
+      else if (tile + 1 < kv_tiles) {
+        // V[0] has been released. Prefetch next tile's K[0] into that stage
+        // while current V[1] is consumed; no extra shared-memory buffer.
+        load_k_async(k, key0 + BK, tk, 0, storage, 0);
+      }
       auto sVt = make_tensor(make_smem_ptr(storage.kv[stage].v), VTransposedLayout{});
       // Compile-time feature index keeps this a register view, not a dynamically indexed array.
       auto out_part = local_tile(rO, Shape<Int<TM * TN>, _1, Int<PV_N_ITER>>{},
                                  make_coord(_0{}, _0{}, feature));
       gemm_pv_subtile(rP, sVt, out_part);
-      if constexpr (f + 1 < FEATURE_TILES) cp_async_wait<0>();
-      __syncthreads(); // Release V before the next KV tile can write K into the union.
+      if constexpr (f + 1 < FEATURE_TILES) {
+        cp_async_wait<0>();
+        __syncthreads(); // Publish V[1] and release V[0] before next K[0].
+      } else if (tile + 1 < kv_tiles) {
+        cp_async_wait<0>();
+        __syncthreads(); // Publish next K[0], release V[1] before next K[1].
+      }
+      // Last tile: no further shared-memory reads/writes need a rendezvous.
     });
   }
 

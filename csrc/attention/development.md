@@ -34,9 +34,9 @@ Clang 对输入检查头文件和绑定的 C++17 语法检查通过；此检查�
 尚未运行 nvcc、GPU 数值测试或 compute-sanitizer。
 
 BF16 性能排查：host 使用 `at::cuda::getDeviceProperties` 的设备缓存，避免每次调用
-查询 CUDA runtime。通用 kernel 的预取发生在 K/V 各自的特征循环内部；每次复用
-union stage 前，必须完成旧数据的 MMA 消费和 CTA barrier。最后一段 K 完成后才允许
-加载 V；最后一段 V 完成后才允许下一 KV tile 加载 K。同步改动仍需重跑数值测试和
+查询 CUDA runtime。每次复用某个 union stage 前，必须完成该 stage 的旧数据消费和
+CTA barrier；另一个 stage 可以仍在计算。K[1] 计算时预取 V[0]，V[1] 计算时预取
+下一 KV tile 的 K[0]。同步改动仍需重跑数值测试和
 compute-sanitizer racecheck/synccheck 验证。
 性能入口新增 `--attention-timing graph --phases forward`，完整算子图重放与原有
 operator 耗时分开报告，具体口径见 benchmarks README。新增 GPU 测试检查未对齐
@@ -60,7 +60,8 @@ prefill/decode 输入在 CUDA Graph 中捕获和重复重放的 O/LSE。
 - 先对完整 O 的 64 列缩放一次 alpha，再遍历输出特征 `h=0,32`，
   计算 `O[:,h:h+BH] += P @ V[:,h:h+BH]`；PV 的归约维为 BK，不能误用 BH/DH。
   O 仍为 `(4,1,8)`，32 个 FP32。输出切片索引在编译期确定，避免动态索引寄存器数组。
-- 两个 union stage 在各自的特征循环内交替预取；第一块 V 的加载与 softmax 重叠。
+- 两个 union stage 交替预取，跨越 QK/PV 阶段与相邻 KV tile；V[0] 的加载与 K[1]
+  的计算及 softmax 重叠，下一 tile 的 K[0] 与当前 V[1] 的计算重叠。
   该方案减少 shared memory 和 fragment 大小，但增加 subtile 切换与同步，收益需实测。
 - softmax 的非正指数参数使用 `__expf`，LSE 仍为自然对数和 FP32；需按原阈值重验精度。
 - `Tq=1 && Tk<=4096` 使用专用 SIMT split-KV 路径，每 CTA 256 线程处理 128 个 key。
@@ -96,6 +97,29 @@ python -u -m unittest discover -s tests -p 'test_student_attention.py' -k bf16 -
 输出每个 kernel 的 registers、stack frame、spill loads/stores。开关会改变构建参数，
 切换时可能重新编译。应保留 forward kernel 的报告与 NCU Source Counters 对照，
 不要仅凭 local-memory 流量断言某个 C++ fragment 一定发生了寄存器容量溢出。
+
+2026-10-08 根据新版 NCU（BF16 约 120 registers/thread、零 spill、理论 occupancy 25%）
+实现以下待 GPU 验证的优化；日志里的 96 registers 属于 FP32 SIMT kernel：
+
+- QK/PV 的 B 加载粒度缩到一个 `N=8,K=16` atom，每线程 rB 从 16 个 BF16 减为
+  4 个。QK 的 8 个 BF16 A 元素跨 4 个 N atom 复用，P 继续保存在寄存器。
+  用编译期 ki/ni 索引切片 C；不强制 maxrregcount/最小驻留块数，避免人为引入 spill。
+  C++ 作用域缩小不保证编译器最终减少寄存器，必须复查 ptxas 和独立性能数据。
+- Q 和首个 K[0] 一起 commit/wait。流水线为 K0(0)→K1(1)→V0(0)→V1(1)→
+  下一 K0(0)，括号为 stage。每个阶段在另一 stage 的旧读者已完成 barrier 后发起预取。
+  K[1] 结束后的 barrier 合并到 V[0] ready barrier；下一 tile 的 K[0] ready barrier
+  合并到前一 tile 的 PV 末尾。每轮通常 4 次 CTA barrier，最后一轮 3 次；
+  含 Q prologue 总计 `4*kv_tiles` 次，之前为 `1+6*kv_tiles` 次，共享内存仍为 12 KiB。
+- 一维 grid 的 block 编号按 query tile 降序、同一 tile 内遍历 batch/head：
+  `bh = blockIdx.x % batch_heads`，`q_tile = q_tiles-1-blockIdx.x/batch_heads`。
+  每对 `(bh,q_tile)` 仍恰好一个 CTA，只改变枚举顺序；CUDA 不保证实际调度顺序。
+  长 CTA 靠前可能改善 causal 尾效应，也可能影响 cache locality，收益须实测。
+- 新增不同 head 常数偏移及随 token 变化的 V 测试，覆盖 query 尾块、chunk 和
+  各 pipeline 阶段切换，检查 CTA 重排后没有漏写或写错 head。
+
+本地验证：CTA 映射的 28 组 head/长度组合覆盖检查、N=8 拆分 GEMM 数学检查、
+1/2/3/16 个 KV tile 的 stage 发布/释放状态模型均通过。attention 测试 1 项通过、
+16 项因缺少 CUDA 跳过；没有执行 nvcc、GPU 数值/竞态检查或性能测试。
 
 2026-10-07 本地验证：student 回归 82 项（11 项通过、71 项 CUDA 跳过），
 benchmark 回归 25 项通过，operator 回归 10 项通过；Clang 对绑定和输入检查头文件的
