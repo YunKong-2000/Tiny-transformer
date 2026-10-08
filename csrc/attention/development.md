@@ -63,7 +63,8 @@ prefill/decode 输入在 CUDA Graph 中捕获和重复重放的 O/LSE。
 - 两个 union stage 交替预取，跨越 QK/PV 阶段与相邻 KV tile；V[0] 的加载与 K[1]
   的计算及 softmax 重叠，下一 tile 的 K[0] 与当前 V[1] 的计算重叠。
   该方案减少 shared memory 和 fragment 大小，但增加 subtile 切换与同步，收益需实测。
-- softmax 的非正指数参数使用 `__expf`，LSE 仍为自然对数和 FP32；需按原阈值重验精度。
+- 通用 softmax 使用 base-2 最大值、`__exp2f` 与融合 scale/subtract；LSE 写回时转换
+  为自然对数，仍为 FP32。专用 decode 路径保持原有自然指数实现。
 - `Tq=1 && Tk<=4096` 使用专用 SIMT split-KV 路径，每 CTA 256 线程处理 128 个 key。
   QK、P、PV 使用 FP32；单块直接输出，多块写 FP32 `(numerator, max, sum)` 并由第二个
   kernel 按全局 max 重缩放后合并。无需补齐 64 行 query，Tk>4096 仍走通用路径。
@@ -163,6 +164,38 @@ BF16 P 的分块舍入可能变化，需重新通过精度检查；寄存器可�
 753 个 mask tile 分类通过；BK=64 的分块数学模型在 10 个随机形状和 13 个 key 探针下
 通过 FP64 对照。benchmark 主机测试 29 项通过；attention 测试 1 项通过、18 项
 CUDA 跳过。未运行 nvcc、GPU 数值/竞态或性能测试。
+
+2026-10-08 实现 base-2 online softmax，并恢复 `__launch_bounds__(THREADS, 4)`。
+比较基线应使用用户测得的 minBlocks=4 版本（operator 52.03 us、graph 50.61 us），
+而不是 minBlocks=5 的 graph 53.16 us。仅恢复驻留目标并修改通用 softmax，
+没有修改 tile、预取、CTA 顺序、索引宽度或 decode 的数值域。
+
+当前 `rS` 始终保存未缩放的 QK 分数；完整合法块不再执行逐元素 scale/mask 循环，
+边界块只将非法位置写为 -inf。正比例因子允许先对 raw score 求 max，随后每行计算：
+
+```text
+scale2 = (1/sqrt(DH)) * log2(e)
+m2_new = max(m2_old, rowmax(raw_score) * scale2)
+alpha = m2_old == -inf ? 0 : exp2(m2_old - m2_new)
+p = raw_score == -inf ? 0 : exp2(fma(raw_score, scale2, -m2_new))
+l = alpha*l + rowsum(p)
+O_acc = alpha*O_acc + BF16(p) @ V
+LSE = fma(m2, ln(2), ln(l))  // 自然对数接口
+```
+
+全 mask 的 padded query 行在指数运算前屏蔽 -inf，避免 -inf-(-inf) 导致 NaN。
+FMA 和 base-2 最大值的舍入与旧实现不同，最大概率可能因舍入略大于 1，不能假设
+指数参数在浮点计算中严格非正；沿用原 O/LSE 容差做验证，不放宽阈值。
+实现参考 Triton 官方 v3.4.0 `python/tutorials/06-fused-attention.py` 的
+`_attn_fwd_inner`（raw max / scale / exp2）以及 CUTLASS example 41 的
+`iterative_softmax`（base-2 最大值）；教程的内部 log2 LSE 不能直接作为本接口输出。
+
+新增 GPU 用例用正负非零常数 logits 验证自然对数 LSE、精确常数 V 输出，包含
+cache chunk、full/masked tile 切换及 query padding。CPU 分块模型使用 FP64
+乘加后舍入 FP32 模拟 FMA，49 个完整 tile 和 60 个 mask tile 通过 FP64 对照，
+最大 O 绝对误差 0.006991，最大 LSE 绝对误差 0.00006104（均在原阈值内）。
+attention 主机测试 1 项通过、19 项 CUDA 跳过。未运行 nvcc、CUDA __exp2f 精度检查、
+GPU racecheck 或性能测试，寄存器分配与加速效果需由目标 A100 验证。
 
 2026-10-07 本地验证：student 回归 82 项（11 项通过、71 项 CUDA 跳过），
 benchmark 回归 25 项通过，operator 回归 10 项通过；Clang 对绑定和输入检查头文件的

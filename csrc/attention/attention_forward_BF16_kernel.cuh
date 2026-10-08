@@ -25,6 +25,9 @@ constexpr int SCORE_N_ITER = BK / MMA_N;
 constexpr int OUTPUT_N_ITER = DH / MMA_N;
 constexpr int PV_N_ITER = BH / MMA_N;
 constexpr float SCALE = 0.125f; // 1 / sqrt(DH).
+constexpr float LOG2E = 1.4426950408889634f;
+constexpr float LN2 = 0.6931471805599453f;
+constexpr float SCALE_LOG2 = SCALE * LOG2E;
 
 // The fragment conversion and swizzles below are for this fixed tile family.
 static_assert(DH == 64 && BQ == 64 && BK == 64 && BH == 32);
@@ -163,12 +166,12 @@ gemm_pv_subtile(const PTensor& rP, const VTensor& sVt, OTensor& acc) {
   }
 }
 
-// The full-tile specialization has no per-element coordinate/mask operations.
-// Keep only this small loop specialized; share the online-softmax/PV code so
-// that the fast path does not duplicate the entire kernel body.
-template <bool FULL_TILE, class STensor, class CoordTensor>
+// Keep valid scores unscaled: max(raw_score) * SCALE_LOG2 needs one scale
+// per row, and each probability fuses its scale/subtraction into one FMA.
+// Full tiles skip this helper entirely; boundary tiles only mask invalid scores.
+template <class STensor, class CoordTensor>
 __device__ __forceinline__ void
-scale_mask_scores(STensor& scores, const CoordTensor& coords,
+mask_scores(STensor& scores, const CoordTensor& coords,
                   int64_t q0, int64_t key0, int64_t tq, int64_t tk, int64_t past_len) {
   CUTE_UNROLL
   for (int a = 0; a < TM; ++a) {
@@ -177,14 +180,10 @@ scale_mask_scores(STensor& scores, const CoordTensor& coords,
       CUTE_UNROLL
       for (int b = 0; b < TN; ++b) {
         const int vi = TN * a + b;
-        if constexpr (FULL_TILE) {
-          scores(vi, 0, n) *= SCALE;
-        } else {
-          const int64_t qi = q0 + get<0>(coords(vi, 0, n));
-          const int64_t kj = key0 + get<1>(coords(vi, 0, n));
-          const bool valid = qi < tq && kj < tk && kj <= past_len + qi;
-          scores(vi, 0, n) = valid ? scores(vi, 0, n) * SCALE : -CUDART_INF_F;
-        }
+        const int64_t qi = q0 + get<0>(coords(vi, 0, n));
+        const int64_t kj = key0 + get<1>(coords(vi, 0, n));
+        const bool valid = qi < tq && kj < tk && kj <= past_len + qi;
+        if (!valid) scores(vi, 0, n) = -CUDART_INF_F;
       }
     }
   }
@@ -199,7 +198,7 @@ __device__ __forceinline__ float row_sum(float x) {
   return x + __shfl_xor_sync(0xffffffffu, x, 2);
 }
 
-__global__ __launch_bounds__(THREADS, 5)
+__global__ __launch_bounds__(THREADS, 4)
 void forward(const Element* q, const Element* k, const Element* v,
              Element* o, float* lse, int64_t tq, int64_t tk, int64_t past_len) {
   extern __shared__ __align__(16) unsigned char shared_bytes[];
@@ -231,7 +230,7 @@ void forward(const Element* q, const Element* k, const Element* v,
   CUTE_STATIC_ASSERT_V(size<2>(tS) == Int<SCORE_N_ITER>{});
   CUTE_STATIC_ASSERT_V(size<2>(rO) == Int<OUTPUT_N_ITER>{});
   clear(rO);
-  float m[TM] = {-CUDART_INF_F, -CUDART_INF_F};
+  float m2[TM] = {-CUDART_INF_F, -CUDART_INF_F}; // Row maxima in base-2 score units.
   float l[TM] = {0.f, 0.f};
 
   load_subtile_async<BQ, DH>(q, q0, tq, 0, storage.q, QLayout{});
@@ -279,10 +278,8 @@ void forward(const Element* q, const Element* k, const Element* v,
       // This branch is uniform across the CTA; padded query rows take the mask path.
       const bool fully_valid = q_end - q0 == BQ && tk - key0 >= BK &&
                                past_len + q0 - key0 >= BK - 1;
-      if (fully_valid)
-        scale_mask_scores<true>(rS, tS, q0, key0, tq, tk, past_len);
-      else
-        scale_mask_scores<false>(rS, tS, q0, key0, tq, tk, past_len);
+      if (!fully_valid)
+        mask_scores(rS, tS, q0, key0, tq, tk, past_len);
 
       // V[0] is already in flight; softmax needs no shared-memory operands.
       CUTE_UNROLL
@@ -296,8 +293,8 @@ void forward(const Element* q, const Element* k, const Element* v,
             local_max = fmaxf(local_max, rS(vi, 0, n));
           }
         }
-        const float m_new = fmaxf(m[a], row_max(local_max));
-        const float alpha = m[a] == -CUDART_INF_F ? 0.f : __expf(m[a] - m_new);
+        const float m2_new = fmaxf(m2[a], row_max(local_max) * SCALE_LOG2);
+        const float alpha = m2[a] == -CUDART_INF_F ? 0.f : __exp2f(m2[a] - m2_new);
         float local_sum = 0.f;
         CUTE_UNROLL
         for (int n = 0; n < SCORE_N_ITER; ++n) {
@@ -305,7 +302,9 @@ void forward(const Element* q, const Element* k, const Element* v,
           for (int b = 0; b < TN; ++b) {
             const int vi = TN * a + b;
             const float score = rS(vi, 0, n);
-            const float p = score == -CUDART_INF_F ? 0.f : __expf(score - m_new);
+            // Guard fully masked padded rows before evaluating -inf - (-inf).
+            const float p = score == -CUDART_INF_F ? 0.f :
+                __exp2f(fmaf(score, SCALE_LOG2, -m2_new));
             local_sum += p;
             rP(vi + (n % 2) * (TM * TN), 0, n / 2) = Element(p);
           }
@@ -318,7 +317,7 @@ void forward(const Element* q, const Element* k, const Element* v,
           for (int b = 0; b < TN; ++b) rO(TN * a + b, 0, n) *= alpha;
         }
         l[a] = alpha * l[a] + row_sum(local_sum);
-        m[a] = m_new;
+        m2[a] = m2_new;
       }
     } // rS is no longer needed while PV holds rP and the full rO.
 
@@ -367,7 +366,8 @@ void forward(const Element* q, const Element* k, const Element* v,
         *reinterpret_cast<uint32_t*>(o + qi * DH + d) = packed;
       }
       if (threadIdx.x % LANES_PER_ROW == 0)
-        lse[qi] = l[a] > 0.f ? m[a] + logf(l[a]) : -CUDART_INF_F;
+        // Public LSE is a natural logarithm, even though internal maxima use base 2.
+        lse[qi] = l[a] > 0.f ? fmaf(m2[a], LN2, logf(l[a])) : -CUDART_INF_F;
     }
   }
 }

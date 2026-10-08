@@ -217,6 +217,26 @@ class StudentAttentionCudaTests(unittest.TestCase):
         torch.testing.assert_close(before[:, :, :65], after[:, :, :65], atol=0, rtol=0)
 
     @torch.no_grad()
+    def test_bf16_base2_softmax_natural_lse(self):
+        self.require_bf16()
+        # Nonzero positive/negative logits catch a missing ln(2) conversion.
+        # Chunk past=63 crosses full-tile/masked paths; Tq=65 has padded rows.
+        for tq, tk in ((64, 127), (65, 193)):
+            for key_value in (-10., -0.5, 0.5, 10.):
+                with self.subTest(tq=tq, tk=tk, key_value=key_value):
+                    q = torch.full((1, 2, tq, 64), 0.25,
+                                   device='cuda', dtype=torch.bfloat16)
+                    k = torch.full((1, 2, tk, 64), key_value,
+                                   device='cuda', dtype=torch.bfloat16)
+                    v = torch.ones_like(k)
+                    self.check_forward(q, k, v, tk - tq)
+                    out, lse = self.extension.attention_forward(q, k, v, tk - tq)
+                    torch.testing.assert_close(out, torch.ones_like(out), atol=0, rtol=0)
+                    expected = 2 * key_value + torch.arange(
+                        tk - tq + 1, tk + 1, device='cuda').float().log()
+                    torch.testing.assert_close(lse, expected.expand_as(lse), atol=2e-4, rtol=2e-5)
+
+    @torch.no_grad()
     def test_bf16_current_stream_with_alignment_copies(self):
         self.require_bf16()
         for tq, tk in ((65, 65), (1, 257)):
