@@ -16,7 +16,7 @@
 namespace attention_bf16 {
 using namespace cute;
 using Element = cute::bfloat16_t;
-constexpr int DH = 64, BQ = 64, BK = 32, BH = 32;
+constexpr int DH = 64, BQ = 64, BK = 64, BH = 32;
 constexpr int THREADS = 128, STAGES = 2;
 constexpr int VEC_LEN = 8, MMA_N = 8, MMA_K = 16;
 constexpr int TM = 2, TN = 2, LANES_PER_ROW = 4;
@@ -27,7 +27,7 @@ constexpr int PV_N_ITER = BH / MMA_N;
 constexpr float SCALE = 0.125f; // 1 / sqrt(DH).
 
 // The fragment conversion and swizzles below are for this fixed tile family.
-static_assert(DH == 64 && BQ == 64 && BK == 32 && BH == 32);
+static_assert(DH == 64 && BQ == 64 && BK == 64 && BH == 32);
 static_assert(THREADS == 128 && STAGES == 2);
 static_assert(DH % BH == 0 && BH % MMA_K == 0 && BK % MMA_K == 0);
 static_assert(VEC_LEN * sizeof(Element) == 16);
@@ -55,7 +55,7 @@ struct alignas(16) SharedStorage {
     Element v[BK * BH];
   } kv[STAGES];
 };
-static_assert(sizeof(SharedStorage) == 12 * 1024);
+static_assert(sizeof(SharedStorage) == 16 * 1024);
 static_assert(cosize_v<QLayout> == BQ * DH);
 static_assert(cosize_v<KVLayout> == BK * BH);
 static_assert(cosize_v<VTransposedLayout> == BK * BH);
@@ -245,6 +245,9 @@ void forward(const Element* q, const Element* k, const Element* v,
     // order. Keep only the partition's shape and allocate ordinary compact
     // register storage, with the atom value dimension contiguous.
     auto rP = make_tensor<Element>(shape(thr.partition_A(score_coords)));
+    CUTE_STATIC_ASSERT_V(size<0>(rP) == Int<8>{});
+    CUTE_STATIC_ASSERT_V(size<1>(rP) == Int<1>{});
+    CUTE_STATIC_ASSERT_V(size<2>(rP) == Int<BK / MMA_K>{});
     {
       auto rS = thr.make_fragment_C(tS);
       clear(rS); // Clear once per KV tile, not once per feature subtile.

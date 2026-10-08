@@ -81,8 +81,9 @@ class StudentAttentionCudaTests(unittest.TestCase):
     def test_bf16_tiles_tails_and_cache(self):
         self.require_bf16()
         for tq, tk in ((1, 1), (17, 17), (31, 31), (32, 32), (33, 33),
-                       (64, 64), (65, 65), (129, 129),
-                       (193, 193), (257, 257), (1, 513), (7, 193), (65, 193)):
+                       (63, 63), (64, 64), (65, 65), (127, 127), (128, 128), (129, 129),
+                       (193, 193), (257, 257), (512, 512), (1, 513),
+                       (7, 127), (7, 128), (7, 129), (7, 193), (65, 193)):
             with self.subTest(tq=tq, tk=tk):
                 q = torch.randn(2, 3, tq, 64, device='cuda', dtype=torch.bfloat16)
                 stores = [torch.full((2, 3, tk + 64, 64), float('nan'),
@@ -94,7 +95,7 @@ class StudentAttentionCudaTests(unittest.TestCase):
     def test_bf16_feature_subtiles_and_full_output_rescale(self):
         self.require_bf16()
         # Each probe isolates a QK feature on either side of a BH/MMA boundary.
-        # Increasing key scores force alpha != 1 across BK=32 tiles, while V
+        # Increasing key scores force alpha != 1 across BK=64 tiles, while V
         # varies in both token and output-feature dimensions (including d>=32).
         key_codes = torch.arange(65, device='cuda', dtype=torch.bfloat16) / 32
         feature_codes = (torch.arange(64, device='cuda', dtype=torch.bfloat16) - 32) / 16
@@ -109,11 +110,11 @@ class StudentAttentionCudaTests(unittest.TestCase):
 
     def test_bf16_full_tile_mask_boundary(self):
         self.require_bf16()
-        # At past=30, key 31 is future for query 0; at past=31 it becomes
+        # At past=62, key 63 is future for query 0; at past=63 it becomes
         # valid for every row of the first full query tile (inclusive boundary).
         # Tq=63/65 also forces the padded-query path; Tk crosses BK boundaries.
         for tq in (63, 64, 65, 128):
-            for past in (0, 30, 31, 32, 33):
+            for past in (0, 30, 31, 32, 33, 62, 63, 64, 65):
                 with self.subTest(tq=tq, past=past):
                     tk = tq + past
                     q, k = [torch.zeros(1, 1, t, 64, device='cuda', dtype=torch.bfloat16)
@@ -130,6 +131,19 @@ class StudentAttentionCudaTests(unittest.TestCase):
                     changed[:, :, past + 1:].add_(16)
                     after = self.check_forward(q, k, changed, past)
                     torch.testing.assert_close(before[:, :, :1], after[:, :, :1], atol=0, rtol=0)
+
+    def test_bf16_key_reduction_spans_both_halves_of_tile(self):
+        self.require_bf16()
+        # BK=64 and BH=32 must remain distinct: PV reduces across all 64
+        # keys even though it produces only 32 output features per subtile.
+        q = torch.zeros(1, 1, 64, 64, device='cuda', dtype=torch.bfloat16)
+        k = torch.zeros(1, 1, 129, 64, device='cuda', dtype=torch.bfloat16)
+        for key_index in (0, 15, 16, 31, 32, 47, 48, 63, 64, 95, 96, 127, 128):
+            with self.subTest(key_index=key_index):
+                v = torch.zeros_like(k)
+                v[:, :, key_index, :32] = 64
+                v[:, :, key_index, 32:] = -64
+                self.check_forward(q, k, v, 65)
 
     def test_bf16_causal_tile_order_and_pipeline_transitions(self):
         self.require_bf16()

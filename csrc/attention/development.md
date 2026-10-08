@@ -5,8 +5,8 @@ FP32 和 BF16 通用 Tensor Core 路径每 CTA 128 线程；BF16 单 query 专�
 两条路径均支持 causal prefill、decode/chunk 和序列尾块，Q/K/V 必须具有相同 dtype。
 FP32 支持文档 segment IDs；host 将 Q/K 和 segment IDs 连续化，V 直接使用实际 stride。
 BF16 要求 SM80+，不支持 segment IDs；host 将 Q/K/V 连续化，必要时 clone 保证起点
-16-byte 对齐，kernel 本身不处理任意 stride。BF16 通用路径使用 BQ=64、BK=BH=32，
-Q 整块常驻 shared memory，两个 K/V union stage 保存特征 subtile，共 12 KiB/CTA。
+16-byte 对齐，kernel 本身不处理任意 stride。BF16 通用路径当前实验配置为 BQ=BK=64、BH=32，
+Q 整块常驻 shared memory，两个 K/V union stage 保存特征 subtile，共 16 KiB/CTA。
 score、softmax 统计量和输出累加器为 FP32，P 直接转换为 BF16 A fragment 留在寄存器。
 原生接口返回 `(O, LSE)`：O 与输入同 dtype，LSE 始终为 FP32；Python 只返回 O。
 反向、AMP/autocast 和 FP16 尚未实现；需要梯度时明确报错。
@@ -47,16 +47,16 @@ prefill/decode 输入在 CUDA Graph 中捕获和重复重放的 O/LSE。
 
 - Q_i 的完整 `(64,64)` tile 保存在 shared memory，共 8 KiB。每次 QK 只加载
   当前 MMA 的 K=16 Q fragment 到寄存器，避免 Q 的完整寄存器 fragment 跨循环存活。
-- K/V 的 subtile 均为 `(BK,BH)=(32,32)`，每个 2 KiB；每个 stage 使用 union 复用
-  K/V 存储，两个 stage 共 4 KiB。共享内存总量为 `8+2*2=12 KiB`，没有 shared P。
+- K/V 的 subtile 当前均为 `(BK,BH)=(64,32)`，每个 4 KiB；每个 stage 使用 union 复用
+  K/V 存储，两个 stage 共 8 KiB。共享内存总量为 `8+2*4=16 KiB`，没有 shared P。
   Q 使用 `Swizzle<3,3,3>`；K/V 的行宽为 32，使用 `Swizzle<2,3,3>`。
   32 个 BF16 的行跨越 16 个 bank，行低位已经选择 bank 的前/后半；swizzle 应使用
   行的第 1/2 位，即元素地址第 6/7 位。旧的 shift=2 会使相隔 4 行的片段重复占用 banks。
 - 每轮 KV tile 中，先遍历 Q/K 特征 `d=0,32`，将两个部分点积累加到同一个 S；
-  完成全部 DH 后才做 scale/mask/softmax。每线程 S 为 `(4,1,4)`，16 个 FP32。
+  完成全部 DH 后才做 scale/mask/softmax。每线程 S 为 `(4,1,8)`，32 个 FP32。
 - softmax 直接将 `rS(vi,0,n)` 对应的概率写到
   `rP(vi+4*(n%2),0,n/2)`，编译期断言校验 atom 的 A/C 布局关系；转换不跨线程。
-  每线程 P 为 `(8,1,2)`，16 个 BF16。FP32 分母在转换前计算；进入 PV 前 S 结束使用。
+  每线程 P 为 `(8,1,4)`，32 个 BF16。FP32 分母在转换前计算；进入 PV 前 S 结束使用。
 - 先对完整 O 的 64 列缩放一次 alpha，再遍历输出特征 `h=0,32`，
   计算 `O[:,h:h+BH] += P @ V[:,h:h+BH]`；PV 的归约维为 BK，不能误用 BH/DH。
   O 仍为 `(4,1,8)`，32 个 FP32。输出切片索引在编译期确定，避免动态索引寄存器数组。
@@ -139,6 +139,30 @@ past_len+q0-key0>=BK-1`。完整块仅乘 SCALE，编译期移除每元素的坐
 对照 FP64/SDPA 并检查改变未来 V 不影响首行，以覆盖 inclusive causal 边界和路径切换。
 该改动基于当前工作区（已撤回 N=8 手写展开），没有恢复该展开或改变 BK/BH。
 未执行 CUDA 编译或计时，寄存器和性能影响仍需单独比较。
+
+2026-10-08 下一步单变量实验：在 mask fast path 的基础上只将 BK 从 32 改成 64，
+BH=32、BQ=64、128 线程、swizzle、union 预取、CTA 排列和 decode 分派保持原配置。
+基线用户报告为 operator prefill：SDPA 41.11 us、student 62.86 us。
+
+| 项目 | BK=32 基线 | BK=64 候选 |
+|---|---:|---:|
+| shared memory / CTA | 12 KiB | 16 KiB |
+| 每线程 FP32 S 元素 | 16 | 32 |
+| 每线程 BF16 P 元素 | 16 | 32 |
+| PV 的 K=16 归约迭代数 / 输出 subtile | 2 | 4 |
+| T=512 每 head 的 KV tile 总数 | 72 | 36 |
+| 其中完整合法 / 边界 tile | 56 / 16 | 28 / 8 |
+| T=512 每 head 的 CTA barrier 总次数 | 288 | 144 |
+
+每个输出元素的 softmax 合并次数减少，QK/PV 总 MMA 数在这个整齐形状下保持相同。
+BF16 P 的分块舍入可能变化，需重新通过精度检查；寄存器可能增加甚至引入更多 spill，
+不预设新配置更快。新增 BK 边界、past=62/63/64/65、key 32–63 的 PV 归约探针，
+并覆盖完整 512 prefill。有效性以 GPU 正确性、ptxas 和无 NCU 的同条件 benchmark 为准。
+
+此轮本地检查：4096 个 P 坐标、2048 个 K/V 地址、16-byte 对齐、8x8 bank 分组、
+753 个 mask tile 分类通过；BK=64 的分块数学模型在 10 个随机形状和 13 个 key 探针下
+通过 FP64 对照。benchmark 主机测试 29 项通过；attention 测试 1 项通过、18 项
+CUDA 跳过。未运行 nvcc、GPU 数值/竞态或性能测试。
 
 2026-10-07 本地验证：student 回归 82 项（11 项通过、71 项 CUDA 跳过），
 benchmark 回归 25 项通过，operator 回归 10 项通过；Clang 对绑定和输入检查头文件的
