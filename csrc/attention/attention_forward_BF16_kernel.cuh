@@ -16,7 +16,7 @@
 namespace attention_bf16 {
 using namespace cute;
 using Element = cute::bfloat16_t;
-constexpr int DH = 64, BQ = 64, BK = 64, BH = 32;
+constexpr int DH = 64, BQ = 64, BK = 64, BH = 64;
 constexpr int THREADS = 128, STAGES = 2;
 constexpr int VEC_LEN = 8, MMA_N = 8, MMA_K = 16;
 constexpr int TM = 2, TN = 2, LANES_PER_ROW = 4;
@@ -30,7 +30,8 @@ constexpr float LN2 = 0.6931471805599453f;
 constexpr float SCALE_LOG2 = SCALE * LOG2E;
 
 // The fragment conversion and swizzles below are for this fixed tile family.
-static_assert(DH == 64 && BQ == 64 && BK == 64 && BH == 32);
+static_assert(DH == 64 && BQ == 64 && BK == 64 && BH == 64);
+static_assert(FEATURE_TILES == 1);
 static_assert(THREADS == 128 && STAGES == 2);
 static_assert(DH % BH == 0 && BH % MMA_K == 0 && BK % MMA_K == 0);
 static_assert(VEC_LEN * sizeof(Element) == 16);
@@ -41,24 +42,24 @@ using TiledMma = decltype(make_tiled_mma(
 
 using QLayout = decltype(composition(
     Swizzle<3, 3, 3>{}, Layout<Shape<Int<BQ>, Int<DH>>, Stride<Int<DH>, _1>>{}));
-// A 32-BF16 row advances 16 banks. Its low row bit already selects a bank
-// half, so XOR row bits 1/2 (element-address bits 6/7) into vector bits 3/4.
-// Shift=2 would reuse the low row bit and collide again after four rows.
+// A full 64-BF16 row advances 32 banks. XOR its three low row bits
+// (element-address bits 6/7/8) into the 16-byte vector-index bits 3/4/5.
 using KVLayout = decltype(composition(
-    Swizzle<2, 3, 3>{}, Layout<Shape<Int<BK>, Int<BH>>, Stride<Int<BH>, _1>>{}));
+    Swizzle<3, 3, 3>{}, Layout<Shape<Int<BK>, Int<BH>>, Stride<Int<BH>, _1>>{}));
 using VTransposedLayout = decltype(composition(
-    Swizzle<2, 3, 3>{}, Layout<Shape<Int<BH>, Int<BK>>, Stride<_1, Int<BH>>>{}));
+    Swizzle<3, 3, 3>{}, Layout<Shape<Int<BH>, Int<BK>>, Stride<_1, Int<BH>>>{}));
 
 struct alignas(16) SharedStorage {
   Element q[BQ * DH];
-  // K and V are consumed in separate phases. Each stage changes ownership
-  // only after every thread has finished reading the previous subtile.
+  // Two full-width slots. The pipeline keeps K in slot 0 and V in slot 1
+  // so loading one can overlap consuming the other. A slot is overwritten
+  // only after a CTA barrier releases all its readers.
   union {
     Element k[BK * BH];
     Element v[BK * BH];
   } kv[STAGES];
 };
-static_assert(sizeof(SharedStorage) == 16 * 1024);
+static_assert(sizeof(SharedStorage) == 24 * 1024);
 static_assert(cosize_v<QLayout> == BQ * DH);
 static_assert(cosize_v<KVLayout> == BK * BH);
 static_assert(cosize_v<VTransposedLayout> == BK * BH);
@@ -257,28 +258,12 @@ void forward(const Element* q, const Element* k, const Element* v,
     {
       auto rS = thr.make_fragment_C(tS);
       clear(rS); // Clear once per KV tile, not once per feature subtile.
-      // K[0] is ready from the prologue or the preceding tile's last PV step.
-
-      for_each(make_seq<FEATURE_TILES>{}, [&](auto feature) {
-        constexpr int f = decltype(feature)::value;
-        constexpr int stage = f % STAGES;
-        if constexpr (f + 1 < FEATURE_TILES)
-          load_k_async(k, key0, tk, (f + 1) * BH, storage, (f + 1) % STAGES);
-        else {
-          static_assert(FEATURE_TILES == 2);
-          // The preceding barrier released stage 0. Load V[0] while K[1]
-          // is consumed from stage 1, then continue overlapping with softmax.
-          load_v_async(v, key0, tk, 0, storage, 0);
-        }
-        auto q_part = local_tile(sQ, Shape<Int<BQ>, Int<BH>>{}, make_coord(0, feature));
-        auto sK = make_tensor(make_smem_ptr(storage.kv[stage].k), KVLayout{});
-        gemm_qk_subtile(q_part, sK, rS);
-        if constexpr (f + 1 < FEATURE_TILES) {
-          cp_async_wait<0>();
-          __syncthreads(); // Publish K[1] and release K[0] before V[0] overwrites it.
-        }
-        // The V-ready barrier after softmax also releases the last K stage.
-      });
+      // The full K tile is ready from the prologue or previous PV step.
+      // Prefetch full V in the other slot while QK and softmax run. The
+      // preceding CTA barrier guarantees that all old V readers have finished.
+      load_v_async(v, key0, tk, 0, storage, 1);
+      auto sK = make_tensor(make_smem_ptr(storage.kv[0].k), KVLayout{});
+      gemm_qk_subtile(sQ, sK, rS);
 
       // All rows must exist, and even the first query must see the last key.
       // Subtractions avoid constructing a padded key endpoint beyond int32.
@@ -288,7 +273,7 @@ void forward(const Element* q, const Element* k, const Element* v,
       if (!fully_valid)
         mask_scores(rS, tS, q0, key0, tq, tk, past_len);
 
-      // V[0] is already in flight; softmax needs no shared-memory operands.
+      // V is already in flight; softmax needs no shared-memory operands.
       CUTE_UNROLL
       for (int a = 0; a < TM; ++a) {
         float local_max = -CUDART_INF_F;
@@ -317,7 +302,7 @@ void forward(const Element* q, const Element* k, const Element* v,
           }
         }
         // O has DH columns, not BK columns. Rescale every column exactly once
-        // before the separate output-feature loop accumulates P @ V_subtile.
+        // before PV accumulates all output features from the full V tile.
         CUTE_UNROLL
         for (int n = 0; n < OUTPUT_N_ITER; ++n) {
           CUTE_UNROLL
@@ -329,31 +314,18 @@ void forward(const Element* q, const Element* k, const Element* v,
     } // rS is no longer needed while PV holds rP and the full rO.
 
     cp_async_wait<0>();
-    __syncthreads(); // The prefetched V[0] is now ready for all warps.
-    for_each(make_seq<FEATURE_TILES>{}, [&](auto feature) {
-      constexpr int f = decltype(feature)::value;
-      constexpr int stage = f % STAGES;
-      if constexpr (f + 1 < FEATURE_TILES)
-        load_v_async(v, key0, tk, (f + 1) * BH, storage, (f + 1) % STAGES);
-      else if (tile + 1 < kv_tiles) {
-        // V[0] has been released. Prefetch next tile's K[0] into that stage
-        // while current V[1] is consumed; no extra shared-memory buffer.
-        load_k_async(k, key0 + BK, tk, 0, storage, 0);
-      }
-      auto sVt = make_tensor(make_smem_ptr(storage.kv[stage].v), VTransposedLayout{});
-      // Compile-time feature index keeps this a register view, not a dynamically indexed array.
-      auto out_part = local_tile(rO, Shape<Int<TM * TN>, _1, Int<PV_N_ITER>>{},
-                                 make_coord(_0{}, _0{}, feature));
-      gemm_pv_subtile(rP, sVt, out_part);
-      if constexpr (f + 1 < FEATURE_TILES) {
-        cp_async_wait<0>();
-        __syncthreads(); // Publish V[1] and release V[0] before next K[0].
-      } else if (tile + 1 < kv_tiles) {
-        cp_async_wait<0>();
-        __syncthreads(); // Publish next K[0], release V[1] before next K[1].
-      }
-      // Last tile: no further shared-memory reads/writes need a rendezvous.
-    });
+    __syncthreads(); // Publish V[1] and release K[0] after all QK reads.
+    if (tile + 1 < kv_tiles) {
+      // Next K can overwrite slot 0 while current PV only reads slot 1.
+      load_k_async(k, key0 + BK, tk, 0, storage, 0);
+    }
+    auto sVt = make_tensor(make_smem_ptr(storage.kv[1].v), VTransposedLayout{});
+    gemm_pv_subtile(rP, sVt, rO);
+    if (tile + 1 < kv_tiles) {
+      cp_async_wait<0>();
+      __syncthreads(); // Publish next K[0] and release V[1] before next V load.
+    }
+    // Last iteration has no outstanding copies and only stores register results.
   }
 
   CUTE_UNROLL

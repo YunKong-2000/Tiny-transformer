@@ -110,8 +110,10 @@ SDPA 保留 PyTorch 自动选择后端的行为；该选项不强制使用 Flash
 `--dim/--heads/--out-features/--hidden-dim/--vocab-size` 调整对应形状；
 BF16 attention 的 `--precision bf16` 直接创建 BF16 Q/K/V，不启用 autocast。
 BF16 prefill/chunk 使用 Q 常驻 shared memory、P 常驻寄存器的 Tensor Core kernel，
-当前实验配置 `BQ=BK=64,BH=32`，K/V 通过两个 union stage 复用 subtile 存储
-（16 KiB/CTA）；与先前 BK=32 配置比较时应检查精度、寄存器和同口径耗时，不能预设提速。
+当前实验配置 `BQ=BK=BH=64`，Q 常驻 shared memory，另两个完整 K/V slot 用于
+交叠加载和计算（24 KiB/CTA）。对照已保存的 `BK=64,BH=32`、int32/base-2
+基线（Graph 48.71 us）：共享内存增加、特征循环移除，barrier 次数减半；
+PV 临时 B fragment 增大，需检查精度、寄存器和同口径耗时，不能预设提速。
 `Q=1,K<=4096` 使用专用
 SIMT split-KV decode，K>128 时包含 partial 和 merge 两次 kernel 启动。K>4096 使用
 通用 Tensor Core kernel；可以用 `--seq-length 128/129/4096/4097` 分别观察分派边界。

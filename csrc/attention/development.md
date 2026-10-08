@@ -5,8 +5,9 @@ FP32 和 BF16 通用 Tensor Core 路径每 CTA 128 线程；BF16 单 query 专�
 两条路径均支持 causal prefill、decode/chunk 和序列尾块，Q/K/V 必须具有相同 dtype。
 FP32 支持文档 segment IDs；host 将 Q/K 和 segment IDs 连续化，V 直接使用实际 stride。
 BF16 要求 SM80+，不支持 segment IDs；host 将 Q/K/V 连续化，必要时 clone 保证起点
-16-byte 对齐，kernel 本身不处理任意 stride。BF16 通用路径当前实验配置为 BQ=BK=64、BH=32，
-Q 整块常驻 shared memory，两个 K/V union stage 保存特征 subtile，共 16 KiB/CTA。
+16-byte 对齐，kernel 本身不处理任意 stride。BF16 通用路径当前实验配置为 BQ=BK=BH=64，
+Q 整块常驻 shared memory，另两个完整 K/V slot 共用 union 类型，共 24 KiB/CTA。
+当前 slot 0 固定保存 K、slot 1 固定保存 V，使两者的预取和消费可以重叠。
 score、softmax 统计量和输出累加器为 FP32，P 直接转换为 BF16 A fragment 留在寄存器。
 原生接口返回 `(O, LSE)`：O 与输入同 dtype，LSE 始终为 FP32；Python 只返回 O。
 反向、AMP/autocast 和 FP16 尚未实现；需要梯度时明确报错。
@@ -36,9 +37,9 @@ Clang 对输入检查头文件和绑定的 C++17 语法检查通过；此检查�
 尚未运行 nvcc、GPU 数值测试或 compute-sanitizer。
 
 BF16 性能排查：host 使用 `at::cuda::getDeviceProperties` 的设备缓存，避免每次调用
-查询 CUDA runtime。每次复用某个 union stage 前，必须完成该 stage 的旧数据消费和
-CTA barrier；另一个 stage 可以仍在计算。K[1] 计算时预取 V[0]，V[1] 计算时预取
-下一 KV tile 的 K[0]。同步改动仍需重跑数值测试和
+查询 CUDA runtime。每次复用某个 slot 前，必须完成该 slot 的旧数据消费和
+CTA barrier；另一个 slot 可以仍在计算。当前完整 QK 计算时预取 V，完整 PV 计算时
+预取下一 KV tile 的 K。同步改动仍需重跑数值测试和
 compute-sanitizer racecheck/synccheck 验证。
 性能入口新增 `--attention-timing graph --phases forward`，完整算子图重放与原有
 operator 耗时分开报告，具体口径见 benchmarks README。新增 GPU 测试检查未对齐
@@ -49,24 +50,20 @@ prefill/decode 输入在 CUDA Graph 中捕获和重复重放的 O/LSE。
 
 - Q_i 的完整 `(64,64)` tile 保存在 shared memory，共 8 KiB。每次 QK 只加载
   当前 MMA 的 K=16 Q fragment 到寄存器，避免 Q 的完整寄存器 fragment 跨循环存活。
-- K/V 的 subtile 当前均为 `(BK,BH)=(64,32)`，每个 4 KiB；每个 stage 使用 union 复用
-  K/V 存储，两个 stage 共 8 KiB。共享内存总量为 `8+2*4=16 KiB`，没有 shared P。
-  Q 使用 `Swizzle<3,3,3>`；K/V 的行宽为 32，使用 `Swizzle<2,3,3>`。
-  32 个 BF16 的行跨越 16 个 bank，行低位已经选择 bank 的前/后半；swizzle 应使用
-  行的第 1/2 位，即元素地址第 6/7 位。旧的 shift=2 会使相隔 4 行的片段重复占用 banks。
-- 每轮 KV tile 中，先遍历 Q/K 特征 `d=0,32`，将两个部分点积累加到同一个 S；
-  完成全部 DH 后才做 scale/mask/softmax。每线程 S 为 `(4,1,8)`，32 个 FP32。
+- K/V 当前均为 `(BK,BH)=(64,64)`，每个 8 KiB，两个 slot 共 16 KiB；加上 Q
+  总计 24 KiB，没有 shared P。Q/K/V 的 64-BF16 行都使用 `Swizzle<3,3,3>`，
+  将元素地址第 6/7/8 位异或到第 3/4/5 位，保留 16-byte 向量对齐。
+- 每轮 KV tile 直接消费完整 Q/K，MMA 内部仍按 K=16 遍历 DH；
+  完成全部 DH 后才做 mask/softmax。每线程 S 为 `(4,1,8)`，32 个 FP32。
 - softmax 直接将 `rS(vi,0,n)` 对应的概率写到
   `rP(vi+4*(n%2),0,n/2)`，编译期断言校验 atom 的 A/C 布局关系；转换不跨线程。
   每线程 P 为 `(8,1,4)`，32 个 BF16。FP32 分母在转换前计算；进入 PV 前 S 结束使用。
-- 先对完整 O 的 64 列缩放一次 alpha，再遍历输出特征 `h=0,32`，
-  计算 `O[:,h:h+BH] += P @ V[:,h:h+BH]`；PV 的归约维为 BK，不能误用 BH/DH。
-  O 仍为 `(4,1,8)`，32 个 FP32。输出切片索引在编译期确定，避免动态索引寄存器数组。
-- 两个 union stage 交替预取，跨越 QK/PV 阶段与相邻 KV tile；V[0] 的加载与 K[1]
-  的计算及 softmax 重叠，下一 tile 的 K[0] 与当前 V[1] 的计算重叠。
-  该方案减少 shared memory 和 fragment 大小，但增加 subtile 切换与同步，收益需实测。
-- 通用 softmax 使用 base-2 最大值、`exp2f` 与融合 scale/subtract；LSE 写回时转换
-  为自然对数，仍为 FP32。专用 decode 路径保持原有自然指数实现。
+- 先对完整 O 的 64 列缩放一次 alpha，再直接计算 `O += P @ V`；
+  PV 内部按 K=16 归约 BK，不再切分输出特征。O 仍为 `(4,1,8)`，32 个 FP32。
+- 完整 V 的加载与 QK/softmax 重叠，下一 tile 的完整 K 与当前 PV 重叠。
+  每个 CTA 消费 N 个 KV tile 时共 2N 次 barrier（含 prologue），收益需实测。
+- 通用 softmax 与已保存的 int32/base-2 基线一致，使用 `exp2f` 和 FMA，LSE
+  写回时转换为自然对数 FP32。该轮实验只改变 K/V 宽度、相应 swizzle 和流水线。
 - `Tq=1 && Tk<=4096` 使用专用 SIMT split-KV 路径，每 CTA 256 线程处理 128 个 key。
   QK、P、PV 使用 FP32；单块直接输出，多块写 FP32 `(numerator, max, sum)` 并由第二个
   kernel 按全局 max 重缩放后合并。无需补齐 64 行 query，Tk>4096 仍走通用路径。
@@ -221,6 +218,44 @@ global load/store 的 `row*DH`、batch/head base 偏移在乘法前显式提升�
 本地另用 Clang UBSan 编译 kernel 中提取的真实索引表达式，对 INT32_MAX 附近的
 尾块、非零 past_len、CTA 映射与原 int64 mask 语义进行对照。该检查不替代 nvcc、
 CUDA 数值/竞态或性能测试；attention 主机测试 1 项通过、20 项 CUDA 跳过。
+
+2026-10-08 保存的基线与当前 full-width KV 实验：
+
+- 48.71 us 基线保存在 Git 提交 `b1482b45222875dcff2b893086a52dcf38418a2c`。
+  本地快照目录 `runs/attention-tuning/baseline-int32-base2-b1482b4/` 包含源码和
+  `manifest.json`（SHA256、commit、用户报告的性能及 ptxas 数据）。runs 被 gitignore
+  排除，跨机器恢复以 Git 提交为准。基线为 A100 80GB PCIe、BF16、B=8,H=12,
+  T=512,D=64、Graph、warmup=20,repeats=100,trials=5；student 48.71 us、SDPA
+  39.23 us，128 registers、8-byte stack、4-byte spill stores/loads。
+- 自然指数候选未经 GPU 测量已撤回。当前候选从上述快照恢复相同 base-2 数学后，
+  仅将 BH=32 增大为 BH=64，BK/BQ=64、int32 索引及 launch_bounds(128,4) 保持不变。
+- 共享内存 16→24 KiB，S/P/O 的逻辑寄存器元素数不变；QK 仍逐 K=16 加载 Q 片段，
+  未将整个 Q 常驻寄存器。PV 当前 B fragment 由每线程 16 个 BF16 增大到 32 个，
+  所以寄存器分配/spill 必须重测，不能仅凭 barrier 减少预设加速。
+- 流水线：prologue 加载 Q 与 K(slot 0)；每轮预取 V(slot 1)，执行 QK/softmax，
+  wait+CTA barrier 发布 V 并释放 K；若有下一轮，预取下一 K(slot 0)，执行当前 PV，
+  wait+CTA barrier 发布 K 并释放 V。最后一轮 PV 后无需同步，无未完成 cp.async。
+  原来的两个特征循环被移除。每 CTA 的 barrier 为 `1+N+(N-1)=2N`，基线为 4N。
+  在 T=512 下，每 head 的 KV tile 仍为 36，barrier 总次数由 144 降至 72。
+- GPU 测试增加单 head 的连续 cache-prefix view，在有效 Tk 后放入 NaN，覆盖
+  Tk=63/64/65、query tail、多轮缓冲复用、单轮收尾。该 view 不会被 host 连续化
+  复制，能检查原 allocation 内的越界尾部读取。沿用已有 FP64/SDPA、特征探针、
+  非默认 stream 和 CUDA Graph 测试。
+
+候选需先通过正确性和 racecheck/synccheck，再用相同 Graph 参数对照 48.71 us。
+建议输出到 `runs/attention-bh64-graph.json`，避免覆盖基线报告。若需恢复基线 kernel：
+
+```bash
+git restore --source=b1482b45222875dcff2b893086a52dcf38418a2c -- csrc/attention/attention_forward_BF16_kernel.cuh
+```
+
+该命令会覆盖 kernel 的工作区修改；已有基线快照和 Git 提交均保留。
+
+本地检查：保存文件的 SHA256 和 softmax/指数常量与基线一致；full-width swizzle
+的 4096 个地址、16-byte 向量、8x8 物理子矩阵 bank 分组通过。1/2/3/8/16 个 KV
+tile 的 slot 状态模型确认每次覆盖前释放读者、收尾无 pending copy、barrier 为 2N。
+12 组随机 BF16 输入的 QK/PV 分组数学模型与原 BH=32 版本一致。attention 测试
+1 项通过、21 项 CUDA 跳过；未完成 nvcc、GPU 数值/竞态检查或性能测试。
 
 2026-10-07 本地验证：student 回归 82 项（11 项通过、71 项 CUDA 跳过），
 benchmark 回归 25 项通过，operator 回归 10 项通过；Clang 对绑定和输入检查头文件的

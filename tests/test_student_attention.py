@@ -134,8 +134,7 @@ class StudentAttentionCudaTests(unittest.TestCase):
 
     def test_bf16_key_reduction_spans_both_halves_of_tile(self):
         self.require_bf16()
-        # BK=64 and BH=32 must remain distinct: PV reduces across all 64
-        # keys even though it produces only 32 output features per subtile.
+        # Probe both halves of the key tile and both halves of the output.
         q = torch.zeros(1, 1, 64, 64, device='cuda', dtype=torch.bfloat16)
         k = torch.zeros(1, 1, 129, 64, device='cuda', dtype=torch.bfloat16)
         for key_index in (0, 15, 16, 31, 32, 47, 48, 63, 64, 95, 96, 127, 128):
@@ -144,6 +143,21 @@ class StudentAttentionCudaTests(unittest.TestCase):
                 v[:, :, key_index, :32] = 64
                 v[:, :, key_index, 32:] = -64
                 self.check_forward(q, k, v, 65)
+
+    def test_bf16_full_width_kv_pipeline_poisoned_tails(self):
+        self.require_bf16()
+        for tq, tk in ((2, 63), (2, 64), (2, 65), (64, 64), (65, 129), (129, 257)):
+            with self.subTest(tq=tq, tk=tk):
+                q = torch.randn(1, 1, tq, 64, device='cuda', dtype=torch.bfloat16)
+                stores = [torch.full((1, 1, tk + 64, 64), float('nan'),
+                                     device='cuda', dtype=torch.bfloat16) for _ in range(2)]
+                for storage in stores:
+                    storage[:, :, :tk].normal_()
+                k, v = [storage[:, :, :tk] for storage in stores]
+                # Singleton batch/head keeps these prefixes contiguous: the
+                # host uses the original allocation with NaNs directly after Tk.
+                self.assertTrue(k.is_contiguous() and v.is_contiguous())
+                self.check_forward(q, k, v, tk - tq)
 
     def test_bf16_causal_tile_order_and_pipeline_transitions(self):
         self.require_bf16()
@@ -217,9 +231,10 @@ class StudentAttentionCudaTests(unittest.TestCase):
         torch.testing.assert_close(before[:, :, :65], after[:, :, :65], atol=0, rtol=0)
 
     @torch.no_grad()
-    def test_bf16_base2_softmax_natural_lse(self):
+    def test_bf16_softmax_natural_lse(self):
         self.require_bf16()
-        # Nonzero positive/negative logits catch a missing ln(2) conversion.
+        # Nonzero positive/negative logits verify natural-log LSE for either
+        # exponential implementation (and catch an incorrect base conversion).
         # Chunk past=63 crosses full-tile/masked paths; Tq=65 has padded rows.
         for tq, tk in ((64, 127), (65, 193)):
             for key_value in (-10., -0.5, 0.5, 10.):

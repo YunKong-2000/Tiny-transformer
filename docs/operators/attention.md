@@ -9,7 +9,7 @@ Q/K/V 必须同 dtype，O 保持输入 dtype，内部 LSE 为 FP32。
 BF16 的序列长度要求 `Tk <= INT32_MAX`；kernel 使用 int32 序列索引，元素地址偏移
 仍使用 int64，长度检查在输入连续化和输出分配之前执行。
 BF16 通用路径将 Q 整块保存在 shared memory、P 保存在寄存器，当前实验配置的 K/V 为
-`(64,32)` subtile，两个 union stage 复用存储，共 16 KiB/CTA；`Tq=1,Tk<=4096` 使用专用
+`(64,64)` 完整 tile，两个 slot 分别用于 K/V，共 24 KiB/CTA；`Tq=1,Tk<=4096` 使用专用
 SIMT split-KV decode，分块 softmax 在 FP32 中合并；更长序列使用通用 Tensor Core 路径。
 反向、AMP/autocast 和 FP16 尚未实现。GPU 编译、数值与竞态仍须在 CUDA 环境验收，命令见
 [实现记录](../../csrc/attention/development.md)；本地 CPU 测试不代表 CUDA 验证通过。
