@@ -199,7 +199,7 @@ __device__ __forceinline__ float row_sum(float x) {
   return x + __shfl_xor_sync(0xffffffffu, x, 2);
 }
 
-__global__ __launch_bounds__(THREADS, 4)
+__global__ __launch_bounds__(THREADS, 5)
 void forward(const Element* q, const Element* k, const Element* v,
              Element* o, float* lse, int64_t tq, int64_t tk, int64_t past_len) {
   extern __shared__ __align__(16) unsigned char shared_bytes[];
