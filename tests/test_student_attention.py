@@ -134,10 +134,12 @@ class StudentAttentionCudaTests(unittest.TestCase):
 
     def test_bf16_key_reduction_spans_both_halves_of_tile(self):
         self.require_bf16()
-        # Probe both halves of the key tile and both halves of the output.
+        # Probe the first/last key of every K=16 fragment across two KV tiles,
+        # plus the one-key tail: duplicated, missing or stale V fragments fail.
         q = torch.zeros(1, 1, 64, 64, device='cuda', dtype=torch.bfloat16)
         k = torch.zeros(1, 1, 129, 64, device='cuda', dtype=torch.bfloat16)
-        for key_index in (0, 15, 16, 31, 32, 47, 48, 63, 64, 95, 96, 127, 128):
+        for key_index in (0, 15, 16, 31, 32, 47, 48, 63,
+                          64, 79, 80, 95, 96, 111, 112, 127, 128):
             with self.subTest(key_index=key_index):
                 v = torch.zeros_like(k)
                 v[:, :, key_index, :32] = 64

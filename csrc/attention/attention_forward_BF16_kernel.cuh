@@ -157,15 +157,32 @@ gemm_pv_subtile(const PTensor& rP, const VTensor& sVt, OTensor& acc) {
   CUTE_STATIC_ASSERT_V(size<0>(rP) == Int<8>{});
   CUTE_STATIC_ASSERT_V(size<2>(rP) == Int<BK / MMA_K>{});
   CUTE_STATIC_ASSERT_V(size<2>(acc) == Int<PV_N_ITER>{});
-  CUTE_UNROLL
-  for (int ki = 0; ki < BK / MMA_K; ++ki) {
-    auto b = local_tile(sVt, Shape<Int<BH>, Int<MMA_K>>{}, make_coord(0, ki));
-    auto rB = thr.partition_fragment_B(b);
+
+  // Two explicit register fragments, not a dynamically indexed tensor array.
+  // The next ldmatrix load is issued before MMA consumes the current fragment.
+  auto first_b = local_tile(sVt, Shape<Int<BH>, Int<MMA_K>>{}, make_coord(_0{}, _0{}));
+  auto rB0 = thr.partition_fragment_B(first_b);
+  auto rB1 = thr.partition_fragment_B(first_b);
+  CUTE_STATIC_ASSERT_V(size(rB0) == Int<4 * PV_N_ITER>{});
+  auto load_fragment = [&](auto ki, auto& rB) {
+    auto b = local_tile(sVt, Shape<Int<BH>, Int<MMA_K>>{}, make_coord(_0{}, ki));
     auto tBs = thr_b.partition_S(b);
     auto tBr = thr_b.retile_D(rB);
     copy(copy_b, tBs, tBr);
-    gemm(mma, rP(_, _, ki), rB(_, _, 0), acc);
-  }
+  };
+
+  load_fragment(_0{}, rB0);
+  for_each(make_seq<BK / MMA_K>{}, [&](auto ki) {
+    constexpr int k = decltype(ki)::value;
+    if constexpr (k % 2 == 0) {
+      if constexpr (k + 1 < BK / MMA_K) load_fragment(Int<k + 1>{}, rB1);
+      gemm(mma, rP(_, _, ki), rB0(_, _, _0{}), acc);
+    } else {
+      // MMA k-1 has consumed rB0 before it is reused for k+1.
+      if constexpr (k + 1 < BK / MMA_K) load_fragment(Int<k + 1>{}, rB0);
+      gemm(mma, rP(_, _, ki), rB1(_, _, _0{}), acc);
+    }
+  }); // Last MMA drains the pipeline without loading beyond the BK tile.
 }
 
 // Keep valid scores unscaled: max(raw_score) * SCALE_LOG2 needs one scale

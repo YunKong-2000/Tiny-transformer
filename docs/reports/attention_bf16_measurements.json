@@ -1,0 +1,224 @@
+{
+  "title": "BF16 Attention 前向优化路径报告",
+  "date": "2026-10-08",
+  "provenance": "用户在本对话提供的 GPU 日志与 NCU 截图，结合本地仓库源码和提交；未在报告生成主机复测 GPU。",
+  "environment": {
+    "GPU": "NVIDIA A100 80GB PCIe",
+    "pytorch": "2.8.0a0+34c6371d24.nv25.08",
+    "arch": "sm_80",
+    "B": 8,
+    "heads": 12,
+    "Tq_prefill": 512,
+    "Tk": 512,
+    "DH": 64,
+    "dtype": "bfloat16",
+    "warmup": 20,
+    "repeats": 100,
+    "trials": 5
+  },
+  "mode_legend": {
+    "graph*": "沿用前文 Graph 设置，末次结果日志未附完整命令；不视为完整可复现的单次实验记录。"
+  },
+  "measurements": [
+    {
+      "id": "O01",
+      "mode": "operator",
+      "workload": "prefill",
+      "change": "最初可运行 BF16",
+      "student_us": 101.92,
+      "sdpa_us": 40.92,
+      "note": "完整命令可见",
+      "speedup": 0.40149136577708006
+    },
+    {
+      "id": "D01",
+      "mode": "operator",
+      "workload": "decode",
+      "change": "通用 query tile",
+      "student_us": 35.44,
+      "sdpa_us": 30.15,
+      "note": "完整命令可见",
+      "speedup": 0.8507336343115124
+    },
+    {
+      "id": "G01",
+      "mode": "graph",
+      "workload": "prefill",
+      "change": "初始 Graph 对照",
+      "student_us": 100.42,
+      "sdpa_us": 39.37,
+      "note": "完整命令可见",
+      "speedup": 0.3920533758215495
+    },
+    {
+      "id": "D02",
+      "mode": "graph",
+      "workload": "decode",
+      "change": "通用 query tile",
+      "student_us": 34.06,
+      "sdpa_us": 15.42,
+      "note": "完整命令可见",
+      "speedup": 0.45273047563123897
+    },
+    {
+      "id": "G02",
+      "mode": "graph",
+      "workload": "prefill",
+      "change": "小 KV tile 与 union",
+      "student_us": 98.08,
+      "sdpa_us": 39.29,
+      "note": "与多个中间改动组合，不单独归因",
+      "speedup": 0.40059135399673734
+    },
+    {
+      "id": "D03",
+      "mode": "graph",
+      "workload": "decode",
+      "change": "专用 split KV",
+      "student_us": 12.73,
+      "sdpa_us": 15.44,
+      "note": "同轮 prefill 与 decode",
+      "speedup": 1.2128829536527885
+    },
+    {
+      "id": "X01",
+      "mode": "NCU operator",
+      "workload": "prefill",
+      "change": "仅一次预热和采样",
+      "student_us": 209.92,
+      "sdpa_us": 258.05,
+      "note": "受 profiler 干扰，排除性能结论",
+      "speedup": 1.2292778201219514
+    },
+    {
+      "id": "X02",
+      "mode": "NCU operator",
+      "workload": "prefill",
+      "change": "恢复 20 100 5 采样",
+      "student_us": 102.79,
+      "sdpa_us": 158.28,
+      "note": "受 profiler 干扰，排除性能结论",
+      "speedup": 1.539838505691215
+    },
+    {
+      "id": "O02",
+      "mode": "operator",
+      "workload": "prefill",
+      "change": "无 NCU 复测",
+      "student_us": 99.1,
+      "sdpa_us": 41.19,
+      "note": "完整命令可见",
+      "speedup": 0.4156407669021191
+    },
+    {
+      "id": "O03",
+      "mode": "operator",
+      "workload": "prefill",
+      "change": "预取与 CTA 组合优化",
+      "student_us": 69.9,
+      "sdpa_us": 41.25,
+      "note": "N=8 展开回撤版本对应存在不确定性",
+      "speedup": 0.5901287553648068
+    },
+    {
+      "id": "O04",
+      "mode": "operator",
+      "workload": "prefill",
+      "change": "完整块 mask fast path",
+      "student_us": 62.86,
+      "sdpa_us": 41.11,
+      "note": "可能伴随 N=8 展开回撤，不能完全单独归因",
+      "speedup": 0.6539930003181673
+    },
+    {
+      "id": "O05",
+      "mode": "operator",
+      "workload": "prefill",
+      "change": "BK 从 32 增至 64",
+      "student_us": 58.51,
+      "sdpa_us": 41.31,
+      "note": "完整命令可见",
+      "speedup": 0.7060331567253462
+    },
+    {
+      "id": "O06",
+      "mode": "operator",
+      "workload": "prefill",
+      "change": "launch bounds 4",
+      "student_us": 52.03,
+      "sdpa_us": 41.18,
+      "note": "完整命令可见",
+      "speedup": 0.7914664616567365
+    },
+    {
+      "id": "G03",
+      "mode": "graph",
+      "workload": "prefill",
+      "change": "launch bounds 4",
+      "student_us": 50.61,
+      "sdpa_us": 39.52,
+      "note": "两次 timing 参数，最后一个 graph 生效",
+      "speedup": 0.780873345188698
+    },
+    {
+      "id": "G04",
+      "mode": "graph",
+      "workload": "prefill",
+      "change": "launch bounds 5 回退",
+      "student_us": 53.16,
+      "sdpa_us": 39.26,
+      "note": "完整命令可见",
+      "speedup": 0.7385252069224981
+    },
+    {
+      "id": "G05",
+      "mode": "graph",
+      "workload": "prefill",
+      "change": "base 2 softmax",
+      "student_us": 51.11,
+      "sdpa_us": 39.39,
+      "note": "恢复 bounds 4 后与 G03 对照",
+      "speedup": 0.7706906671884172
+    },
+    {
+      "id": "G06",
+      "mode": "graph",
+      "workload": "prefill",
+      "change": "int32 索引",
+      "student_us": 48.71,
+      "sdpa_us": 39.23,
+      "note": "完整命令可见",
+      "speedup": 0.805378772326011
+    },
+    {
+      "id": "G07",
+      "mode": "graph*",
+      "workload": "prefill",
+      "change": "BH 从 32 增至 64",
+      "student_us": 46.73,
+      "sdpa_us": 39.35,
+      "note": "沿用 Graph 语境，结果片段无完整命令",
+      "speedup": 0.8420714744275627
+    },
+    {
+      "id": "G08",
+      "mode": "graph*",
+      "workload": "prefill",
+      "change": "shared O 重排 回退",
+      "student_us": 48.17,
+      "sdpa_us": 39.27,
+      "note": "沿用 Graph 语境，结果片段无完整命令",
+      "speedup": 0.8152376998131617
+    },
+    {
+      "id": "G09",
+      "mode": "graph*",
+      "workload": "prefill",
+      "change": "延迟归约与倒数复用",
+      "student_us": 42.34,
+      "sdpa_us": 39.27,
+      "note": "沿用 Graph 语境，结果片段无完整命令",
+      "speedup": 0.9274917335852622
+    }
+  ]
+}

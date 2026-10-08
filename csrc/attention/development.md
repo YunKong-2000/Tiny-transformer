@@ -263,6 +263,31 @@ C++17 语法检查通过。未运行 nvcc、GPU 数值测试或 compute-sanitize
 
 ## 整体算法 overall algorithm
 
+2026-10-08 PV shared→register 预取实验：基线提交
+`8732172b52eaf63f9ca7a0541d86cb727bec908e`，用户报告 student 42.34 us、SDPA 39.27 us。
+本轮只改 `gemm_pv_subtile`：保留两个独立的 V register fragment rB0/rB1，
+ki 和 slot 选择通过 `make_seq`/`if constexpr` 编译期展开，不使用动态索引数组。
+
+```text
+load V[0] → rB0
+load V[1] → rB1; MMA(P[0], rB0)
+load V[2] → rB0; MMA(P[1], rB1)
+load V[3] → rB1; MMA(P[2], rB0)
+                 MMA(P[3], rB1)
+```
+
+每个片段覆盖 K=16，每线程 32 个 BF16；只有前一内容已被 MMA 消费的 slot 才可复用。
+最后一轮不预取，加载与 MMA 各执行 4 次，累加顺序与基线相同。共享内存仍为 24 KiB，
+未增添 CTA barrier，也未改 QK、softmax、global→shared 流水线或 epilogue。
+两个片段增加显式存活的 V 值；编译器可能进一步调整加载次序与寄存器分配，源码预取
+不保证硬件上已经发生有效重叠，必须对照 ptxas、SASS 和同条件 Graph benchmark。
+
+本地检查确认 kernel 除 PV helper 外与基线逐字相同；寄存器 slot 状态模型无提前覆盖、
+无越界预取，20 组随机 BF16 操作数的 PV 数学模型与串行 K=16 累加逐位一致。
+GPU key 探针扩展到两个完整 KV tile 中每个 K=16 fragment 的首尾，以及最后一个 key
+的 tail。attention 测试 1 项通过、23 项 CUDA 跳过；未执行 nvcc、GPU 数值/竞态
+或性能验收。候选只有在正确性通过并稳定优于 42.34 us 基线时才值得保留。
+
 2026-10-08 输出重排实验（已撤回）：复用 `storage.q` 的 8 KiB，先由 MMA 原线程将归一化的
 BF16 pair 写到 QLayout 对应位置，再执行一次全 CTA barrier。随后按每行 8 个线程、
 每线程 8 个 BF16 重新读取，使用对齐的 uint4 向 global memory 写回。共享内存仍为
