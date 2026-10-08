@@ -239,7 +239,10 @@ void forward(const Element* q, const Element* k, const Element* v,
   CUTE_STATIC_ASSERT_V(size<2>(rO) == Int<OUTPUT_N_ITER>{});
   clear(rO);
   float m2[TM] = {-CUDART_INF_F, -CUDART_INF_F}; // Row maxima in base-2 score units.
-  float l[TM] = {0.f, 0.f};
+  // Each lane keeps its own running contribution for its two query rows.
+  // Row maxima/alpha remain shared across the four lanes, but the denominator
+  // is not needed by QK, softmax weights or PV until the final normalization.
+  float l_partial[TM] = {0.f, 0.f};
 
   load_subtile_async<BQ, DH>(q, q0, tq, 0, storage.q, QLayout{});
   load_k_async(k, 0, tk, 0, storage, 0); // Commit Q and first K in one group.
@@ -308,7 +311,7 @@ void forward(const Element* q, const Element* k, const Element* v,
           CUTE_UNROLL
           for (int b = 0; b < TN; ++b) rO(TN * a + b, 0, n) *= alpha;
         }
-        l[a] = alpha * l[a] + row_sum(local_sum);
+        l_partial[a] = alpha * l_partial[a] + local_sum;
         m2[a] = m2_new;
       }
     } // rS is no longer needed while PV holds rP and the full rO.
@@ -325,47 +328,33 @@ void forward(const Element* q, const Element* k, const Element* v,
       cp_async_wait<0>();
       __syncthreads(); // Publish next K[0] and release V[1] before next V load.
     }
-    // Last iteration has no outstanding copies; Q is released for the epilogue.
+    // Last iteration has no outstanding copies and only stores register results.
   }
 
-  // The last QK->PV barrier has released every Q reader. Reuse Q's 8 KiB
-  // for an epilogue layout conversion; normalization arithmetic is unchanged.
   CUTE_UNROLL
   for (int a = 0; a < TM; ++a) {
+    // All lanes, including padded rows, must execute the full-mask shuffle.
+    // Placing this inside qi<tq would make a tail warp's participation invalid.
+    const float denominator = row_sum(l_partial[a]);
     const int32_t qi = q0 + get<0>(tO(TN * a, 0, 0));
     if (qi < tq) {
+      const bool has_sum = denominator > 0.f;
+      const float inv_l = has_sum ? 1.0f / denominator : 0.f;
       CUTE_UNROLL
       for (int n = 0; n < OUTPUT_N_ITER; ++n) {
         static_assert(TN == 2);
         const int vi = TN * a;
         const int d = get<1>(tO(vi, 0, n));
-        const Element lo(l[a] > 0.f ? rO(vi, 0, n) / l[a] : 0.f);
-        const Element hi(l[a] > 0.f ? rO(vi + 1, 0, n) / l[a] : 0.f);
-        // Write each MMA-owned pair to its logical output position in shared
-        // memory. All values of a valid row are produced exactly once.
+        const Element lo(has_sum ? rO(vi, 0, n) * inv_l : 0.f);
+        const Element hi(has_sum ? rO(vi + 1, 0, n) * inv_l : 0.f);
+        // The two atom values are consecutive columns with an even first d.
+        // Pack their exact BF16 bits into one aligned store instead of two STG.U16.
         const uint32_t packed = uint32_t(lo.raw()) | (uint32_t(hi.raw()) << 16);
-        const int offset = QLayout{}(make_coord(qi - q0, d));
-        *reinterpret_cast<uint32_t*>(storage.q + offset) = packed;
+        *reinterpret_cast<uint32_t*>(o + int64_t(qi) * DH + d) = packed;
       }
       if (threadIdx.x % LANES_PER_ROW == 0)
         // Public LSE is a natural logarithm, even though internal maxima use base 2.
-        lse[qi] = l[a] > 0.f ? fmaf(m2[a], LN2, logf(l[a])) : -CUDART_INF_F;
-    }
-  }
-  __syncthreads(); // Output writers and vector readers have different ownership.
-
-  // Eight adjacent lanes write one complete 64-BF16 row. Each lane transfers
-  // 8 BF16 values (16 bytes), filling every 32-byte global-store sector.
-  constexpr int vectors_per_row = DH / VEC_LEN;
-  CUTE_UNROLL
-  for (int vector = int(threadIdx.x); vector < BQ * vectors_per_row; vector += THREADS) {
-    const int row = vector / vectors_per_row;
-    const int d = (vector % vectors_per_row) * VEC_LEN;
-    const int32_t qi = q0 + row;
-    if (qi < tq) {
-      const int offset = QLayout{}(make_coord(row, d));
-      const uint4 values = *reinterpret_cast<const uint4*>(storage.q + offset);
-      *reinterpret_cast<uint4*>(o + int64_t(qi) * DH + d) = values;
+        lse[qi] = has_sum ? fmaf(m2[a], LN2, logf(denominator)) : -CUDART_INF_F;
     }
   }
 }

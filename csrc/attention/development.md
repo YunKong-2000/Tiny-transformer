@@ -61,8 +61,7 @@ prefill/decode 输入在 CUDA Graph 中捕获和重复重放的 O/LSE。
 - 先对完整 O 的 64 列缩放一次 alpha，再直接计算 `O += P @ V`；
   PV 内部按 K=16 归约 BK，不再切分输出特征。O 仍为 `(4,1,8)`，32 个 FP32。
 - 完整 V 的加载与 QK/softmax 重叠，下一 tile 的完整 K 与当前 PV 重叠。
-  每个 CTA 消费 N 个 KV tile 时主循环共 2N 次 barrier（含 prologue），
-  当前输出重排另加 1 次；收益需实测。
+  每个 CTA 消费 N 个 KV tile 时共 2N 次 barrier（含 prologue），输出直接写回。
 - 通用 softmax 与已保存的 int32/base-2 基线一致，使用 `exp2f` 和 FMA，LSE
   写回时转换为自然对数 FP32。该轮实验只改变 K/V 宽度、相应 swizzle 和流水线。
 - `Tq=1 && Tk<=4096` 使用专用 SIMT split-KV 路径，每 CTA 256 线程处理 128 个 key。
@@ -264,7 +263,7 @@ C++17 语法检查通过。未运行 nvcc、GPU 数值测试或 compute-sanitize
 
 ## 整体算法 overall algorithm
 
-2026-10-08 输出重排实验：复用 `storage.q` 的 8 KiB，先由 MMA 原线程将归一化的
+2026-10-08 输出重排实验（已撤回）：复用 `storage.q` 的 8 KiB，先由 MMA 原线程将归一化的
 BF16 pair 写到 QLayout 对应位置，再执行一次全 CTA barrier。随后按每行 8 个线程、
 每线程 8 个 BF16 重新读取，使用对齐的 uint4 向 global memory 写回。共享内存仍为
 24 KiB，没有额外分配；原来的逐元素除法和 LSE 计算保留，只测试输出访问布局变化。
@@ -278,6 +277,34 @@ BF16 pair 写到 QLayout 对应位置，再执行一次全 CTA barrier。随后�
 尚未运行 nvcc、racecheck/synccheck 或性能测试，新增 shared 往返及 barrier 的代价
 必须与更好的 global store 合并效果一起测量。分母延迟归约和每行倒数是另两项独立建议，
 本轮没有同时实现。
+
+用户实测该输出重排版本 student 48.17 us、SDPA 39.27 us；直接写回版本 student
+46.73 us、SDPA 39.35 us，本次对照约慢 3.1%。撤回该 epilogue 时，kernel
+逐字节恢复为 `e13905e` 的直接 uint32 pair 写回版本。失败实验完整保存在提交
+`f14345a`，不同 head/feature 和 query tail 的精确输出测试继续保留。
+这次数据表明更好的 global-store sector 利用率没有带来净收益；新增 shared 往返、
+barrier 及编译调度变化的具体占比尚未单独量化。后续实验以 46.73 us 版本为基线。
+
+2026-10-08 在直接写回基线上实现分母延迟归约与倒数复用：
+
+- 每线程仍保存两个 FP32 分母状态，但语义改为本 lane 的累计部分和：
+  `l_partial[a] = alpha*l_partial[a] + local_sum`。行最大值仍每轮跨四个 lane 归约，
+  同一行的 alpha 因而一致。local_sum 是 P 转 BF16 前的 FP32 指数和。
+- Tk 循环后才调用 `row_sum(l_partial[a])`，取得完整 denominator；此 shuffle 在
+  `qi<tq` 判断之前执行，包括 padded 行的 lane，满足 full-mask warp 参与要求。
+  遍历 N 个 KV tile 的 CTA，分母相关 shuffle 由每线程 4N 次降为 4 次。
+- 最终对每线程负责的每行计算 `inv_l=1/denominator`，该行的所有输出元素都乘该
+  倒数；源码中的除法从每线程最多 32 次降为 2 次。LSE 使用完整 denominator，
+  仍输出 `fma(m2,ln(2),log(denominator))`。保留 denominator<=0 的零输出/-inf LSE。
+- 没有引入 shared O 或额外 CTA barrier，维持 24 KiB shared memory、原来的 Q/K/V
+  预取、tile、int32 索引、base-2 指数和 launch_bounds(128,4)。
+
+新增 GPU 用例使同一行四个 lane 的权重明显不同，KV 各块的最大值交替上升/下降，
+并覆盖 2/63/65/129 个 query 的尾块，防止丢失历史部分和或漏乘 alpha。
+本地 CPU 分块模型对 40 个 query tile 通过 FP64 对照，最大 O 误差 0.006991、
+LSE 误差 0.000001908；新旧分母因求和顺序变化的最大差值 0.000007629。
+attention 测试 1 项通过、23 项因无 CUDA 跳过；没有执行 nvcc、GPU 精度/竞态或
+性能测试。收益以与 46.73 us 基线的同条件 Graph benchmark 对照为准。
 
 $$
 \mathbf{Q}_i \in \mathbb{R}^{B_q \times D_n} \\ 

@@ -159,7 +159,7 @@ class StudentAttentionCudaTests(unittest.TestCase):
                 self.assertTrue(k.is_contiguous() and v.is_contiguous())
                 self.check_forward(q, k, v, tk - tq)
 
-    def test_bf16_output_relayout_feature_and_head_order(self):
+    def test_bf16_output_feature_and_head_order(self):
         self.require_bf16()
         features = torch.arange(64, device='cuda', dtype=torch.bfloat16) / 8 - 4
         offsets = torch.tensor([-24., -8., 8., 24.], device='cuda',
@@ -244,6 +244,25 @@ class StudentAttentionCudaTests(unittest.TestCase):
         v[:, :, 65:].add_(4)
         after = self.check_forward(q, k, v)
         torch.testing.assert_close(before[:, :, :65], after[:, :, :65], atol=0, rtol=0)
+
+    @torch.no_grad()
+    def test_bf16_partial_denominator_across_tiles_and_lanes(self):
+        self.require_bf16()
+        lane_bias = torch.tensor([-1.5, 0., 1.25, 2.5], device='cuda')
+        block_bias = torch.tensor([-4., 3., -2., 6., 1.], device='cuda')
+        for tq, tk in ((2, 129), (63, 193), (65, 257), (129, 321)):
+            with self.subTest(tq=tq, tk=tk):
+                q = torch.zeros(1, 2, tq, 64, device='cuda', dtype=torch.bfloat16)
+                k = torch.zeros(1, 2, tk, 64, device='cuda', dtype=torch.bfloat16)
+                q[..., 0] = 8  # score == K[...,0] for head_dim=64.
+                key = torch.arange(tk, device='cuda')
+                owner = (key % 8) // 2  # Four lanes own two adjacent keys each.
+                for head in range(2):
+                    k[0, head, :, 0] = (block_bias[(key // 64) % 5] +
+                                       lane_bias[(owner + head) % 4]).to(torch.bfloat16)
+                # Nonuniform lane sums plus rising/falling block maxima expose
+                # missing alpha updates, last-tile-only sums or missing lane reduction.
+                self.check_forward(q, k, torch.randn_like(k), tk - tq)
 
     @torch.no_grad()
     def test_bf16_softmax_natural_lse(self):
