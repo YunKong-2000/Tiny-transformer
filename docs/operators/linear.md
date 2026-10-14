@@ -43,12 +43,12 @@ FP32 性能基准和 Linear CUDA 测试使用独立 FP64 结果校验 reference 
 
 ## 1. 接口与职责
 
-```python
+```text
 linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor
 ```
 
 此入口会被 QKV、Attention O、合并 gate/up、FFN down 和 LM head 共用。
-选择 `linear=student` 后，所有这些投影都会调用你的实现，没有“只替换 QKV”的隐含限制。
+选择 `linear=student` 后，所有这些投影都会调用自定义实现，没有“只替换 QKV”的隐含限制。
 每个 block 4 次，最后 LM head 1 次；默认模型每次 forward 共 33 次。
 
 ## 2. 输入与输出

@@ -1,4 +1,4 @@
-"""Attention forward: online softmax, tails, cache strides and API boundaries."""
+"""Attention forward and BF16 backward: masks, views, saved state and CUDA streams."""
 import math
 import unittest
 from unittest.mock import Mock, patch
@@ -10,9 +10,9 @@ from tiny_transformer.operators._extension import load_attention_extension
 
 
 class StudentAttentionHostTests(unittest.TestCase):
-    def test_forward_bridge_and_backward_guard(self):
+    def test_forward_backward_bridge_and_dtype_guard(self):
         # Test doubles check only Python wiring; no CUDA arithmetic is simulated.
-        q, k, v = [Mock(is_cuda=True, requires_grad=False) for _ in range(3)]
+        q, k, v = [Mock(is_cuda=True, requires_grad=False, dtype=torch.float32) for _ in range(3)]
         output, lse, segments = object(), object(), object()
         extension = Mock()
         extension.attention_forward.return_value = (output, lse)
@@ -29,6 +29,62 @@ class StudentAttentionHostTests(unittest.TestCase):
                     self.assertIs(student.attention(q, k, v, 9), output)
                 extension.attention_forward.assert_called_with(q, k, v, 9, None)
                 tensor.requires_grad = False
+
+            # Check that the public BF16 training path reaches Function.apply.
+            for tensor in (q, k, v):
+                tensor.dtype = torch.bfloat16
+            q.requires_grad = True
+            with patch.object(student._Attention, 'apply', return_value=output) as apply:
+                self.assertIs(student.attention(q, k, v, 2), output)
+                apply.assert_called_once_with(q, k, v, 2, None)
+
+        # Explicit CPU native-API double: exercise actual autograd saved state
+        # and gradients through strided views, without claiming CUDA validation.
+        def forward(q, k, v, past_len, segments):
+            self.assertFalse(torch.is_grad_enabled())
+            self.assertIsNone(segments)
+            mask = torch.arange(k.size(2))[None, :] <= torch.arange(q.size(2))[:, None] + past_len
+            scores = (q @ k.transpose(-1, -2) / 8).masked_fill(~mask, -torch.inf)
+            return scores.softmax(-1) @ v, scores.logsumexp(-1)
+
+        def backward(q, k, v, dout, out, lse, past_len, segments):
+            self.assertIsNone(segments)
+            mask = torch.arange(k.size(2))[None, :] <= torch.arange(q.size(2))[:, None] + past_len
+            p = torch.exp(q @ k.transpose(-1, -2) / 8 - lse[..., None]).masked_fill(~mask, 0)
+            ds = p * (dout @ v.transpose(-1, -2) - (dout * out).sum(-1, keepdim=True))
+            return ds @ k / 8, ds.transpose(-1, -2) @ q / 8, p.transpose(-1, -2) @ dout
+
+        extension = Mock(attention_forward=Mock(side_effect=forward),
+                         attention_backward=Mock(side_effect=backward))
+        torch.manual_seed(42)
+        bases = [torch.randn(2, 2, t, 128, dtype=torch.float64, requires_grad=True)
+                 for t in (5, 7, 7)]
+        expected_bases = [x.detach().clone().requires_grad_() for x in bases]
+        with patch.object(student, 'load_attention_extension', return_value=extension):
+            actual, expected = [], []
+            for tk in (7, 6):
+                q, k, v = (x[..., ::2] for x in bases)
+                rq, rk, rv = (x[..., ::2] for x in expected_bases)
+                actual.append(student._Attention.apply(q, k[:, :, :tk], v[:, :, :tk], tk - 5, None))
+                expected.append(reference.attention(rq, rk[:, :, :tk], rv[:, :, :tk], tk - 5))
+            saved = [value.grad_fn.saved_tensors for value in actual]
+            self.assertNotEqual(saved[0][4].data_ptr(), saved[1][4].data_ptr())
+            for index in (1, 0):
+                if index:
+                    actual[index].sum().backward()
+                    expected[index].sum().backward()
+                else:
+                    upstream = torch.randn(2, 2, 5, 128, dtype=torch.float64)[..., ::2]
+                    actual[index].backward(upstream)
+                    expected[index].backward(upstream)
+                args = extension.attention_backward.call_args.args
+                # Saved outputs can be unpacked into a new Python Tensor object.
+                self.assertEqual(args[4].data_ptr(), saved[index][3].data_ptr())
+                self.assertIs(args[5], saved[index][4])
+                self.assertEqual(args[6], (2, 1)[index])
+            for x, expected_x in zip(bases, expected_bases):
+                torch.testing.assert_close(x.grad, expected_x.grad)
+            self.assertEqual(extension.attention_forward.call_count, 2)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), 'requires CUDA and nvcc')
@@ -390,6 +446,156 @@ class StudentAttentionCudaTests(unittest.TestCase):
                 kv = seed.expand(1, 1, tk, 64)
                 with self.assertRaisesRegex(RuntimeError, 'sequence lengths must fit int32'):
                     self.extension.attention_forward(q, kv, kv, tk - tq)
+
+    def check_bf16_backward(self, inputs, *, upstream=None):
+        q, k, v = [x.detach().requires_grad_() for x in inputs]
+        past_len = k.size(2) - q.size(2)
+        originals = [x.detach().clone() for x in (q, k, v)]
+        actual = student.attention(q, k, v, past_len)
+        saved = actual.grad_fn.saved_tensors
+        self.assertEqual(saved[4].dtype, torch.float32)
+        expected_inputs = [x.detach().double().requires_grad_() for x in (q, k, v)]
+        expected = reference.attention(*expected_inputs, past_len=past_len)
+        if upstream is None:
+            upstream = (torch.randn(*q.shape[:-1], 128, device='cuda') * 0.25).bfloat16()[..., ::2]
+        actual_grads = torch.autograd.grad(actual, (q, k, v), upstream)
+        expected_grads = torch.autograd.grad(expected, expected_inputs, upstream.double())
+        torch.testing.assert_close(actual.double(), expected, atol=2e-2, rtol=3e-2)
+        for gradient, expected_gradient, original in zip(actual_grads, expected_grads, originals):
+            self.assertEqual(gradient.shape, original.shape)
+            self.assertEqual(gradient.dtype, torch.bfloat16)
+            self.assertTrue(gradient.is_contiguous())
+            self.assertTrue(torch.isfinite(gradient).all().item())
+            torch.testing.assert_close(gradient.double(), expected_gradient, atol=1e-2, rtol=3e-2)
+        for x, original in zip((q, k, v), originals):
+            torch.testing.assert_close(x, original, atol=0, rtol=0)
+        return actual_grads
+
+    def test_bf16_backward_tiles_tails_and_cached_queries(self):
+        self.require_bf16()
+        for tq, tk in ((1, 1), (63, 63), (64, 64), (65, 65), (129, 129),
+                       (1, 257), (17, 64), (64, 129), (65, 193), (257, 321)):
+            with self.subTest(tq=tq, tk=tk):
+                inputs = [torch.randn(2, 3, t, 64, device='cuda', dtype=torch.bfloat16)
+                          for t in (tq, tk, tk)]
+                self.check_bf16_backward(inputs)
+
+    def test_bf16_backward_strides_offsets_and_expanded_upstream(self):
+        self.require_bf16()
+        for layout in ('unaligned', 'feature_stride', 'cache_prefix', 'expanded'):
+            with self.subTest(layout=layout):
+                if layout == 'unaligned':
+                    inputs = [torch.randn(2 * 3 * t * 64 + 1, device='cuda', dtype=torch.bfloat16)[1:]
+                              .view(2, 3, t, 64) for t in (65, 129, 129)]
+                elif layout == 'feature_stride':
+                    inputs = [torch.randn(2, 3, t, 128, device='cuda', dtype=torch.bfloat16)[..., ::2]
+                              for t in (65, 129, 129)]
+                elif layout == 'cache_prefix':
+                    inputs = [torch.randn(2, 3, t + 64, 64, device='cuda', dtype=torch.bfloat16)[:, :, :t]
+                              for t in (65, 129, 129)]
+                else:
+                    inputs = [torch.randn(1, 1, t, 64, device='cuda', dtype=torch.bfloat16).expand(2, 3, -1, -1)
+                              for t in (65, 129, 129)]
+                # Like backward of sum(): broadcast gradient with zero strides.
+                upstream = torch.full((), 0.125, device='cuda', dtype=torch.bfloat16).expand_as(inputs[0])
+                self.check_bf16_backward(inputs, upstream=upstream)
+
+    def test_bf16_backward_shared_qkv_base_and_partial_requires_grad(self):
+        self.require_bf16()
+        base = torch.randn(2, 65, 3, 2, 64, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+        expected_base = base.detach().double().requires_grad_()
+        inputs = [x.transpose(1, 2) for x in base.unbind(2)]
+        expected_inputs = [x.transpose(1, 2) for x in expected_base.unbind(2)]
+        actual = student.attention(*inputs)
+        expected = reference.attention(*expected_inputs)
+        upstream = (torch.randn_like(actual.float()) * 0.25).bfloat16()
+        actual.backward(upstream)
+        expected.backward(upstream.double())
+        torch.testing.assert_close(base.grad.double(), expected_base.grad, atol=1e-2, rtol=3e-2)
+        for index in range(3):
+            leaves = [x.detach().requires_grad_(i == index) for i, x in enumerate(inputs)]
+            student.attention(*leaves).backward(torch.zeros_like(upstream))
+            for i, x in enumerate(leaves):
+                if i == index:
+                    self.assertEqual(torch.count_nonzero(x.grad).item(), 0)
+                else:
+                    self.assertIsNone(x.grad)
+
+    def test_bf16_backward_on_current_stream(self):
+        self.require_bf16()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(10_000_000)
+            inputs = [torch.randn(2 * 3 * t * 64 + 1, device='cuda', dtype=torch.bfloat16)[1:]
+                      .view(2, 3, t, 64) for t in (129, 193, 193)]
+            upstream = torch.zeros_like(inputs[0])
+            upstream[:, :, 64:].normal_(std=0.25)
+            self.check_bf16_backward(inputs, upstream=upstream)
+        stream.synchronize()
+
+    @torch.no_grad()
+    def test_bf16_native_backward_strided_saved_state(self):
+        self.require_bf16()
+        q, k, v = [torch.randn(2, 3, t, 64, device='cuda', dtype=torch.bfloat16)
+                   for t in (65, 129, 129)]
+        out, lse = self.extension.attention_forward(q, k, v, 64)
+        dout = torch.randn(out.numel() + 1, device='cuda', dtype=torch.bfloat16)[1:].view_as(out)
+        # The public bridge normally saves contiguous O/LSE, but native callers
+        # may provide views. Exercise both copying and storage-offset alignment.
+        saved_out = torch.empty(*out.shape[:-1], 128, device='cuda', dtype=out.dtype)[..., ::2]
+        saved_out.copy_(out)
+        saved_lse = torch.empty(2, 3, 130, device='cuda')[:, :, ::2]
+        saved_lse.copy_(lse)
+        actual = self.extension.attention_backward(q, k, v, dout, saved_out, saved_lse, 64)
+        expected = self.extension.attention_backward(q, k, v, dout.contiguous(), out, lse, 64)
+        for left, right in zip(actual, expected):
+            torch.testing.assert_close(left, right, atol=0, rtol=0)
+
+    @torch.no_grad()
+    def test_bf16_native_backward_validation(self):
+        self.require_bf16()
+        q, k, v = [torch.randn(2, 3, 7, 64, device='cuda', dtype=torch.bfloat16) for _ in range(3)]
+        out, lse = self.extension.attention_forward(q, k, v)
+        dout = torch.randn_like(out)
+        valid = [q, k, v, dout, out, lse]
+        cases = [
+            (0, q.cpu(), 'CUDA'),
+            (2, v[:, :, :6], 'sequence length'),
+            (3, dout.cpu(), 'same device'),
+            (4, out.cpu(), 'same device'),
+            (5, lse.cpu(), 'same device'),
+            (3, dout.float(), 'same dtype'),
+            (4, out.float(), 'same dtype'),
+            (3, dout[:, :, :6], 'same shape'),
+            (4, out[..., :32], 'same shape'),
+            (5, lse.bfloat16(), 'float32'),
+            (5, lse[..., None], 'shape'),
+            (5, lse[:, :, :6], 'shape'),
+            (3, dout.to_sparse(), 'strided'),
+        ]
+        for index, replacement, message in cases:
+            args = valid.copy()
+            args[index] = replacement
+            with self.subTest(index=index, message=message), self.assertRaisesRegex(RuntimeError, message):
+                self.extension.attention_backward(*args)
+        ids = torch.zeros(2, 7, device='cuda', dtype=torch.long)
+        with self.assertRaisesRegex(RuntimeError, 'segment_ids is not supported'):
+            self.extension.attention_backward(*valid, 0, ids)
+        with self.assertRaisesRegex(RuntimeError, 'only bf16'):
+            self.extension.attention_backward(q.float(), k.float(), v.float(), dout.float(), out.float(), lse)
+        for past_len in (-1, 1):
+            with self.assertRaisesRegex(RuntimeError, 'past_len'):
+                self.extension.attention_backward(*valid, past_len)
+        # Validate before copying enormous zero-stride views or allocating outputs.
+        seed = q[:1, :1, :1]
+        for shape, message in (((1, 1, 2**31, 64), 'int32'),
+                               ((65536, 1, 1, 64), 'grid limits'),
+                               ((1, 65536, 1, 64), 'grid limits')):
+            big = seed.expand(shape)
+            big_lse = lse[:1, :1, :1].expand(shape[:3])
+            with self.subTest(shape=shape), self.assertRaisesRegex(RuntimeError, message):
+                self.extension.attention_backward(big, big, big, big, big, big_lse)
 
     def test_prefill_tiles_and_sequence_tails(self):
         for time in (1, 7, 31, 32, 33, 65, 96):

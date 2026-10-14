@@ -1,6 +1,6 @@
 # 离线服务器使用指南
 
-本机负责下载原文、训练 8K BPE、编码 train/val token 文件；服务器直接使用离线包中的数据。
+联网环境负责下载原文、训练 8K BPE、编码 train/val token 文件；服务器直接使用离线包中的数据。
 数据源为 `roneneldan/TinyStories`，固定 revision：
 `f54c09fd23315a6f9c86f9dc80f725de7d8f9c64`。
 选取前 100,000 条 train 与前 2,000 条 validation，空文本过滤后数量以 `metadata.json` 为准。
@@ -102,7 +102,7 @@ python3 -m tiny_transformer.generate \
   --prompt "Once upon a time" --max-new-tokens 128
 ```
 
-## 5. 本机如何重建数据和离线包
+## 5. 重建数据和离线包
 
 本机准备环境为 `.venv-data`，不会修改系统 PyTorch。
 如网络需要代理，给命令设置本机实际的 `HTTPS_PROXY` / `HTTP_PROXY`，不要把代理配置带到离线服务器。

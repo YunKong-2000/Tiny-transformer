@@ -14,6 +14,9 @@
 #include "attention_forward_kernel.cuh"
 #include "attention_forward_BF16_kernel.cuh"
 #include "attention_decode_BF16_kernel.cuh"
+#include "attention_backward_preprocess_kernel.cuh"
+#include "attention_backward_dQ_kernel.cu"
+#include "attention_backward_dKdV_kernel.cu"
 
 namespace {
 torch::Tensor aligned_contiguous(torch::Tensor x) {
@@ -34,7 +37,8 @@ attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v,
   attention_detail::check_mask_inputs(q, k, v, past_len, segment_ids);
   TORCH_CHECK(!(at::GradMode::is_enabled() &&
                 (q.requires_grad() || k.requires_grad() || v.requires_grad())),
-              "student attention backward is not implemented; use no_grad for inference");
+              "student attention backward requires the Python autograd binding; "
+              "use student.attention or no_grad for inference");
   const int64_t B = q.size(0);
   const int64_t Nh = q.size(1);
   const int64_t Tq = q.size(2);
@@ -152,4 +156,79 @@ attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v,
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   return {o, lse};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+attention_backward(
+  torch::Tensor q, torch::Tensor k, torch::Tensor v,
+  torch::Tensor dO, torch::Tensor O, torch::Tensor lse,
+  int64_t past_len, std::optional<torch::Tensor> segment_ids) {
+  namespace pre = attention_backward_preprocess;
+  namespace dq = attention_backward_dQ;
+  namespace dkv = attention_backward_dKdV;
+  using Element = dq::Element;
+  static_assert(std::is_same_v<Element, pre::Element> &&
+                std::is_same_v<Element, dkv::Element>);
+  static_assert(sizeof(Element) == sizeof(at::BFloat16));
+
+  attention_detail::check_qkv(q, k, v);
+  attention_detail::check_mask_inputs(q, k, v, past_len, segment_ids);
+  TORCH_CHECK(q.scalar_type() == at::kBFloat16,
+              "student attention backward supports only bf16");
+  TORCH_CHECK(!segment_ids.has_value(),
+              "segment_ids is not supported for bf16 attention backward");
+  attention_detail::check_upstream_tensors(q, dO, O, lse);
+
+  const int64_t B = q.size(0), Nh = q.size(1), Tq = q.size(2), Tk = k.size(2);
+  TORCH_CHECK(Tk <= std::numeric_limits<int32_t>::max(),
+              "bf16 attention sequence lengths must fit int32 (Tk <= INT32_MAX)");
+  const c10::cuda::CUDAGuard device_guard(q.device());
+  const auto* props = at::cuda::getDeviceProperties(q.get_device());
+  TORCH_CHECK(props->major >= 8, "BF16 MMA/cp.async require SM80 or later");
+  const int64_t pre_tiles = (Tq - 1) / pre::BQ + 1;
+  const int64_t dq_tiles = (Tq - 1) / dq::BQ + 1;
+  const int64_t dkv_tiles = (Tk - 1) / dkv::BK + 1;
+  TORCH_CHECK(B <= props->maxGridSize[2] && Nh <= props->maxGridSize[1] &&
+              pre_tiles <= props->maxGridSize[0] &&
+              dq_tiles <= props->maxGridSize[0] && dkv_tiles <= props->maxGridSize[0],
+              "attention backward shape exceeds the supported CUDA grid limits");
+  auto stream = c10::cuda::getCurrentCUDAStream(q.get_device());
+
+  // Validate before materializing views. All copies and launches use q's
+  // current stream; stream ordering makes D visible without a host synchronize.
+  q = aligned_contiguous(q);
+  k = aligned_contiguous(k);
+  v = aligned_contiguous(v);
+  dO = aligned_contiguous(dO);
+  O = aligned_contiguous(O);
+  lse = lse.contiguous();
+  auto D = torch::empty({B, Nh, Tq}, q.options().dtype(at::kFloat));
+  auto dQ = torch::empty(q.sizes(), q.options());
+  auto dK = torch::empty(k.sizes(), k.options());
+  auto dV = torch::empty(v.sizes(), v.options());
+  auto qp = reinterpret_cast<const Element*>(q.data_ptr<at::BFloat16>());
+  auto kp = reinterpret_cast<const Element*>(k.data_ptr<at::BFloat16>());
+  auto vp = reinterpret_cast<const Element*>(v.data_ptr<at::BFloat16>());
+  auto dop = reinterpret_cast<const Element*>(dO.data_ptr<at::BFloat16>());
+  auto op = reinterpret_cast<const Element*>(O.data_ptr<at::BFloat16>());
+
+  dim3 pre_grid(static_cast<unsigned>(pre_tiles), static_cast<unsigned>(Nh), static_cast<unsigned>(B));
+  pre::kernel<<<pre_grid, pre::THREADS, 0, stream>>>(B, Nh, Tq, dop, op, D.data_ptr<float>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  dim3 dq_grid(static_cast<unsigned>(dq_tiles), static_cast<unsigned>(Nh), static_cast<unsigned>(B));
+  dq::kernel<<<dq_grid, dq::THREADS, 0, stream>>>(
+      int(B), int(Nh), int(Tq), int(Tk), int(past_len), qp, kp, vp, dop,
+      D.data_ptr<float>(), lse.data_ptr<float>(),
+      reinterpret_cast<Element*>(dQ.data_ptr<at::BFloat16>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  dim3 dkv_grid(static_cast<unsigned>(dkv_tiles), static_cast<unsigned>(Nh), static_cast<unsigned>(B));
+  dkv::kernel<<<dkv_grid, dkv::THREADS, 0, stream>>>(
+      int(B), int(Nh), int(Tq), int(Tk), int(past_len), qp, kp, vp, dop,
+      D.data_ptr<float>(), lse.data_ptr<float>(),
+      reinterpret_cast<Element*>(dK.data_ptr<at::BFloat16>()),
+      reinterpret_cast<Element*>(dV.data_ptr<at::BFloat16>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {dQ, dK, dV};
 }

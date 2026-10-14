@@ -14,7 +14,7 @@ linear decode contiguous   backward: reference=147.46 us, student=237.52 us, spe
 saved runs/linear-performance.json
 可见对于prefill场景性能出现下降，对于decode场景，性能大幅下降，需要进一步优化device gemm的模版参数设置。后续还需开发混合精度训练支持BF16乘法。  
 10.4全形状测试:  
-root@8cfa9e1a2f81:/workspace/tiny-transformer# python -m tiny_transformer.benchmarks --operator linear --output runs/linear-performance.json --device cuda:1
+python -m tiny_transformer.benchmarks --operator linear --output runs/linear-performance.json --device cuda:1
 linear train qkv contiguous forward M,N,K=[4096, 2304, 768]: reference=821.21 us, student=894.86 us, speedup=0.92x
 linear train qkv contiguous backward dX=[4096, 768, 2304], dW=[2304, 768, 4096]: reference=1716.45 us, student=2226.95 us, speedup=0.77x
 linear train o contiguous forward M,N,K=[4096, 768, 768]: reference=293.11 us, student=301.79 us, speedup=0.97x
@@ -39,7 +39,7 @@ saved runs/linear-performance.json
 
 ## 增加适用于推理场景小M问题规模kernel
 增加了适用于小M场景下的kernel配置，设定CTAShape为<8, 64, 8>
-root@8cfa9e1a2f81:/workspace/tiny-transformer# python -m tiny_transformer.benchmarks --operator linear --output runs/linear-performance.json --device cuda:1
+python -m tiny_transformer.benchmarks --operator linear --output runs/linear-performance.json --device cuda:1
 linear train qkv contiguous forward M,N,K=[4096, 2304, 768]: reference=810.53 us, student=885.53 us, speedup=0.92x
 linear train qkv contiguous backward dX=[4096, 768, 2304], dW=[2304, 768, 4096]: reference=1698.26 us, student=2222.49 us, speedup=0.76x
 linear train o contiguous forward M,N,K=[4096, 768, 768]: reference=292.84 us, student=299.93 us, speedup=0.98x
@@ -64,7 +64,7 @@ saved runs/linear-performance.json
 测试结果显示，对于小M场景的矩阵乘法的性能下降程度明显缓解，但是还是较差。
 ## 修改了small-M kernle的CTAShape和WarpShape，减小tile_N来增加CTA数量，增加tile_K减小循环次数
 设定CTAShape为<8, 32, 16>，WarpShape为<8, 16, 16>,测试结果如下  
-root@8cfa9e1a2f81:/workspace/tiny-transformer# python -m tiny_transformer.benchmarks --operator linear --output runs/linear-performance-CTA8-32-16.json --device cuda:1
+python -m tiny_transformer.benchmarks --operator linear --output runs/linear-performance-CTA8-32-16.json --device cuda:1
 linear train qkv contiguous forward M,N,K=[4096, 2304, 768]: reference=809.52 us, student=887.48 us, speedup=0.91x
 linear train qkv contiguous backward dX=[4096, 768, 2304], dW=[2304, 768, 4096]: reference=1688.90 us, student=2221.29 us, speedup=0.76x
 linear train o contiguous forward M,N,K=[4096, 768, 768]: reference=292.58 us, student=299.95 us, speedup=0.98x
@@ -90,7 +90,7 @@ saved runs/linear-performance-CTA8-32-16.json
 
 ## 实现split-K
 增加一个split-k kernel,使得推理阶段的down走split-k路径，每两个cta处理一整行，测试结果  
-root@8cfa9e1a2f81:/workspace/tiny-transformer# python -m tiny_transformer.benchmarks --operator linear --device cuda:1 --output runs/linear-kernel-performance.json
+python -m tiny_transformer.benchmarks --operator linear --device cuda:1 --output runs/linear-kernel-performance.json
 
 linear train qkv contiguous forward M,N,K=[4096, 2304, 768]: reference=811.44 us, student=892.00 us, speedup=0.91x, reference=17.8638 TFLOP/s, student=16.2506 TFLOP/s
 linear train qkv contiguous dx M,N,K=[4096, 768, 2304]: reference=925.90 us, student=1068.20 us, speedup=0.87x, reference=15.6556 TFLOP/s, student=13.5701 TFLOP/s
@@ -136,7 +136,7 @@ linear decode lm_head contiguous forward M,N,K=[8, 8192, 768]: reference=28.82 u
 saved runs/linear-kernel-performance.json
 
 ## 增加split-k slices到8
-root@8cfa9e1a2f81:/workspace/tiny-transformer# python -m tiny_transformer.benchmarks --operator linear --device cuda:1 --output runs/linear-kernel-performance.json
+python -m tiny_transformer.benchmarks --operator linear --device cuda:1 --output runs/linear-kernel-performance.json
 linear train qkv contiguous forward M,N,K=[4096, 2304, 768]: reference=829.36 us, student=901.49 us, speedup=0.92x, reference=17.4780 TFLOP/s, student=16.0795 TFLOP/s
 linear train qkv contiguous dx M,N,K=[4096, 768, 2304]: reference=948.55 us, student=1082.53 us, speedup=0.88x, reference=15.2817 TFLOP/s, student=13.3904 TFLOP/s
 linear train qkv contiguous dweight M,N,K=[2304, 768, 4096]: reference=773.55 us, student=1173.72 us, speedup=0.66x, reference=18.7389 TFLOP/s, student=12.3501 TFLOP/s
@@ -167,7 +167,7 @@ linear decode lm_head contiguous forward M,N,K=[8, 8192, 768]: reference=29.01 u
 saved runs/linear-kernel-performance.json
 
 ## 所有decode的阶段都使用split-k进行优化
-root@8cfa9e1a2f81:/workspace/tiny-transformer# python -m tiny_transformer.benchmarks --operator linear --device cuda:1 --output runs/linear-kernel-performance.json
+python -m tiny_transformer.benchmarks --operator linear --device cuda:1 --output runs/linear-kernel-performance.json
 linear train qkv contiguous forward M,N,K=[4096, 2304, 768]: reference=808.09 us, student=886.76 us, speedup=0.91x, reference=17.9380 TFLOP/s, student=16.3465 TFLOP/s
 linear train qkv contiguous dx M,N,K=[4096, 768, 2304]: reference=927.91 us, student=1066.94 us, speedup=0.87x, reference=15.6217 TFLOP/s, student=13.5861 TFLOP/s
 linear train qkv contiguous dweight M,N,K=[2304, 768, 4096]: reference=766.48 us, student=1163.65 us, speedup=0.66x, reference=18.9117 TFLOP/s, student=12.4569 TFLOP/s

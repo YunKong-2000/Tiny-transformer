@@ -19,7 +19,7 @@ from .embedding import PATTERNS
 # Explicit implementation status, not a fallback. Update as student kernels land.
 STUDENT_PHASES = {name: ("forward", "backward")
                   for name in ("embedding", "linear", "rms_norm", "residual", "cross_entropy", "rope", "swiglu")}
-STUDENT_PHASES["attention"] = ("forward",)
+STUDENT_PHASES["attention"] = ("forward", "backward")
 
 ATTENTION_GRAPH_MEASUREMENT = {
     "timer": "CUDA events around graph replay; median of per-trial mean call times",
@@ -41,6 +41,8 @@ def unsupported_reason(operator, backend, precision, phase, layout, dim=None, he
             return f"student {operator} {phase} is not implemented"
         if operator == "attention" and precision not in ("fp32", "bf16"):
             return "student attention currently supports only fp32 and bf16"
+        if operator == "attention" and phase == "backward" and precision != "bf16":
+            return "student attention FP32 backward is not implemented; backward requires bf16"
         if precision != "fp32" and operator not in ("residual", "cross_entropy", "attention"):
             return f"student {operator} currently supports only fp32"
         if operator == "rms_norm" and phase == "backward" and dim is not None and dim > 1024:

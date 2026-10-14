@@ -6,7 +6,7 @@ Cross entropy supports FP32/FP16/BF16 logits, ignored labels and first-order aut
 RoPE supports strided CUDA FP32 inputs and first-order gradients with constant cos/sin.
 SwiGLU supports strided CUDA FP32 gate/up inputs and first-order gradients.
 Linear supports CUDA FP32 inputs and first-order gradients, with explicit view copies; no AMP.
-Attention supports CUDA FP32 forward with head_dim=64; no backward or AMP.
+Attention supports CUDA FP32/BF16 forward and BF16 first-order backward, head_dim=64; no AMP.
 There is no silent reference fallback.
 Match reference.py semantics, device, shape, dtype, strides and gradients.
 Use --op NAME=student to enable only a completed operator.
@@ -187,20 +187,47 @@ def rope(x, cos, sin):
     return load_rope_extension().rope_forward(x, cos, sin)
 
 
+class _Attention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, past_len, segment_ids):
+        # The native forward normalizes strides/alignment. Save the original
+        # views so PyTorch checks their versions and maps gradients to their bases.
+        output, lse = load_attention_extension().attention_forward(q, k, v, past_len, segment_ids)
+        ctx.save_for_backward(q, k, v, output, lse)
+        ctx.past_len = past_len
+        # BF16 forward rejects segment_ids; no tensor metadata is kept outside
+        # save_for_backward and the backward always uses the same causal mask.
+        return output
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        q, k, v, output, lse = ctx.saved_tensors
+        dq, dk, dv = load_attention_extension().attention_backward(
+            q, k, v, grad_output, output, lse, ctx.past_len, None
+        )
+        return (dq if ctx.needs_input_grad[0] else None,
+                dk if ctx.needs_input_grad[1] else None,
+                dv if ctx.needs_input_grad[2] else None, None, None)
+
+
 def attention(q, k, v, past_len=0, segment_ids=None):
     """FP32/BF16 CUDA causal attention forward, head_dim=64.
 
     FP32 supports segments and reads V using its strides. BF16 requires SM80+,
     rejects segments, and copies Q/K/V as needed for contiguous, aligned storage.
     LSE stays FP32 internally; the public operator returns O in the input dtype.
-    Backward and autocast are not implemented.
+    BF16 supports first-order backward, including strided upstream gradients.
+    FP32 backward and autocast are not implemented.
     """
     if not all(x.is_cuda for x in (q, k, v)):
         raise RuntimeError("student attention requires q, k, v to be CUDA tensors")
     if torch.is_autocast_enabled("cuda"):
         raise RuntimeError("student attention does not support AMP/autocast yet")
     if torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v)):
-        raise NotImplementedError("student attention backward is not implemented")
+        if any(x.dtype != torch.bfloat16 for x in (q, k, v)):
+            raise NotImplementedError("student attention backward supports only bf16; FP32 backward is not implemented")
+        return _Attention.apply(q, k, v, past_len, segment_ids)
     output, _ = load_attention_extension().attention_forward(q, k, v, past_len, segment_ids)
     return output
 

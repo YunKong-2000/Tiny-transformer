@@ -2,7 +2,7 @@
 
 [返回算子总契约](README.md) · [参考实现](../../tiny_transformer/operators/reference.py) · [调用位置](../../tiny_transformer/model.py)
 
-当前 student 已接入 **FP32 SIMT / BF16 Tensor Core 前向、固定 head_dim=64**。
+当前 student 已接入 **FP32 SIMT / BF16 Tensor Core 前向及 BF16 一阶反向，固定 head_dim=64**。
 两条路径支持序列尾块、cache/chunk 和非连续输入；FP32 支持 segment IDs，V 使用实际 stride。
 BF16 要求 SM80+，拒绝 segment IDs；原生入口连续化 Q/K/V，并保证 16-byte 对齐。
 Q/K/V 必须同 dtype，O 保持输入 dtype，内部 LSE 为 FP32。
@@ -11,12 +11,13 @@ BF16 的序列长度要求 `Tk <= INT32_MAX`；kernel 使用 int32 序列索引�
 BF16 通用路径将 Q 整块保存在 shared memory、P 保存在寄存器，当前实验配置的 K/V 为
 `(64,64)` 完整 tile，两个 slot 分别用于 K/V，共 24 KiB/CTA；`Tq=1,Tk<=4096` 使用专用
 SIMT split-KV decode，分块 softmax 在 FP32 中合并；更长序列使用通用 Tensor Core 路径。
-反向、AMP/autocast 和 FP16 尚未实现。GPU 编译、数值与竞态仍须在 CUDA 环境验收，命令见
+BF16 反向支持无 segment IDs 的 causal prefill、decode/chunk 和非连续输入。
+FP32 反向、AMP/autocast 和 FP16 尚未实现。GPU 编译、数值与竞态仍须在 CUDA 环境验收，命令见
 [实现记录](../../csrc/attention/development.md)；本地 CPU 测试不代表 CUDA 验证通过。
 
 ## 1. 接口与职责
 
-```python
+```text
 from typing import Optional
 
 attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -114,7 +115,7 @@ $$
 不能将 head stride 写死成 $T_kD_h$。例如小模型 $B=2,N_h=4,C=16,D_h=16$：
 cache 前缀 shape 为 $[2,4,6,16]$，stride 为 $(1024,256,16,1)$；
 如果错误使用逻辑长度 6 计算 head stride，就会跨到错误位置甚至读取未初始化容量。
-capacity 不作为独立参数传入，你通过 tensor stride 读取真实地址，只遍历有效 $T_k$。
+capacity 不作为独立参数传入，通过 tensor stride 读取真实地址，只遍历有效 $T_k$。
 
 输入 q/k/v 只读；禁止读有效前缀之外的数据。输出可为连续张量，后续 transpose/reshape 由框架处理。
 
@@ -136,17 +137,37 @@ backward 返回 `dq, dk, dv, None, None`，各梯度的 shape/dtype 对应原输
 直接算子测试仍可单独验证非方形张量的梯度。
 高效反向可以保存归一化统计量并重算概率，不需要强制保存完整 $T^2$ 矩阵。
 
-## 8. 分阶段验收
+当前 BF16 调用链为 `student.attention → _Attention.apply`。前向保存原始 Q/K/V 视图、O、
+FP32 自然对数 LSE 和 `past_len`；反向经 pybind `attention_backward(q,k,v,dO,O,lse,past_len,segment_ids)`
+进入 C++ wrapper，在输入设备的当前 CUDA stream 上顺序调用：
 
-第一阶段可只做 continuous、固定 $D_h=64$ 的 forward；随后补 decode、chunk mask、cache stride、
-隔离文档和训练 backward。是否支持每条路径要在启用 student 前明确检查。
+1. preprocess：计算 FP32 `D = sum(dO * O, dim=-1)`，每 CTA 处理 8 行。
+2. dQ：每 CTA 固定 64 行 query，遍历 K/V tiles，输出 BF16 dQ。
+3. dK/dV：每 CTA 固定 64 行 key，遍历 Q/dO tiles，输出 BF16 dK、dV。
+
+wrapper 在复制前校验 dtype、设备、shape、mask、int32 序列长度及 grid 上限。
+Q/K/V/dO/O 按需连续化并保证 16-byte 对齐，LSE 连续化；三个输出独立分配且连续。
+kernel 间依赖由 stream 顺序保证，不做设备同步；Python 返回与各输入对应的梯度，
+由 autograd 将视图梯度累加回原存储。不支持二阶梯度；无梯度路径直接调用原生前向。
+原生前向在启用 grad 且输入需要梯度时拒绝调用，避免绕过 Python autograd 接口。
+
+完整前后向及 wrapper 验收：
 
 ```bash
-python -m tiny_transformer.check_ops --operator attention --backend student \
-  --device cuda --precision bf16 --backward --output runs/attention-bf16.json
+TORCH_CUDA_ARCH_LIST=8.0 python -m unittest discover -s tests -p 'test_student_attention.py' -v
+compute-sanitizer --tool memcheck --error-exitcode 1 python -m unittest discover -s tests -p 'test_student_attention.py'
+compute-sanitizer --tool racecheck --error-exitcode 1 python -m unittest discover -s tests -p 'test_student_attention.py'
 ```
 
-开发工具没有覆盖真实缓存 stride、isolated segments 和全部 chunk 情况，需要补充：
+## 8. 分阶段验收
+
+当前支持固定 $D_h=64$ 的 FP32/BF16 前向及 BF16 一阶反向。验证覆盖 prefill、decode、chunk mask 和 cache stride；隔离文档仅限 FP32 前向。
+
+```bash
+python -m unittest discover -s tests -p 'test_student_attention.py' -v
+```
+
+通用 `check_ops` 的小形状不适用于固定 D=64 的自定义 Attention；使用上述专属测试覆盖：
 改变未来 token 不影响过去输出；改变前一文档不影响后一文档；prefill+decode 与完整前向一致；
 cache capacity 大于有效长度；batch 大于 1；前后向各自的误差与性能。
 SDPA 是独立的可用后端。`attention=student` 中的优化不能仅凭调用名宣称已使用 FlashAttention。

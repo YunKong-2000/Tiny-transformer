@@ -1,101 +1,50 @@
-# 学生 CUDA / CuTe / CUTLASS 源码目录
+# CUDA / CuTe / CUTLASS 算子实现
 
-Attention 位于 `attention/`：CuTe FP32 SIMT 融合前向，固定 head_dim=64，支持
-causal prefill/decode/chunk、序列尾块、跨步输入和可选 segment IDs。
-`load_attention_extension()` 延迟编译，原生返回 O/LSE，Python 只返回 O。
-反向和 AMP 尚未实现；测试及 CUDA 验收限制见 [Attention 实现记录](attention/development.md)。
+每个算子目录包含 CUDA 源码、头文件和独立 `bindings.cpp`。PyTorch 入口位于 [student.py](../tiny_transformer/operators/student.py)，通过 [_extension.py](../tiny_transformer/operators/_extension.py) 延迟编译，在 `torch.autograd.Function` 中连接一阶反向。
 
-Linear 位于 `linear/`：CUTLASS FP32 SIMT 的前向、dX 和 dW，使用当前 CUDA stream。
-通过独立的 `bindings.cpp` 和 `load_linear_extension()` 延迟编译；Python wrapper 复制跨步输入、
-恢复前导维度并接入一阶 autograd。当前不支持 BF16/FP16、autocast 或 compile 自定义算子注册。
-测试与 GPU 验收命令见 [Linear 文档](../docs/operators/linear.md)。
+## 模块
 
-Linear 另提供仅用于测量的 `prepare_linear_benchmark()`：预分配并保有 tensor/workspace，
-初始化与生产路径相同的 GEMM，暴露 forward、dx、dweight 和 split-K 两阶段。
-Python 性能入口用 CUDA Graph 捕获固定指针调用，计时期间不做分配、初始化或 autograd。
-该接口不改变训练模型调用，也不等于支持模型 `torch.compile`；计时口径见性能文档。
+| 目录 | 实现 | 主要约束 |
+| --- | --- | --- |
+| `embedding/` | warp 查表；baseline / grouped 原子累加反向 | FP32 权重、连续 int64 IDs；不支持二阶梯度 |
+| `linear/` | CUTLASS FP32 SIMT 前向、dX、dW；小 M / Split-K | 不支持 BF16/FP16/autocast；wrapper 处理非连续输入 |
+| `rms_norm/` | warp 前向归约；缓存统计量的一阶反向 | FP32；反向 H≤1024 |
+| `rope/` | CuTe pair 布局与前反向模板 | FP32；支持 stride；cos/sin 不求梯度 |
+| `attention/` | FP32 SIMT / BF16 Tensor Core 前向；BF16 preprocess/dQ/dK/dV | D=64；BF16 SM80+；无 autocast、二阶梯度 |
+| `swiglu/` | gate/up 融合与双输入梯度 | FP32；支持 chunk view 和非连续上游梯度 |
+| `residual/` | FP32 向量/标量加法及双路梯度 | wrapper 提供低精度转换、dtype promotion |
+| `cross_entropy/` | 逐行稳定归一化、LSE 缓存和反向 | FP32 kernel；wrapper 支持低精度 logits、ignore_index |
+| `cutlass_smoke/` | CUTLASS/CuTe 编译与运行检查 | 依赖完整子模块及 CUDA 工具链 |
 
-当前包含 embedding 的 FP32 CUDA 前向与一阶反向。前向每个 warp 搬运一个 ID 对应的行，
-256 线程的 block 同时处理 8 个 ID；按地址与行宽对齐选择 float4 或标量 kernel。
-反向每个 warp 对最多 32 个位置按 ID 分组，合并组内梯度后原子累加到全零梯度表。
-另提供一 warp 一 token 的 baseline 反向，共用输入检查、清零和 stream 管理。
-另包含 RMSNorm 的 FP32 CUDA 前向，每个 warp 对一行归约；Python 入口显式复制非连续输入，
-支持 `[..., H]` 与 `[H]`，前向返回 Y 和每行的 R。共享内存反向支持 H <= 1024，
-通过 autograd 缓存 R；dGamma 使用原子加，尚不支持低精度输入或二阶梯度。
-另包含 residual 的 FP32 前向和反向，使用 float4 或标量 grid-stride kernel。
-Python wrapper 显式复制非连续输入、转换 FP16/BF16 并保留 dtype promotion 和两路梯度。
-另包含 cross_entropy 的 FP32 逐行前向与反向；wrapper 转换低精度输入，并对非 `-100`
-标签求平均。反向消费分拆的 LSE 缓存和已包含平均/外部缩放的 CUDA 零维梯度 Tensor，
-kernel 内广播该标量，不物化逐行梯度，也不读回主机。
-详见 [cross entropy 接入与测试](../docs/operators/cross_entropy.md#8-当前-student-实现与调用链)。
-RoPE 使用 CuTe `(head,pair)` 线程分区，每个 CTA 4 个 warp，支持 FP32 前向与一阶反向；
-直接读取 Q/K、系数与上游梯度的实际 stride，支持共享或逐样本位置系数。
-Python autograd 保存 cos/sin，并通过独立 `load_rope_extension()` 连接原生前后向。
-支持范围、线程映射及测试见 [RoPE 接入说明](../docs/operators/rope.md#7-当前-student-实现与-pytorch-接入)。
-其他算子尚未实现；CUDA 编译、数值及性能需在目标 GPU 上验收。
+BF16 Attention 反向按当前 stream 执行 preprocess → dQ → dK/dV，保存前向 Q/K/V/O/LSE。已具备完整接口与测试用例，GPU 验收记录范围见 [验证说明](../docs/validation.md)。
 
-RMSNorm 使用独立的 `rms_norm/bindings.cpp` 和 `load_rms_norm_extension()`，
-只编译本算子的绑定与 CUDA 源码，避免与 embedding 互相产生未定义符号。
-逐步接入说明、代码检查结果与测试命令见 [RMSNorm 文档](../docs/operators/rms_norm.md#7-前向缓存与-pytorch-调用链)。
-Residual 同样通过 `residual/bindings.cpp` 和 `load_residual_extension()` 独立延迟编译；
-native backward 仅接收 `dY`，不保存前向激活。支持范围与测试见 [residual 文档](../docs/operators/residual.md#7-当前-student-实现与调用链)。
+## 构建与调用
 
-调用链：`student.embedding` → `operators/_extension.py` 的延迟 JIT 加载 →
-`bindings.cpp::embedding_forward` → `embedding_forward_cuda` → CUDA kernel。
-训练时由 `student._Embedding.apply` 建立 autograd 节点，保存 ids、V 和 backward_impl；执行
-`loss.backward()` 时进入 `_Embedding.backward`，再经 `bindings.cpp::embedding_backward`
-调用 `embedding_backward_cuda` 和选定的反向 kernel，返回 `(None, dweight, None)` 给 autograd。
-pybind 绑定只暴露函数，forward/backward 的关联由 Python `torch.autograd.Function` 建立。
-逐步说明见 [embedding 开发文档](../docs/operators/embedding.md#54-从绑定到-lossbackward-的调用链)。
-首次调用需要 CUDA 版 PyTorch、CUDA toolkit/nvcc、C++ 编译器和 Ninja；
-后续使用 PyTorch 的编译缓存。当前从源码 checkout 或 editable install 加载 `csrc`，
-不支持不含这些源码的普通 wheel。所有现有 JIT loader 已统一配置 CUTLASS/CuTe 头文件路径和 C++17，
-首次编译前需初始化 `third_party/cutlass`；详见 [CUTLASS / CuTe 接入说明](../third_party/README.md)。
-可运行 `python -m tiny_transformer.check_cutlass` 验证头文件、CUDA 编译及小 kernel 执行。
-
-在 A100 的 CUDA 开发环境中，从仓库根目录运行：
-
-```bash
-export TORCH_CUDA_ARCH_LIST=8.0
-export MAX_JOBS=2
-python -m tiny_transformer.check_ops --operator embedding --backend student \
-  --device cuda --precision fp32 --backward --output runs/embedding-fp32.json
-python -m unittest discover -s tests -p 'test_student_*.py' -v
-python -m tiny_transformer.benchmarks.embedding \
-  --device cuda --backward-impl all --patterns random same unique hot \
-  --output runs/embedding-performance.json
-python -m tiny_transformer.benchmarks.model --config configs/smoke.json \
-  --device cuda --precision fp32 --op embedding=student \
-  --prompt-length 16 --new-tokens 8 --output runs/embedding-inference.json
+```text
+Python public function
+  → torch.autograd.Function（需要梯度时）
+  → 单算子 JIT loader
+  → pybind / C++ 参数校验
+  → 当前 CUDA stream 上的 kernel
 ```
 
-测试会在有 CUDA 时真实编译扩展；没有 CUDA 时跳过 GPU 用例。
-`benchmarks.embedding` 通过统一框架测量四种 token 分布的前向与反向，并与 PyTorch 比较。
-全部八个算子共用 [benchmarks/](../tiny_transformer/benchmarks/README.md) 的测量方法；
-RMSNorm 性能入口为 `python -m tiny_transformer.benchmarks --operator rms_norm --phases forward backward`。
-`--backward-impl all` 同时测试 grouped/baseline；也可仅指定其中一个，默认 grouped。
-反向计时包含梯度表清零，不含前向；参数和结果含义见
-[embedding 性能测试说明](../docs/operators/embedding.md#7-前向与反向性能四种-token-分布)。
-模型缓存对照测试临时将 FP32 matmul precision 设为 `highest`，结束后恢复原设置，
-避免 TF32 下不同 GEMM 尺寸的数值差异干扰 FP32 验收。
-纯 reference 缓存与完整前向的一致性由 `test_model.py` 负责；五个学生算子的共同训练/推理
-放在 `test_student_integration.py`。各算子文件保留独有的数值与边界用例，职责见 [测试说明](../tests/README.md)。
-支持连续二维 int64 IDs、连续二维 FP32 weight，以及非零 storage offset；
-支持空 IDs，但 weight 的 V/H 必须为正。非连续输入显式报错。
-训练通过 `student.embedding` 使用一阶反向；直接调用原生前向不会建立 autograd 图，
-因此原生前向在梯度开启且 weight 需要梯度时拒绝直接调用。
-反向原生入口要求连续 FP32 `[B,T,H]` 梯度；Python wrapper 显式复制非连续上游梯度。
-尚不支持二阶梯度、BF16/FP16 weight 或 torch.compile 集成。
-AMP 下 FP32 weight/output/gradient 保持 FP32。
-浮点原子加存在非确定性，严格 deterministic 模式下非空 backward 明确报错。
+首次加载需要 CUDA 版 PyTorch、nvcc、C++ 编译器、Ninja，以及初始化后的 `third_party/cutlass`。扩展统一使用 C++17。A100 对应 `TORCH_CUDA_ARCH_LIST=8.0`。目前要求源码 checkout 或 editable install，普通 wheel 不保证包含 `csrc`。
 
-非法 ID 在 kernel 内通过设备断言报告，不做主机读回或设备同步。
-错误可能在后续同步时才被观察到，触发后须重启该 CUDA 进程；
-测试用独立子进程分别验证向量与标量路径的非法 ID。
+```bash
+python -m tiny_transformer.check_cutlass
+python -m unittest discover -s tests -p 'test_student_*.py' -v
+python -m tiny_transformer.benchmarks --operator embedding \
+  --backward-impl all --output runs/embedding-performance.json
+```
 
-使用 `torch.utils.cpp_extension.load` 做单算子迭代，再决定是否迁移为预编译扩展。
-将 CUTLASS 固定在一个明确的 commit，记录在实验元数据中；不要使用浮动 main 做最终报告。
-在 A100 上设置 `TORCH_CUDA_ARCH_LIST=8.0`。不要在 Python import 时自动下载依赖或编译全部算子。
+Python wrapper 负责必要的布局转换与 autograd 状态；native kernel 的输入契约不能通过直接调用 pybind 绕过。原子累加存在浮点非确定性，相关路径在严格 deterministic 模式下显式拒绝。
 
-工程契约、autograd、current stream、非连续张量和 CuTe 学习任务见
-[开发指南](../docs/development.md)。
+## 性能测试与实现记录
+
+Linear 提供 `prepare_linear_benchmark()`，预分配 tensor/workspace 并测量 forward、dX、dW 及 Split-K 两阶段；它不是模型 `torch.compile` 注册接口。其他测量边界见 [benchmarks](../tiny_transformer/benchmarks/README.md)。
+
+- [接口与支持矩阵](../docs/operators/README.md)
+- [Attention 实现记录](attention/development.md)
+- [Linear 配置及结果](linear/development.md)
+- [性能记录索引](../docs/performance.md)
+- [扩展开发规范](../docs/development.md)

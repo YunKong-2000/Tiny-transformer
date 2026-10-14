@@ -86,4 +86,24 @@ inline void check_mask_inputs(
               "segment_ids are supported only without past context");
 }
 
+inline void check_upstream_tensors(
+    const torch::Tensor& q, const torch::Tensor& dO,
+    const torch::Tensor& o, const torch::Tensor& lse) {
+  for (const auto& x : {dO, o, lse}) {
+    TORCH_CHECK(x.defined(), "dO, O and LSE must be defined");
+    TORCH_CHECK(x.is_cuda() && x.device() == q.device(),
+                "dO, O and LSE must be CUDA tensors on the same device as q");
+    TORCH_CHECK(x.layout() == at::kStrided,
+                "dO, O and LSE must have strided layout");
+  }
+  TORCH_CHECK(dO.scalar_type() == q.scalar_type() && o.scalar_type() == q.scalar_type(),
+              "dO and O must have the same dtype as q");
+  TORCH_CHECK(dO.sizes() == q.sizes() && o.sizes() == q.sizes(),
+              "dO and O must have the same shape as q");
+  TORCH_CHECK(lse.scalar_type() == at::kFloat, "LSE must be float32");
+  TORCH_CHECK(lse.dim() == 3 && lse.size(0) == q.size(0) &&
+              lse.size(1) == q.size(1) && lse.size(2) == q.size(2),
+              "LSE must have shape [B, Nh, Tq]");
+}
+
 } // namespace attention_detail

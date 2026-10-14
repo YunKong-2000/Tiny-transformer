@@ -11,7 +11,7 @@
 # 全部回归；没有 CUDA 时，GPU 用例自动跳过。
 python -m unittest discover -s tests -v
 
-# 只改了学生算子时：包含 kernel、autograd 和共用的模型集成测试。
+# 只改了自定义算子时：包含 kernel、autograd 和共用的模型集成测试。
 python -m unittest discover -s tests -p 'test_student_*.py' -v
 ```
 
@@ -23,7 +23,7 @@ python -m unittest discover -s tests -p 'test_student_*.py' -v
 
 | 文件 | 唯一职责 |
 |---|---|
-| `test_student_attention.py` | FP32 DH=64 前向及 LSE 与 FP64 对照；Q/K/V 尾块、stride/offset、cache capacity、segment/causal mask、stream、输入限制与反向拒绝；CPU 仅检查 Python 接线 |
+| `test_student_attention.py` | FP32/BF16 DH=64 前向及 BF16 三 kernel 反向与 FP64 对照；尾块、stride/offset、cache、mask、stream、原生校验、共享 QKV 视图梯度；CPU 仅检查 autograd 接线 |
 | `test_student_embedding.py` | embedding 的精确前向、grouped/baseline 梯度、行/通道边界、地址对齐、空输入、非法 ID、stream |
 | `test_student_linear.py` | FP32 CUTLASS 的五种训练/decode 投影、非方形/尾块、各输入 rank、stride/offset、空 M/N/K、输入检查、当前 stream；prepared kernel 与生产路径一致性、CUDA Graph 重放、split-K 分项；CPU 仅验证 autograd 接线 |
 | `test_student_rms_norm.py` | 一组用例检查 Y/R/dX/dgamma；H=1024/1025、非连续输入、缓存 R、清零、行循环与 stream |
@@ -38,7 +38,7 @@ python -m unittest discover -s tests -p 'test_student_*.py' -v
 | `test_offline_bundle.py` | 离线文件校验与路径合法性 |
 | `test_cutlass.py` | CUTLASS/CuTe 路径、离线依赖及真实 CUDA 编译/执行（无 GPU 时跳过后者） |
 
-每个学生算子只保留一个 CPU autograd 接线测试，使用明确的测试替身。
+每个自定义算子只保留一个 CPU autograd 接线测试，使用明确的测试替身。
 它用于没有 GPU 时检查 Python 接线，不证明 CUDA 数值正确。
 GPU 用例不会使用 reference fallback；比较 reference 只是提供预期结果。
 
@@ -57,18 +57,3 @@ python -m tiny_transformer.benchmarks --operator rms_norm \
 
 `python -m tiny_transformer.check_ops` 是单算子小形状开发检查，不是另一套完整验收入口；
 其 `--backward` 只检查梯度，不测反向耗时。需要回归时运行 unittest，需要性能时运行 benchmarks。
-
-## 本次精简
-
-- 删除 `test_benchmark_embedding.py`。ID 分布的独有检查并入 `test_benchmarks.py`；
-  删除与公共框架重复的梯度、错误候选和 CUDA 计时检查。
-- 删除两个算子各自的模型训练/缓存测试，合并为公共集成测试；保留单独启用及组合启用的对照。
-  reference 缓存与完整前向的一致性继续由 `test_model.py` 负责。
-- 删除加载器文件名/缓存调用次数等实现细节 mock，以及主要重复验证 PyTorch 自身版本计数、
-  二阶梯度装饰器和 SGD 更新行为的测试。
-- 合并 RMSNorm 前向/反向的 shape、stride 扫描，移除同一输入的重复 native/public 数值对照。
-  embedding 按行边界和通道边界分别选代表值，减少全组合；非法 ID 保留每条实现的负数/越上界检查。
-- 删除多 GPU 专项，聚焦当前单 GPU 项目；保留非默认 stream、边界检查和原子累加的确定性契约。
-
-保留 grid 上限和非法 ID 用例，是因为它们分别覆盖容易遗漏的循环复用及设备越界。
-精简不改变算子实现，也不提高原有数值误差阈值。

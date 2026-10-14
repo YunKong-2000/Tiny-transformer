@@ -1,231 +1,111 @@
-# Tiny Transformer Lab
+# Tiny Transformer
 
-面向 **A100 80GB PCIe + `nvcr.io/nvidia/pytorch:25.08-py3`** 的单卡训练与推理学习项目。
-完整 PyTorch 参考框架已经提供；student embedding 已接入 CUDA FP32 前向与一阶反向，RMSNorm 已接入 FP32 前向与一阶反向，其余学生算子待实现。
+面向 Transformer 训练与推理负载的 **CUDA 算子实现与性能优化项目**。以 decoder-only Transformer 为计算载体，在 PyTorch 参考实现之外提供 CUDA C++、CUTLASS 和 CuTe 后端，覆盖 GEMM、归约、逐元素融合及因果 Attention 的前反向。
 
-![模型与残差路径](docs/assets/architecture.png)
+主要开发与测量平台：**NVIDIA A100 80GB PCIe / SM80**。参考配置为 8 层、hidden size 768、12 个 attention heads、8K 词表，约 62.93M 参数。
 
-## 从这里开始
+## 主要实现
 
-1. 阅读 [Transformer 算法手册](docs/transformer.md)：从 next-token prediction 到反向传播与 KV Cache。
-2. 阅读 [开发与优化手册](docs/development.md)：算子契约、CuTe 任务、测试和测量边界。
-3. 阅读 [八种 Student 算子开发契约](docs/operators/README.md)：逐项查看真实输入输出、精度、布局和功能边界。
-4. 跑通下面的 smoke 流程，再逐个启用 `student` 算子。
-5. 查看 [当前验证记录](docs/validation.md)，区分本地已验证与 A100 待验证内容。
+- **BF16 Attention 前反向**：CuTe Tensor Core 融合 QKᵀ、causal mask、online softmax 和 PV；反向分为 preprocess、dQ、dK/dV，利用前向 LSE 分块重算概率，并接入一阶 autograd。
+- **Prefill / decode 分工**：prefill 使用异步搬运、共享内存 swizzle、寄存器预算与完整 tile 特化；单 token decode 使用 KV 分块和 FP32 softmax 合并。
+- **模型形状驱动的 Linear**：CUTLASS FP32 SIMT 前向、dX、dW；针对常规矩阵、小 M 和 Split-K 分别配置执行路径。
+- **完整算子调用边界**：处理 stride、alignment、尾块、当前 CUDA stream 和梯度接口，提供数值对照、模型接入测试及独立性能入口。
 
-**服务器不能联网时，使用 [离线部署指南](docs/offline.md)。** 本机已准备真实 TinyStories 子集、
-8K BPE、编码后的 train/val 和 Linux tokenizer wheel；离线包同时包含项目代码与校验文件。
+自定义后端的现有 API 名为 `student`，例如 `--op linear=student`。本文称其为“自定义 CUDA 后端”；命令与源码标识保持一致。`reference` 为 PyTorch 数学参考，Attention 另提供 `sdpa` 基线。
 
-## 环境
+## 性能摘要
 
-先在联网机器的项目根目录初始化固定版本的 CUTLASS（其中包含 CuTe C++）：
+下表为已保存的 **BF16 Attention 前向**测量，B=8、H=12、D=64，平台为 A100 80GB PCIe。速度比定义为 `SDPA 耗时 / 自定义实现耗时`。
+
+| 负载 | Tq / Tk | 自定义实现 | 同轮 SDPA | 速度比 |
+| --- | --- | ---: | ---: | ---: |
+| Prefill | 512 / 512 | 39.78 μs | 39.35 μs | 0.989× |
+| 单 token decode | 1 / 512 | 12.73 μs | 15.44 μs | 1.213× |
+
+Decode 使用 CUDA Graph 计时；prefill 最新记录沿用同一 Graph 测量上下文，但结果片段未附完整 CLI。以上是固定形状的历史记录，不代表所有形状或当前工作区复测结果。BF16 反向已有实现及接入，尚未附完整 GPU 验收和性能报告。
+
+[性能口径与复现](docs/performance.md) · [Attention 优化报告](docs/reports/attention_bf16_optimization_report.md) · [原始测量汇总](docs/reports/attention_bf16_measurements.json)
+
+## 算子支持范围
+
+下表描述源码接口范围；实现、测试覆盖和已执行的验证记录分别见对应文档。
+
+| 算子 | 自定义前向 / 一阶反向 | 关键边界 |
+| --- | --- | --- |
+| [Embedding](docs/operators/embedding.md) | FP32 / FP32 | 连续 int64 IDs 与 FP32 权重；baseline / grouped 反向 |
+| [Linear](docs/operators/linear.md) | FP32 SIMT / FP32 SIMT | 常规、小 M、Split-K；不支持 autocast |
+| [RMSNorm](docs/operators/rms_norm.md) | FP32 / FP32 | 反向 H≤1024；非连续输入显式复制 |
+| [RoPE](docs/operators/rope.md) | FP32 / FP32 | CuTe；支持 stride；cos/sin 作为常量 |
+| [Attention](docs/operators/attention.md) | FP32、BF16 / BF16 | D=64；BF16 要求 SM80+；无 autocast；segments 仅 FP32 前向 |
+| [SwiGLU](docs/operators/swiglu.md) | FP32 / FP32 | 支持 chunk view 和非连续梯度 |
+| [Residual](docs/operators/residual.md) | FP32 kernel / FP32 kernel | wrapper 支持 FP16/BF16 转换及 dtype promotion |
+| [Cross Entropy](docs/operators/cross_entropy.md) | FP32 kernel / FP32 kernel | wrapper 接受低精度 logits；ignore_index=-100；输出 FP32 |
+
+范围外输入会显式报错，不自动回退到参考实现。单个算子的 BF16 支持不等于全自定义后端已支持 BF16 模型训练。项目不包含分布式训练、量化、paged attention 或在线服务调度。
+
+## 环境与快速运行
+
+需要 Linux CUDA 开发环境、CUDA 版 PyTorch、nvcc、C++ 编译器及 Ninja。参考容器为 `nvcr.io/nvidia/pytorch:25.08-py3`，CUTLASS 子模块固定为 v3.9.2。
 
 ```bash
-git submodule update --init --recursive third_party/cutlass
-python3 -m tiny_transformer.check_cutlass --headers-only
-```
+git clone --recurse-submodules https://github.com/YunKong-2000/Tiny-transformer.git
+cd Tiny-transformer
+# 已有 checkout 可执行：git submodule update --init --recursive third_party/cutlass
 
-已固定为 CUTLASS v3.9.2；现有 student JIT 扩展自动配置其头文件路径和 C++17。
-安装方式、`CUTLASS_PATH` 覆盖路径及新增算子接入见 [依赖说明](third_party/README.md)。
-
-在 GPU 主机的项目根目录执行。宿主机需要 NVIDIA 驱动、Docker 和 NVIDIA Container Toolkit；
-驱动兼容性以 NVIDIA 对该镜像的 release notes 为准。容器不提供宿主机驱动。
-
-```bash
 docker run --rm -it --gpus all --ipc=host \
   --ulimit memlock=-1 --ulimit stack=67108864 \
-  -v "$PWD":/workspace/tiny-transformer \
-  -w /workspace/tiny-transformer \
+  -v "$PWD":/workspace/tiny-transformer -w /workspace/tiny-transformer \
   nvcr.io/nvidia/pytorch:25.08-py3 bash
+```
 
-# 以下命令在容器内执行；保留镜像原有的 torch/CUDA。
+容器内：
+
+```bash
 python -m pip install -e '.[data]'
-python -c 'import torch; print(torch.__version__, torch.version.cuda); print(torch.cuda.get_device_name())'
 export TORCH_CUDA_ARCH_LIST=8.0
 python -m tiny_transformer.check_cutlass
-```
 
-也可用仓库 Dockerfile 构建已安装数据依赖的派生镜像：
-
-```bash
-docker build -t tiny-transformer:25.08 .
-docker run --rm -it --gpus all --ipc=host \
-  -v "$PWD":/workspace/tiny-transformer tiny-transformer:25.08
-```
-
-项目不在 pip dependencies 中声明 torch，以防覆盖 NGC 中预装的 CUDA wheel。
-运行前必须已经安装 PyTorch。Python 3.9+；CPU 验证环境为 PyTorch 2.8.0。
-
-## 第一次跑通：不需要下载数据
-
-```bash
-# 自动创建独立输出目录；使用 CPU 小模型，包含测试、训练、生成、benchmark、profile。
-bash scripts/smoke.sh
-
-# GPU 容器内的验收：FP32 / BF16 / FP16、SDPA、compile、profile。
-bash scripts/a100_validate.sh
-```
-
-当前工作区已有 `data/smoke`：500 条训练、50 条验证合成故事，byte tokenizer。
-它只验证流水线，不用于证明模型质量或报告 60M 模型吞吐。
-`data/` 与 `runs/` 不纳入版本控制，换机器后通过脚本重建。
-
-## 真实数据：TinyStories + 8K BPE
-
-```bash
-python -m tiny_transformer.prepare \
-  --source tinystories --output data/tinystories-8k \
-  --train-docs 100000 --val-docs 2000 \
-  --tokenizer-docs 20000 --vocab-size 8192
-```
-
-脚本解析并记录数据集实际 revision，只在 train split 上训练 tokenizer，分开生成 train/val
-token 文件，记录文本、token 文件和 tokenizer 的 SHA256。目标目录已存在时拒绝覆盖。
-首次下载需要能访问 Hugging Face。本机已通过系统代理完成下载与打包：
-过滤空文本后为 99,983 篇训练故事（21,729,332 tokens）和 2,000 篇验证故事（385,234 tokens）。
-已存在的数据目录无需再次运行 prepare；输出目录存在时脚本会拒绝覆盖。
-使用前阅读数据集卡片和使用条款。
-
-没有外网的 GPU 主机可以在联网机器执行上述步骤，再复制整个 `data/tinystories-8k` 目录。
-也支持自备 JSONL（每行 `{"text":"..."}`）：
-
-```bash
-python -m tiny_transformer.prepare --source local \
-  --train-jsonl /path/to/train.jsonl --val-jsonl /path/to/val.jsonl \
-  --output data/local-8k --vocab-size 8192
-```
-
-## 60M 训练
-
-```bash
-# 算法参考基线，默认 eager attention。约 62.93M 参数。
-python -m tiny_transformer.train --config configs/model_60m.json \
-  --data data/tinystories-8k --output runs/60m-eager --device cuda
-
-# 成熟库性能基线：相同配置，单独启用 SDPA。
-python -m tiny_transformer.train --config configs/model_60m.json \
-  --data data/tinystories-8k --output runs/60m-sdpa --device cuda \
-  --op attention=sdpa
-
-# FP32 对照：保持同一数据、seed、batch、seq_len；默认关闭 TF32。
-python -m tiny_transformer.train --config configs/model_60m.json \
-  --data data/tinystories-8k --output runs/60m-fp32 --device cuda --precision fp32
-
-# 保持训练总 schedule 为 1000 steps，只执行前 20 steps。
-python -m tiny_transformer.train --config configs/model_60m.json \
-  --data data/tinystories-8k --output runs/resume-demo --device cuda --stop-after 20
-python -m tiny_transformer.train --config configs/model_60m.json \
-  --data data/tinystories-8k --output runs/resume-demo --device cuda \
-  --resume runs/resume-demo/last.pt
-```
-
-默认每步处理 `8 × 512 × 4 = 16384` 个 input tokens；1000 steps 约 16.38M tokens。
-采样是可复现的随机 token 窗口、有放回抽样；step 不等于 epoch。
-100M tokens 可设置 `--steps 6104`。正式长训前先跑 100–200 步实测速度和显存。
-
-日志：`metadata.json`、逐步 `metrics.jsonl`、原子写入的 `last.pt`。
-训练含验证、梯度裁剪、AdamW、warmup/cosine、FP16 GradScaler 与 RNG/sampler 恢复。
-只加载自己信任的 checkpoint；当前 checkpoint 含 optimizer 和 RNG 的 Python 对象。
-
-## 推理、benchmark 与热点
-
-```bash
-python -m tiny_transformer.generate --checkpoint runs/60m-sdpa/last.pt \
-  --device cuda --precision bf16 --prompt "Once upon a time" --max-new-tokens 128
-
-python -m tiny_transformer.benchmarks.model --checkpoint runs/60m-sdpa/last.pt \
-  --device cuda --precision bf16 --batch-size 1 --prompt-length 512 \
-  --new-tokens 128 --repeats 10 --output runs/bench-b1.json
-
-TORCH_LOGS="graph_breaks,recompiles" python -m tiny_transformer.benchmarks.model \
-  --checkpoint runs/60m-sdpa/last.pt --device cuda --precision bf16 --compile \
-  --prompt-length 512 --new-tokens 128 --output runs/bench-compile.json \
-  2> runs/compile.log
-
-python -m tiny_transformer.profile --checkpoint runs/60m-sdpa/last.pt \
-  --device cuda --precision bf16 --phase decode --seq-len 512 --output runs/profile-decode
-```
-
-`--phase train/prefill/decode` 分别分析三类负载。生成 Chrome/Perfetto trace、算子时间表和前三个热点。
-benchmark 报告冷请求、稳态 TTFT/TPOT、输出 token 吞吐、allocated/reserved 峰值显存、环境和原始 trial。
-它是固定 batch 的模型基准，不是 HTTP 服务或动态调度器。
-
-## 实现你的第一个算子
-
-已有 embedding 的一 warp 一 ID 前向和 warp 内分组累加反向，支持 CUDA 连续 int64 IDs 与 FP32 weight，
-首次调用延迟编译扩展。构建依赖、检查与推理命令见 [csrc 说明](csrc/README.md)。
-已通过 eager autograd 接入一阶梯度；GPU 编译、数值及性能需在目标 CUDA 环境验收。
-它尚不支持二阶梯度、低精度 weight 或 torch.compile。
-
-修改 `tiny_transformer/operators/student.py` 对应函数，在 `csrc/` 添加实际代码。
-RMSNorm 当前支持 CUDA FP32 前向与一阶反向（反向 H <= 1024），非连续输入由 Python 入口显式复制。
-[代码检查与 PyTorch 接入步骤](docs/operators/rms_norm.md#7-前向缓存与-pytorch-调用链) 包含各层职责和测试说明。
-例如只替换 RMSNorm：
-
-```bash
-python -m tiny_transformer.check_ops --operator rms_norm --backend student \
-  --device cuda --precision fp32 --output runs/rmsnorm-check.json
-
-python -m tiny_transformer.benchmarks.model --checkpoint runs/60m-sdpa/last.pt \
-  --device cuda --precision fp32 --op rms_norm=student --output runs/rmsnorm-e2e.json
-```
-
-未实现的算子会明确抛出 `NotImplementedError`；已接入算子的范围外调用会报错。没有自动退回 PyTorch 的隐藏路径。
-训练接入必须支持正确反向；仅完成前向时先用于 inference。
-
-## 正确性测试
-
-测试职责与精简说明见 [tests/README.md](tests/README.md)。日常使用一个回归入口：
-
-```bash
-python -m unittest discover -s tests -v
-# 只验证 embedding、RMSNorm 及它们的模型接入：
+# 数值/梯度和模型接入回归；首次调用会 JIT 编译扩展。
 python -m unittest discover -s tests -p 'test_student_*.py' -v
+
+# BF16 Attention 前向与同 dtype SDPA 对照。
+python -m tiny_transformer.benchmarks --operator attention \
+  --backend student --baseline sdpa --precision bf16 --phases forward \
+  --workloads prefill decode --layouts contiguous --attention-timing graph \
+  --batch-size 8 --heads 12 --dim 768 --seq-length 512 \
+  --warmup 20 --repeats 100 --trials 5 --output runs/attention-bf16-graph.json
 ```
 
-两个算子文件只维护 kernel 与 autograd 的核心回归；模型训练、prefill/decode 放在
-`test_student_integration.py` 共用。性能测量使用下面的 benchmarks 命令。
-
-## 统一算子性能测试
-
-八个算子的性能代码集中在 [tiny_transformer/benchmarks](tiny_transformer/benchmarks/README.md)，
-统一采用校验后预热、CUDA events、交替后端顺序、多轮中位数；forward/backward 分开计时。
-保留 embedding 的四种 ID 分布与 grouped/baseline，对所有算子记录形状、stride、原始样本和跳过原因。
+GPU 用例在无 CUDA 环境会跳过。CPU smoke 验证框架流程，不作为 CUDA 正确性或性能证据：
 
 ```bash
-python -m tiny_transformer.benchmarks --operator rms_norm \
-  --layouts contiguous strided last-only --phases forward backward --output runs/rmsnorm-performance.json
-python -m tiny_transformer.benchmarks --operator embedding \
-  --backward-impl all --output runs/embedding-performance.json
-python -m tiny_transformer.benchmarks --operator all --output runs/all-operators-performance.json
+bash scripts/smoke.sh
 ```
 
-当前 student RMSNorm 可测 FP32 前向与一阶反向（H <= 1024）；未实现的算子、反向或低精度阶段在报告中明确跳过。
-`--backend reference` 可验证八个算子的测量流程，`--operator attention --backend sdpa` 可比较 SDPA。
-模型端到端入口为 `python -m tiny_transformer.benchmarks.model`；旧命令保留转发兼容。
+## 模型运行
 
-## 目录
+参考框架支持 TinyStories / 本地 JSONL 数据准备、训练、断点续训、KV cache 生成、TTFT/TPOT 测量及 profiling。`data/`、`runs/` 和 checkpoint 不随仓库分发，需按流程生成。
 
-```text
-configs/                    小模型与 60M 模型 JSON 配置
-tiny_transformer/
-  operators/reference.py    可执行算法规范
-  operators/student.py      你需要实现的算子入口
-  operators/dispatch.py     逐算子选择后端
-  model.py                  decoder、参数管理、连续 KV cache
-  tokenizer.py / prepare.py tokenizer、下载与 token 文件生成
-  data.py                   packed window、文档边界与标签
-  train.py / generate.py    训练、续训、文本生成
-  benchmark.py / profile.py 性能测量与热点分析
-  check_ops.py              小形状算子数值/梯度检查
-  benchmarks/               集中的算子性能与整模型性能测试
-csrc/                       你的 CUDA / CuTe / CUTLASS 实现
-third_party/cutlass/         固定版本的 CUTLASS 子模块（包含 CuTe）
-tests/                      算法、数据、缓存、梯度、续训测试
-scripts/                    CPU/GPU 验收、图表重建
-docs/transformer.md          算法手册
-docs/development.md          工程与优化手册
+```bash
+python -m tiny_transformer.prepare --source tinystories --output data/tinystories-8k \
+  --train-docs 100000 --val-docs 2000 --tokenizer-docs 20000 --vocab-size 8192
+python -m tiny_transformer.train --config configs/model_60m.json \
+  --data data/tinystories-8k --output runs/60m-sdpa --device cuda --op attention=sdpa
 ```
 
-当前未实现：embedding 二阶梯度、RMSNorm 二阶梯度与低精度路径、其余学生 GPU kernel、paged attention、CUDA Graph bucket、量化、分布式训练、HTTP serving。
-这些是后续实验，不会被标记为已完成优化。
+[训练与推理流程](docs/model_workflow.md) · [离线环境](docs/offline.md) · [依赖配置](third_party/README.md)
+
+## 文档与代码导航
+
+| 路径 | 内容 |
+| --- | --- |
+| [docs/](docs/README.md) | 文档入口、阅读路径与测量记录 |
+| [csrc/](csrc/README.md) | CUDA / CuTe / CUTLASS kernel 和 C++ 绑定 |
+| [operators/student.py](tiny_transformer/operators/student.py) | 自定义算子接口与一阶 autograd |
+| [operators/reference.py](tiny_transformer/operators/reference.py) | 数学参考实现 |
+| [benchmarks/](tiny_transformer/benchmarks/README.md) | 算子和模型性能测试 |
+| [tests/](tests/README.md) | 数值、梯度、边界和模型集成测试 |
+| [算子接口](docs/operators/README.md) | shape、dtype、stride 与反向返回项 |
+| [开发规范](docs/development.md) | 扩展接入、stream、数值验证和测量约定 |
+
+底层实现参考 [CUTLASS / CuTe](https://github.com/NVIDIA/cutlass) 和 [FlashAttention](https://github.com/Dao-AILab/flash-attention) 的相关设计；依赖及上游许可保留在 `third_party/` 中。

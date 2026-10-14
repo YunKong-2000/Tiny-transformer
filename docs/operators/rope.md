@@ -4,7 +4,7 @@
 
 ## 1. 接口与职责
 
-```python
+```text
 rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor
 ```
 
@@ -12,7 +12,7 @@ rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor
 一次调用只处理一个张量，默认每层 2 次。V 不经过 RoPE。
 
 位置、频率、cos/sin 已由 `Transformer.forward` 算好；此函数不用接收 position、theta 或 cache。
-旋转后的 K 随后由框架写入 cache，你的算子不负责 cache 分配、写入或更新长度。
+旋转后的 K 随后由框架写入 cache，算子不负责 cache 分配、写入或更新长度。
 
 ## 2. 输入与输出
 
@@ -88,9 +88,8 @@ dx 的 shape/dtype 对应 x；不需要复制 x 的原始 storage offset，但�
 
 ## 6. 开发与验收建议
 
-优先学会 CuTe 的 Q/K strided view 和相邻通道配对，再做向量化 load/store。
-可以从固定 $D_h=64$ 的推理开始，但 smoke 使用 $D_h=16$；同时覆盖 batch 广播与逐样本 cos/sin。
-RoPE 与 K-cache write 融合属于新接口设计，不能在当前纯函数中偷偷改 cache。
+CuTe 实现按 Q/K strided view 和相邻通道配对组织数据。默认配置 $D_h=64$，smoke 使用 $D_h=16$；测试覆盖 batch 广播与逐样本 cos/sin。
+RoPE 与 K-cache write 融合属于新接口设计，不应改变当前纯函数的 cache 无副作用语义。
 
 ```bash
 python -m tiny_transformer.check_ops --operator rope --backend student \

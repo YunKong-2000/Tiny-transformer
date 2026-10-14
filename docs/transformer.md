@@ -1,14 +1,11 @@
 # Transformer 算法手册：从 token 到训练与解码
 
-这份手册针对熟悉 CUDA/C++、但尚未系统学习深度学习的开发者。
-目标是让你能回答：模型计算了什么，张量形状为什么如此，梯度怎样流动，缓存为什么正确。
+本文定义模型计算图、张量形状、梯度传播和缓存语义，作为算子实现的数学参考。
 实现细节和优化实验见 [开发手册](development.md)。
 
-## 0. 阅读路线和符号
+## 0. 结构与符号
 
-第一次阅读按 1→8→9→10 的顺序理解前向、loss、训练、推理，再读反向推导和复杂度。
-每读完一个算子，同时打开 `tiny_transformer/operators/reference.py` 找到对应表达式。
-不要先背 API；先在纸上写出输入、输出和每个维度的含义。
+第 1–8 节定义前向与损失，第 9–10 节描述训练和缓存推理，后续章节汇总复杂度与验证要点。可执行参考位于 `tiny_transformer/operators/reference.py`。
 
 | 符号 | 意义 | 本项目默认值 |
 |---|---|---:|
@@ -28,7 +25,7 @@
 shape 是逻辑维度，不保证张量连续。张量从 $[B,L,H,d_h]$ transpose 成 $[B,H,L,d_h]$
 通常只是改变 stride；理解这一点会直接影响 CuTe/CUDA kernel 的正确性。
 
-## 1. 模型到底学习什么
+## 1. 建模目标
 
 语言建模将一段文本的概率拆为条件概率：
 
@@ -91,7 +88,7 @@ $$
 其中 $4d_{\mathrm{model}}^2$ 是 Q/K/V/O，$3d_{\mathrm{model}}d_{\mathrm{ffn}}$ 是 gate/up/down，$2d_{\mathrm{model}}$ 是每层两个 RMSNorm 的缩放参数。
 输入 embedding 和输出 LM head 共享权重，所以 $Vd_{\mathrm{model}}$ 只计算一次。
 
-## 3. Embedding 与 Linear：先连接到熟悉的 GEMM
+## 3. Embedding 与 Linear 的矩阵表达
 
 Embedding 权重 $E\in\mathbb{R}^{V\times d_{\mathrm{model}}}$ 是可训练表格：
 
@@ -292,7 +289,7 @@ $$
 dg=dz\odot u\odot\operatorname{SiLU}'(g),\quad du=dz\odot\operatorname{SiLU}(g)
 $$
 
-这适合学习融合：独立 sigmoid、乘法会产生中间张量；融合 kernel 可在寄存器中完成。
+融合机会：独立 sigmoid、乘法会产生中间张量；融合 kernel 可在寄存器中完成。
 
 ## 8. LM head、Cross Entropy 与“学会”的含义
 
@@ -425,18 +422,15 @@ reset 只改变有效长度，不必清零整块显存，因为 attention 只读
 $6\times\text{参数量}\times\text{训练 token 数}$ 是常见训练 FLOPs 粗估，忽略或简化 attention 等开销；
 长序列或精确 MFU 报告应采用更完整的计数。
 
-## 12. 动手检查：能解释这些，才算掌握主线
+## 12. 数据流验证要点
 
-1. 对 $B=2$、$L=5$，写出每个算子的形状，特别是 $QK^\top$ 和 gate/up。
-2. 改变输入最后两个 token，验证更早位置 logits 不变。
-3. 用 $L=4$ 的小矩阵手算 causal softmax 的一行，确认非法权重为零、合法权重和为 1。
-4. 比较整段前向和 prefill+逐 token decode 的 logits，解释误差来源。
-5. 将 RoPE decode position 错误地固定为 0，观察第 4 项测试如何失败，然后恢复。
-6. 将 label 再错移一位，解释为什么 loss 仍可能下降但任务已变。
-7. 给定上游梯度，推导 Linear、RMSNorm、SiLU 的反向。
-8. 解释为什么模型最终只预测下一个 token，却在训练中需要所有位置的 logits。
+- 张量 shape、stride、数据类型与对应 reference 表达式一致。
+- RMSNorm 缩放、RoPE 相邻 pair 及 SwiGLU 双分支的梯度分别对照。
+- 因果 mask 隔离未来 token；文档隔离模式不跨 segment 传播信息。
+- 标签只偏移一次，忽略目标不参与损失归约。
+- 完整前向与 cache prefill/decode 在容差内一致，cache 容量与有效长度分开处理。
 
-建议先在 `configs/smoke.json` 上完成这些练习，再到 A100 上测真实形状。
+小配置 `configs/smoke.json` 用于数据流检查，目标 GPU 的真实形状用于数值与性能测试。
 
 ## 参考资料
 

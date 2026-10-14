@@ -4,7 +4,7 @@
 
 ## 1. 接口与职责
 
-```python
+```text
 cross_entropy(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor
 ```
 
@@ -103,7 +103,7 @@ kernel 必须接收并应用实际上游梯度。算子内部只对**本次调�
 
 ## 7. 开发与验收建议
 
-先实现 FP32、连续 logits、有限有效 targets 的 mean CE；随后覆盖 ignore_index、低精度输入与 backward。
+当前实现包含 FP32 mean CE 前反向、ignore_index 处理及 wrapper 的低精度输入转换。
 推理的 `--op cross_entropy=student` 不会触发它，必须运行训练、验证或直接算子检查。
 
 ```bash

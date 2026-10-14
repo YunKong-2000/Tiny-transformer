@@ -4,7 +4,7 @@
 
 ## 1. 接口与职责
 
-```python
+```text
 rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor
 ```
 
@@ -43,7 +43,7 @@ $$
 
 参考的顺序是：将低精度 x 转 FP32 → 平方均值 → 加 eps → rsqrt → 乘 x 和 weight → 转回 x dtype。
 FP32 保持 FP32；FP64 reference 路径保留 FP64，方便 gradcheck。
-你可以融合这些步骤，但应保持相同数学定义与精度意图。
+这些步骤可融合，但应保持相同数学定义与精度意图。
 
 边界：
 
@@ -97,11 +97,11 @@ dtype 分别对应原始 x、weight；不要把所有梯度都强制输出为 BF
 
 ## 6. 功能范围和优化路线
 
-第一版可先支持 CUDA、末维连续、FP32/BF16、特定 $H$ 的 forward，明确返回范围外错误。
-模型训练默认 $H=768$，但 smoke 的 $H=64$，开发工具还用到 $H=65$；尾部处理是独立任务。
+当前自定义实现支持 FP32 前向及 H≤1024 的一阶反向；不支持低精度输入。
+模型训练默认 $H=768$，但 smoke 的 $H=64$，开发工具还用到 $H=65$；尾部处理需单独验证。
 接训练时需要 FP32 输入路径，即使训练命令选择了 BF16。
 
-先优化行内归约、向量化 load/store，再考虑 residual+norm 融合。
+当前实现采用行内归约和向量化 load/store；residual+norm 融合属于独立接口扩展。
 当前接口没有 residual update 参数，不能私自将相加塞入这个函数。
 跨算子融合通常需要同时返回原 residual 更新结果与 normalized 结果，需另立契约。
 

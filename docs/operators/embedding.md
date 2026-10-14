@@ -4,7 +4,7 @@
 
 ## 1. 接口与职责
 
-```python
+```text
 embedding(ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor
 ```
 
@@ -138,7 +138,7 @@ $$
 1. [扩展加载器](../../tiny_transformer/operators/_extension.py) 将 `bindings.cpp`、
    `embedding.cu` 和 `embedding_backward.cu` 一起传给 `torch.utils.cpp_extension.load`，
    延迟编译并加载同一个扩展模块。只在头文件声明函数不会编译其实现。
-2. [bindings.cpp](../../csrc/bindings.cpp) 中的
+2. [bindings.cpp](../../csrc/embedding/bindings.cpp) 中的
    `m.def("embedding_backward", &embedding_backward_cuda, ...)` 将 C++ host wrapper
    暴露为 Python 的 `extension.embedding_backward(ids, gradient, vocab_size, implementation="grouped")`。
    **pybind 只提供可调用函数，不会自动把 forward 与 backward 关联起来。**
@@ -179,7 +179,7 @@ x.sum().backward()                 # 自动调用绑定的 CUDA backward
 反向使用浮点原子加，不保证逐 bit 确定性。开启 `torch.use_deterministic_algorithms(True)`
 时，非空反向明确报错；`warn_only=True` 时警告后执行。空输入只返回全零表。
 
-## 6. 建议的实现阶段与验收
+## 6. 实现范围与验证
 
 当前 student 已接入 **CUDA FP32 连续输入的前向与一阶反向**，前向保留一 warp 一 ID 的标量和 float4 两条路径。
 weight/output 指针均为 16 字节对齐且 H 能被 4 整除时使用 float4，否则使用标量 kernel。

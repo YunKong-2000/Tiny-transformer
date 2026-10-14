@@ -4,7 +4,7 @@
 
 ## 1. 接口与职责
 
-```python
+```text
 residual(x: torch.Tensor, update: torch.Tensor) -> torch.Tensor
 ```
 
@@ -75,7 +75,7 @@ backward 返回 `dx, dupdate`，不额外除 batch/sequence，也不修改参数
 
 ## 6. 开发与验收建议
 
-此算子的数学很简单，但可用于练习多 dtype dispatch、向量化访存和输出类型契约。
+实现涉及多 dtype 分派、向量化访存和输出类型契约。
 单独相加通常受带宽和 launch 限制；是否值得替换需要看整个模型中的时间占比。
 
 ```bash

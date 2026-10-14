@@ -441,6 +441,7 @@ class BenchmarkHostTests(unittest.TestCase):
         self.assertIn('head_dim=64', unsupported_reason('attention', 'student', 'fp32', 'forward', 'contiguous', 128, 4))
         self.assertIn('not implemented', unsupported_reason('attention', 'student', 'fp32', 'backward', 'contiguous', 768, 12))
         self.assertIsNone(unsupported_reason('attention', 'student', 'bf16', 'forward', 'strided', 768, 12))
+        self.assertIsNone(unsupported_reason('attention', 'student', 'bf16', 'backward', 'strided', 768, 12))
         self.assertIn('fp32 and bf16', unsupported_reason('attention', 'student', 'fp16', 'forward', 'contiguous', 768, 12))
         for precision, dtype in (('fp32', torch.float32), ('bf16', torch.bfloat16)):
             with self.subTest(precision=precision):
@@ -451,13 +452,14 @@ class BenchmarkHostTests(unittest.TestCase):
                               return_value={'speedup': 1., 'reference_us': 1., 'candidate_us': 1.}) as measure, \
                         redirect_stdout(io.StringIO()):
                     results = run(args, torch.device('cpu'))
-                self.assertEqual(measure.call_count, 2)  # prefill and decode reach timing.
+                # Both workloads reach forward timing; BF16 also reaches backward.
+                self.assertEqual(measure.call_count, 4 if precision == 'bf16' else 2)
                 for call in candidate.call_args_list:
                     self.assertTrue(all(x.dtype == dtype for x in call.args[:3]))
                     self.assertIsNone(call.args[4])  # BF16 does not support segments.
                 for row in results:
                     self.assertEqual(row['forward']['status'], 'passed')
-                    self.assertEqual(row['backward']['status'], 'skipped')
+                    self.assertEqual(row['backward']['status'], 'passed' if precision == 'bf16' else 'skipped')
 
     def test_attention_sdpa_baseline_times_selected_pair_on_shared_inputs(self):
         # Real CPU SDPA checks values; only CUDA timing/student are test doubles.

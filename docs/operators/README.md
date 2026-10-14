@@ -1,10 +1,10 @@
-# Student 算子开发契约与导航
+# 算子接口与调用契约
 
 这组文档以当前仓库的实际调用为准，回答“模型会传入什么、算子必须返回什么”。
 算法推导见 [Transformer 手册](../transformer.md)，CUDA/CuTe 工程规则见 [开发手册](../development.md)。
-核对日期：2026-09-24。
+张量契约整理于 2026-09-24；后端支持范围更新于 2026-10-14，见 [首页支持矩阵](../../README.md#算子支持范围)。
 
-## 1. 是否必须完全匹配 reference？
+## 1. 与 reference 的语义一致性
 
 **对于声明支持且实际启用的路径，必须与 reference 的数学语义、逻辑形状、dtype、设备和梯度语义一致。**
 不要求照抄实现、使用相同 kernel 数，也不要求浮点结果逐 bit 相同。
@@ -18,13 +18,13 @@
 | 项目推理版 | 所选配置下 prefill、decode 和全部相关调用点 | 训练；例如只做 BF16 CUDA inference 时要写明限制 |
 | 项目训练版 | 所选训练精度下的 AMP、输入梯度、参数梯度、验证前向 | PyTorch 通用 API 中本项目没有使用的其他选项 |
 
-这不是要求第一天复刻完整的 `torch.nn.functional`。例如 embedding 没有 `padding_idx` 参数，
+接口范围不等同于完整的 `torch.nn.functional`。例如 embedding 没有 `padding_idx` 参数，
 Linear 没有 bias，Attention 没有 dropout 或 GQA，CE 没有 label smoothing。
 但只支持某个固定维度的 kernel，不应被标记为已经覆盖整个模型。
 
 `--op 名称=student` 会替换该名称的**所有调用**，并不会按层自动选择或对不支持的 shape 自动 fallback。
 例如只完成 QKV 的 GEMM 时，不能直接声称 `linear=student` 已能运行完整模型。
-你可以在 student wrapper 内对已声明支持的不同 shape 做 dispatch；未覆盖输入应先检查再报错。
+可在自定义 wrapper 内对已声明支持的不同 shape 做 dispatch；未覆盖输入应先检查再报错。
 
 “支持 stride”指正确读取实际传入的视图。输出通常可以选择新的连续张量，
 不要求复刻 reference 每个输出的物理 stride；必须满足后续消费者的逻辑接口并统计必要复制开销。
@@ -95,7 +95,7 @@ FP32 训练中，浮点数据主路径为 FP32；FP16 AMP 的结构与上表相�
 
 ## 5. 前向接口之外，训练还需要什么
 
-`student.py` 只列出 8 个前向入口，不代表训练框架能自动理解你写的 CUDA kernel。
+`student.py` 提供 8 个公共前向入口；梯度关联由对应的 autograd Function 显式实现。
 若前向仅分配输出并调用扩展，需通过 `torch.autograd.Function` 或自定义算子注册提供 backward。
 
 | forward 参数顺序 | backward 对应返回槽位 |
@@ -118,9 +118,9 @@ FP32 训练中，浮点数据主路径为 FP32；FP16 AMP 的结构与上表相�
 若需要训练，可先使用自定义 backward 中的 PyTorch 参考运算验证链路，再独立优化 backward；
 文档与性能报告要明确这时仍使用参考反向。
 
-## 6. 如何查看自己收到的数据
+## 6. 输入布局诊断
 
-下面的诊断代码只包装 reference，打印一个小模型的第一个调用，不实现学生 kernel：
+下面的诊断代码只包装 reference，打印一个小模型的第一个调用，不实现自定义 kernel：
 
 ```python
 import torch

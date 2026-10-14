@@ -1,7 +1,7 @@
 {
   "title": "BF16 Attention 前向优化路径报告",
   "date": "2026-10-08",
-  "provenance": "用户在本对话提供的 GPU 日志与 NCU 截图，结合本地仓库源码和提交；未在报告生成主机复测 GPU。",
+  "provenance": "历史 GPU 终端日志与 NCU 截图，结合仓库源码和提交；未在文档整理环境复测 GPU。",
   "environment": {
     "GPU": "NVIDIA A100 80GB PCIe",
     "pytorch": "2.8.0a0+34c6371d24.nv25.08",
@@ -219,6 +219,28 @@
       "sdpa_us": 39.27,
       "note": "沿用 Graph 语境，结果片段无完整命令",
       "speedup": 0.9274917335852622
+    },
+    {
+      "id": "G10",
+      "mode": "graph*",
+      "workload": "prefill",
+      "change": "PV 寄存器预取",
+      "student_us": 42.38,
+      "sdpa_us": 39.19,
+      "note": "沿用 Graph 语境，结果片段无完整命令",
+      "speedup": 0.9247286455875412,
+      "commit": "8574747"
+    },
+    {
+      "id": "G11",
+      "mode": "graph*",
+      "workload": "prefill",
+      "change": "完整 tile 编译期特化",
+      "student_us": 39.78,
+      "sdpa_us": 39.35,
+      "note": "沿用 Graph 语境，结果片段无完整命令",
+      "speedup": 0.9891905480140775,
+      "commit": "66ec6cb"
     }
   ]
 }

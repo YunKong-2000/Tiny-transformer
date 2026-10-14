@@ -8,3 +8,5 @@ dist/
 data/
 runs/
 .DS_Store
+output/
+tmp/

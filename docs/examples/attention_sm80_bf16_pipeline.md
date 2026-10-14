@@ -1,10 +1,10 @@
-# A100 BF16 Tensor Core attention 前向模板
+# A100 BF16 Tensor Core Attention 实现参考
 
 核心代码：[attention_sm80_bf16_pipeline.cuh](attention_sm80_bf16_pipeline.cuh)。
 独立 PyTorch 绑定：[attention_sm80_bf16_binding.cu](attention_sm80_bf16_binding.cu)。
 编译与验证：[check_attention_sm80_bf16.py](check_attention_sm80_bf16.py)。
 
-这是用于迁移现有 SIMT 实现的可编译目标模板，不替换生产 `student.attention`。
+该独立示例用于对照 SIMT 与 Tensor Core 的数据组织，不替换当前 `student.attention` 执行路径。
 作者环境没有 CUDA/nvcc，尚未完成 GPU 编译、数值或竞态验收；下面提供完整验收入口。
 它采用 Ampere 的 `mma.sync`、`ldmatrix`、`cp.async`，不使用 Hopper 的 TMA/WGMMA。
 
@@ -128,4 +128,4 @@ TORCH_CUDA_ARCH_LIST=8.0 compute-sanitizer --tool synccheck --error-exitcode 1 \
 编译使用 `--ptxas-options=-v`，留意寄存器数、spill 和 48 KiB shared memory。
 用 Nsight Compute/反汇编检查 MMA、LDSM、异步加载指令及实际重叠情况；
 完成数值和竞态验收后，再纳入统一 benchmark，与同为 BF16 的 SDPA 比较。
-本模板提供的是设计起点，不预设能超过 SDPA。
+该示例用于布局和数值对照，性能应独立测量，不据此推断优于 SDPA。

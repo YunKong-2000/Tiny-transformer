@@ -10,13 +10,27 @@ Q 整块常驻 shared memory，另两个完整 K/V slot 共用 union 类型，�
 当前 slot 0 固定保存 K、slot 1 固定保存 V，使两者的预取和消费可以重叠。
 score、softmax 统计量和输出累加器为 FP32，P 直接转换为 BF16 A fragment 留在寄存器。
 原生接口返回 `(O, LSE)`：O 与输入同 dtype，LSE 始终为 FP32；Python 只返回 O。
-反向、AMP/autocast 和 FP16 尚未实现；需要梯度时明确报错。
+BF16 一阶反向已接入 preprocess、dQ、dK/dV 三个 kernel，接口与验收见下文。
+FP32 反向、AMP/autocast 和 FP16 尚未实现；对应路径明确报错。
 输入 batch、heads、序列长度必须为正，且 `Tk = past_len + Tq`。
 FP32 二维 grid 要求 `B*H <= 65535`、`ceil(Tq/32) <= INT_MAX`；
 BF16 通用路径一维 grid 要求 `B*H*ceil(Tq/64) <= INT_MAX`，乘法前检查溢出。
 BF16 另要求 `Tk <= INT32_MAX`，host 在连续化/输出分配前检查，再将 Tq/Tk/past_len
 传为 int32；完整元素地址偏移仍为 int64。
 单 query 专用路径 grid 为 `(B*H, ceil(Tk/128))`，第二维最多 32，沿用上述边界检查。
+
+2026-10-13 BF16 反向集成（待 GPU 验收）：
+
+- `attention_backward` 校验 Q/K/V/dO/O/LSE、past_len、BF16/SM80 和 grid/序列上限，
+  按需复制非连续或未对齐输入，在当前 stream 顺序调用 preprocess → dQ → dK/dV。
+  D 为临时 FP32 `[B,Nh,Tq]`；输出为三个独立连续 BF16 张量，不做全设备同步。
+- Python `_Attention` 保存 Q/K/V/O/LSE 和 past_len，通过一次原生 backward 返回梯度；
+  原始输入视图保留 autograd 连接。FP32 backward、segments、autocast 和二阶梯度不在此路径内。
+- `test_student_attention.py` 增加完整链路的 FP64 梯度对照、独立尾块/cache 长度、
+  非连续/未对齐输入和 dO、共享 QKV base、零梯度/部分 requires_grad、当前 stream 和非法输入测试。
+  独立 dQ、dK/dV kernel 测试继续保留；本地主机测试不代表 CUDA 编译、数值或竞态验收。
+- benchmarks 开放 BF16 backward，FP32 backward 仍明确跳过。CUDA 验收命令沿用下文，
+  现在同一入口覆盖前后向；可追加 `--phases forward backward --precision bf16` 测量完整算子。
 
 2026-10-08 完整序列 tile 编译期特化（待 GPU 验收）：
 
@@ -34,7 +48,7 @@ GPU 测试新增：同一组 query 的完整 tile 路径与追加一个 query/ke
 NaN cache-capacity 用例补充 full/full、tail/full、full/tail，验证不能只检查一个长度。
 本地 attention 测试 25 项：1 项 host 通过、24 项 CUDA 跳过。独立 CPU 索引检查覆盖
 116 组长度、982 对抽样 tile（含 int32 上限），完整 tile 访存边界与 causal mask
-等价性通过；不代表 CUDA 编译或运行验证。性能待与用户实测 42.38 us 基线比较。
+等价性通过；不代表 CUDA 编译或运行验证。性能待与历史实测 42.38 us 基线比较。
 编译日志/NCU 中现在应关注 `attention_bf16::forward<true>`；原有
 `regex:attention_bf16::forward` 过滤器仍可匹配两个特化版本。
 
@@ -162,7 +176,7 @@ past_len+q0-key0>=BK-1`。完整块仅乘 SCALE，编译期移除每元素的坐
 
 2026-10-08 下一步单变量实验：在 mask fast path 的基础上只将 BK 从 32 改成 64，
 BH=32、BQ=64、128 线程、swizzle、union 预取、CTA 排列和 decode 分派保持原配置。
-基线用户报告为 operator prefill：SDPA 41.11 us、student 62.86 us。
+基线测量记录为 operator prefill：SDPA 41.11 us、student 62.86 us。
 
 | 项目 | BK=32 基线 | BK=64 候选 |
 |---|---:|---:|
@@ -185,7 +199,7 @@ BF16 P 的分块舍入可能变化，需重新通过精度检查；寄存器可�
 CUDA 跳过。未运行 nvcc、GPU 数值/竞态或性能测试。
 
 2026-10-08 实现 base-2 online softmax，并恢复 `__launch_bounds__(THREADS, 4)`。
-比较基线应使用用户测得的 minBlocks=4 版本（operator 52.03 us、graph 50.61 us），
+比较基线应使用测得的 minBlocks=4 版本（operator 52.03 us、graph 50.61 us），
 而不是 minBlocks=5 的 graph 53.16 us。仅恢复驻留目标并修改通用 softmax，
 没有修改 tile、预取、CTA 顺序、索引宽度或 decode 的数值域。
 
@@ -223,7 +237,7 @@ example 41 的调用一致。此前误用了 `__exp2f`，目标工具链将其�
 
 2026-10-08 索引宽度实验：通用 BF16 forward 的 Tq/Tk/past_len 参数、CTA 映射、
 query/key/tile 循环变量及 mask 比较改为 int32。保持当前 base-2 softmax、BK=64、
-BH=32、launch_bounds(128,4) 和流水线，以用户 base-2 Graph 51.11 us 为直接对照。
+BH=32、launch_bounds(128,4) 和流水线，以base-2 Graph 51.11 us 为直接对照。
 未同时退回自然指数，避免将两项改动的收益混在一起。FP32 和专用 decode kernel 未改。
 
 安全边界：由 host 的 `Tk=past_len+Tq`、正尺寸及 `Tk<=INT32_MAX` 推导 Tq/past_len
@@ -243,7 +257,7 @@ CUDA 数值/竞态或性能测试；attention 主机测试 1 项通过、20 项 
 
 - 48.71 us 基线保存在 Git 提交 `b1482b45222875dcff2b893086a52dcf38418a2c`。
   本地快照目录 `runs/attention-tuning/baseline-int32-base2-b1482b4/` 包含源码和
-  `manifest.json`（SHA256、commit、用户报告的性能及 ptxas 数据）。runs 被 gitignore
+  `manifest.json`（SHA256、commit、测量记录的性能及 ptxas 数据）。runs 被 gitignore
   排除，跨机器恢复以 Git 提交为准。基线为 A100 80GB PCIe、BF16、B=8,H=12,
   T=512,D=64、Graph、warmup=20,repeats=100,trials=5；student 48.71 us、SDPA
   39.23 us，128 registers、8-byte stack、4-byte spill stores/loads。
@@ -284,7 +298,7 @@ C++17 语法检查通过。未运行 nvcc、GPU 数值测试或 compute-sanitize
 ## 整体算法 overall algorithm
 
 2026-10-08 PV shared→register 预取实验：基线提交
-`8732172b52eaf63f9ca7a0541d86cb727bec908e`，用户报告 student 42.34 us、SDPA 39.27 us。
+`8732172b52eaf63f9ca7a0541d86cb727bec908e`，测量记录 student 42.34 us、SDPA 39.27 us。
 本轮只改 `gemm_pv_subtile`：保留两个独立的 V register fragment rB0/rB1，
 ki 和 slot 选择通过 `make_seq`/`if constexpr` 编译期展开，不使用动态索引数组。
 
@@ -323,7 +337,7 @@ BF16 pair 写到 QLayout 对应位置，再执行一次全 CTA barrier。随后�
 必须与更好的 global store 合并效果一起测量。分母延迟归约和每行倒数是另两项独立建议，
 本轮没有同时实现。
 
-用户实测该输出重排版本 student 48.17 us、SDPA 39.27 us；直接写回版本 student
+历史实测该输出重排版本 student 48.17 us、SDPA 39.27 us；直接写回版本 student
 46.73 us、SDPA 39.35 us，本次对照约慢 3.1%。撤回该 epilogue 时，kernel
 逐字节恢复为 `e13905e` 的直接 uint32 pair 写回版本。失败实验完整保存在提交
 `f14345a`，不同 head/feature 和 query tail 的精确输出测试继续保留。

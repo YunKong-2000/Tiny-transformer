@@ -4,7 +4,7 @@
 
 ## 1. 接口与职责
 
-```python
+```text
 swiglu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor
 ```
 
@@ -83,7 +83,7 @@ $$
 
 ## 6. 开发与验收建议
 
-这是学习 CuTe view 和 pointwise 融合的合适入口。先做真实 chunk stride 的 forward，再加入 backward。
+实现需处理真实 chunk stride，并保持前向与反向的布局语义一致。
 沿 $I$ 向量化读取，处理不整除向量宽度的尾部；减少中间张量，但保留清晰的输入输出契约。
 
 ```bash

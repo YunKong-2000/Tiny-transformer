@@ -77,6 +77,12 @@ TORCH_CUDA_ARCH_LIST=8.0 python -m tiny_transformer.benchmarks \
   --warmup 20 --repeats 100 --trials 5 \
   --output runs/attention-bf16-graph.json
 
+# BF16 attention 完整前后向；反向计时包括 preprocess、dQ、dK/dV 和必要的复制。
+TORCH_CUDA_ARCH_LIST=8.0 python -m tiny_transformer.benchmarks \
+  --operator attention --backend student --baseline sdpa --precision bf16 \
+  --phases forward backward --workloads prefill decode --layouts contiguous strided \
+  --output runs/attention-bf16-forward-backward.json
+
 # 整模型请求指标。
 python -m tiny_transformer.benchmarks.model --config configs/smoke.json \
   --device cuda --precision fp32 --op rms_norm=student \
@@ -102,7 +108,7 @@ SDPA 保留 PyTorch 自动选择后端的行为；该选项不强制使用 Flash
 | linear | QKV/O/Gate-Up/Down/LM head 的 `[B,T,K]`、`[N,K]`；训练与推理分别生成 | x、weight（仅训练反向） | FP32 SIMT 前向/反向；wrapper 复制跨步输入；尚不支持 AMP/BF16/FP16 |
 | rms_norm | `[B,T,H]`、`[H]`、eps；可测 last-only `[B,1,H]` | x、weight | FP32 前向/反向（H <= 1024）；wrapper 复制跨步输入 |
 | rope | `[B,heads,T,H/heads]` 与共享 cos/sin | x；cos/sin 是常量 | FP32 CuTe 前向/反向；直接消费输入及梯度的 stride |
-| attention | prefill `Q=K=T`；decode `Q=1,K=seq_length`，携带 past_len | q、k、v | FP32 SIMT / BF16 Tensor Core 前向，head_dim=64；BF16 要求 SM80+，无 segments；反向/FP16 跳过 |
+| attention | prefill `Q=K=T`；decode `Q=1,K=seq_length`，携带 past_len | q、k、v | FP32 SIMT / BF16 Tensor Core 前向，head_dim=64；BF16 要求 SM80+，无 segments；BF16 一阶反向已接入；FP32 反向/FP16 跳过 |
 | swiglu | `[B,T,hidden_dim]` gate/up；跨步用例保留 chunk view | gate、up | FP32 CuTe 前向/反向；支持独立输入 stride 和非连续/零 stride 上游梯度 |
 | residual | 两个 `[B,T,H]` | 两项输入 | FP32 kernel 前向/反向；wrapper 支持 FP16/BF16 与跨步输入，计入转换/复制成本 |
 | cross_entropy | `[B,T,V]` logits、含 ignore_index 的 targets | logits | FP32 kernel 前向/反向；wrapper 支持 FP16/BF16 与跨步输入，返回 FP32 平均 loss，计入转换/复制成本 |
@@ -110,7 +116,7 @@ SDPA 保留 PyTorch 自动选择后端的行为；该选项不强制使用 Flash
 `--dim/--heads/--out-features/--hidden-dim/--vocab-size` 调整对应形状；
 BF16 attention 的 `--precision bf16` 直接创建 BF16 Q/K/V，不启用 autocast。
 BF16 prefill/chunk 使用 Q 常驻 shared memory、P 常驻寄存器的 Tensor Core kernel，
-当前实验配置 `BQ=BK=BH=64`，Q 常驻 shared memory，另两个完整 K/V slot 用于
+当前配置 `BQ=BK=BH=64`，Q 常驻 shared memory，另两个完整 K/V slot 用于
 交叠加载和计算（24 KiB/CTA）。对照已保存的 `BK=64,BH=32`、int32/base-2
 基线（Graph 48.71 us）：共享内存增加、特征循环移除，barrier 次数减半；
 PV 临时 B fragment 增大，需检查精度、寄存器和同口径耗时，不能预设提速。
@@ -265,6 +271,6 @@ python -m unittest discover -s tests -p 'test_benchmarks.py' -v
 
 主机测试覆盖八个算子的输入/梯度契约、非连续布局、反向不重跑前向或积累 `.grad`、
 错误结果拒绝、CUDA event 交替顺序/单位换算/中位数、未实现路径和变体间的输入公平性。
-该文件只测试公共框架，不重复跑学生 kernel 的数值或性能。
-学生 kernel 正确性运行 `python -m unittest discover -s tests -p 'test_student_*.py' -v`；
+该文件只测试公共框架，不重复跑自定义 kernel 的数值或性能。
+自定义 kernel 正确性运行 `python -m unittest discover -s tests -p 'test_student_*.py' -v`；
 真实性能运行上方 benchmark CLI，其中已包含计时前的数值校验。完整测试分工见 [测试说明](../../tests/README.md)。
