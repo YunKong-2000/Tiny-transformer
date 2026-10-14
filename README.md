@@ -2,7 +2,11 @@
 
 面向 Transformer 训练与推理负载的 **CUDA 算子实现与性能优化项目**。以 decoder-only Transformer 为计算载体，在 PyTorch 参考实现之外提供 CUDA C++、CUTLASS 和 CuTe 后端，覆盖 GEMM、归约、逐元素融合及因果 Attention 的前反向。
 
+本仓库目前是**个人实验项目**，用于探索 GPU 算子的实现方法、性能瓶颈与优化策略。后续将持续更新，逐步优化算子性能、扩展测试覆盖，并完善文档与性能记录。
+
 主要开发与测量平台：**NVIDIA A100 80GB PCIe / SM80**。参考配置为 8 层、hidden size 768、12 个 attention heads、8K 词表，约 62.93M 参数。
+
+**项目预期的八类核心算子均已实现并接入自定义后端：Embedding、Linear、RMSNorm、RoPE、Attention、SwiGLU、Residual 和 Cross Entropy。** 各算子已提供所声明精度范围内的前向及一阶反向；Attention 支持 FP32/BF16 前向和 BF16 反向。具体 dtype、shape 和验证范围见下方支持矩阵及测试文档。
 
 ## 主要实现
 
