@@ -51,9 +51,6 @@ using VTransposedLayout = decltype(composition(
 
 struct alignas(16) SharedStorage {
   Element q[BQ * DH];
-  // Two full-width slots. The pipeline keeps K in slot 0 and V in slot 1
-  // so loading one can overlap consuming the other. A slot is overwritten
-  // only after a CTA barrier releases all its readers.
   union {
     Element k[BK * BH];
     Element v[BK * BH];
